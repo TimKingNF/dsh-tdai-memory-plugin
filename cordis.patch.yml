@@ -1,0 +1,24 @@
+- insert:
+    - id: tdai-memory
+      name: dsh-tdai-memory-plugin
+      inject: [tools, systemPrompt, sessions]
+      config:
+        endpoint: !!js process.env.TDAI_MEMORY_ENDPOINT || 'http://127.0.0.1:8420'
+        apiKeyEnv: !!js process.env.TDAI_MEMORY_API_KEY_ENV || 'TDAI_MEMORY_API_KEY'
+        serviceId: !!js process.env.TDAI_MEMORY_INSTANCE_ID || ''
+        teamId: !!js process.env.TDAI_MEMORY_TEAM_ID || ''
+        agentId: !!js process.env.TDAI_MEMORY_AGENT_ID || ''
+        userId: !!js process.env.TDAI_MEMORY_USER_ID || ''
+        userKey: !!js process.env.TDAI_MEMORY_USER_KEY || ''
+        taskId: !!js process.env.TDAI_MEMORY_TASK_ID || ''
+        enabled: !!js process.env.TDAI_MEMORY_ENABLED ?? ''
+        recallEnabled: !!js process.env.TDAI_MEMORY_RECALL_ENABLED ?? ''
+        injectionEnabled: !!js process.env.TDAI_MEMORY_INJECTION_ENABLED ?? ''
+        captureEnabled: !!js process.env.TDAI_MEMORY_CAPTURE_ENABLED ?? ''
+        sessionContextEnabled: !!js process.env.TDAI_MEMORY_SESSION_CONTEXT_ENABLED ?? ''
+        profileMemoryEnabled: !!js process.env.TDAI_MEMORY_PROFILE_MEMORY_ENABLED ?? ''
+        skillsEnabled: !!js process.env.TDAI_MEMORY_SKILLS_ENABLED ?? ''
+        knowledgeEnabled: !!js process.env.TDAI_MEMORY_KNOWLEDGE_ENABLED ?? ''
+        recallLimit: !!js process.env.TDAI_MEMORY_RECALL_LIMIT ?? ''
+        l2Limit: !!js process.env.TDAI_MEMORY_L2_LIMIT ?? ''
+        timeoutMs: !!js process.env.TDAI_MEMORY_TIMEOUT_MS ?? ''
