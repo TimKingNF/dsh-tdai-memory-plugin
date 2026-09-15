@@ -17,6 +17,9 @@ function harness(cfgOverrides = {}, assetOverrides = {}) {
   const ctx = {
     systemPrompt: { section: (s) => { listeners[`section:${s.name}`] = s } },
     on: (ev, cb) => { listeners[ev] = cb },
+    // cordis 获取**可选**服务的姿势（见 lib/sections.mjs 的 registerKnowledgeSkill 注释）：
+    // 这里不提供 skills，回调不执行 = 宿主没有 skills 服务。护栏在 test/knowledge-skill.test.mjs。
+    inject: () => () => {},
   }
   const asset = {
     identity: { session_id: 's1' },

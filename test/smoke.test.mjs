@@ -45,7 +45,10 @@ const block = renderSessionContext(
   { id: 'task-1', name: 'T', description: 'td', goal: 'g' },
 )
 assert.ok(block.startsWith('<session_context>') && block.endsWith('</session_context>'))
-assert.ok(block.includes('[Agent]') && block.includes('[Task]') && block.includes('prompt:'))
+assert.ok(block.includes('[Agent]') && block.includes('[Task]'))
+// **不注入 agent.prompt**：persona 已由 DSH preset 的 deployment:persona 段注入，
+// 再注一遍是同内容两遍（docs/prompt-injection-redesign.md 阶段 2）。
+assert.ok(!block.includes('prompt:') && !block.includes('\np'), 'session_context 不应包含 agent.prompt 全文')
 assert.equal(renderSessionContext(null, null), '')
 
 // buildListingQuery：弱信号 → undefined（core 回落 mode=full）
@@ -63,6 +66,9 @@ assert.ok(recalled.endsWith('</tdai_recalled_l1_memories>'))
 
 // renderProfileMemory：空 → 仅 guide；有内容 → 分段
 assert.ok(renderProfileMemory([]).startsWith('<memory-tools-guide>'))
+// 传入总述时：总述在前，且资产全空也照常输出（降级路径的保证）
+const withOverview = renderProfileMemory([], 'OVERVIEW-TEXT')
+assert.ok(withOverview.startsWith('OVERVIEW-TEXT') && withOverview.includes('<memory-tools-guide>'))
 const profile = renderProfileMemory([{
   ctx: { agentId: 'a1', agentName: 'Coder', isSelf: true },
   l3: { content: 'persona text' },

@@ -1,6 +1,6 @@
 {
   "name": "dsh-tdai-memory-plugin",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "DeepSeek Harness 的 TencentDB Agent Memory 插件：会话级上下文注入（L2/L3/Skill/Knowledge/session_context）、L1 自有+借入召回、对话旁路回流 MemoryCore，支持 Web 设置面板与 slash 命令。",
   "type": "module",
   "main": "./index.mjs",
@@ -16,6 +16,8 @@
     "lib/",
     "cordis.patch.yml",
     "README.md",
+    "README_CN.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "keywords": [
@@ -39,7 +41,7 @@
   },
   "scripts": {
     "build:client": "node build-card.mjs",
-    "test": "node --check index.mjs && node --check config.mjs && node --check client.mjs && node --check lib/text.mjs && node --check lib/assets.mjs && node --check lib/prompts.mjs && node --check lib/recall.mjs && node --check lib/capture.mjs && node --check lib/tools.mjs && node --check lib/sections.mjs && node --check lib/settings.mjs && node --check lib/commands.mjs && node test/smoke.test.mjs && node test/load.test.mjs && node test/recall.test.mjs && node test/sections.test.mjs && node test/section-registry.test.mjs"
+    "test": "node --check index.mjs && node --check config.mjs && node --check client.mjs && node --check lib/text.mjs && node --check lib/assets.mjs && node --check lib/prompts.mjs && node --check lib/recall.mjs && node --check lib/capture.mjs && node --check lib/normalize.mjs && node --check lib/tools.mjs && node --check lib/sections.mjs && node --check lib/settings.mjs && node --check lib/commands.mjs && node test/smoke.test.mjs && node test/load.test.mjs && node test/recall.test.mjs && node test/assets-budget.test.mjs && node test/gateway-timeout.test.mjs && node test/sections.test.mjs && node test/section-registry.test.mjs && node test/capture-filter.test.mjs && node test/capture-normalize.test.mjs && node test/tools-render.test.mjs && node test/knowledge-skill.test.mjs && node test/knowledge-tools.test.mjs && node test/settings-card.test.mjs && node test/settings-card-render.test.mjs && node test/prompt-budget.test.mjs"
   },
   "dsh": {
     "bundle": {

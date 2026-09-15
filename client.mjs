@@ -119,13 +119,16 @@ export class GatewayClient {
   /**
    * L1 召回。ctx = { teamId, userId, agentId }（自有或借入 agent）；
    * session/task 归属用调用方的，与 proxy searchL1ForCtx 语义一致。
+   *
+   * `opts.signal` 让调用方（lib/recall.mjs）能施加**硬超时**：网关不响应时这一步
+   * 必须放弃召回继续走，而不是把整轮挡住（超时由 safe() 归为失败 → 返回空命中）。
    */
-  async searchL1(ctx, query, { sessionId, taskId, limit } = {}, signal) {
+  async searchL1(ctx, query, { sessionId, taskId, limit, signal } = {}, signalArg) {
     if (!query || !query.trim()) return []
     const identity = { ...toCtxIds(ctx), session_id: sessionId, task_id: taskId }
     const data = await this.safe('/v3/atomic/search', {
       ...identity, query: query.slice(0, 2048), limit,
-    }, { identity, signal }, {})
+    }, { identity, signal: signal ?? signalArg }, {})
     return (data?.items ?? [])
       .map((item) => ({
         id: String(item?.id ?? ''),
@@ -244,6 +247,71 @@ export class GatewayClient {
     if (Array.isArray(ids) && ids.length > 0) body.knowledge_ids = ids
     const data = await this.safe('/v3/knowledge/list', body, {}, null)
     return Array.isArray(data?.items) ? data.items : []
+  }
+
+  // ── 知识服务（wiki / code-graph）─────────────────────────────────────────────
+  //
+  // 注意：这两个端点**不在 MemoryCore 上**，而在每个知识资源自己的 `service_url`
+  // （已含 API 路径，如 http://kb.internal/v3）。因此不能复用 this.post() 的固定
+  // endpoint，需要按资源切换 base。
+  //
+  // 调用契约（TencentDB-Agent-Memory/MemoryKnowledge/v3-api-memoryknowledge-doc.md:507-575）：
+  //   POST {service_url}/tools/list  body { knowledge_id }                  → { tools: [{name, description, params}] }
+  //   POST {service_url}/tools/call  body { knowledge_id, tool_name, params }
+  // 两者都要求 `x-tdai-service-id`（租户标识），无需密钥。
+
+  /** 对任意 base 发一次 POST，错误语义与主客户端一致（fail-open → fallback）。 */
+  async #postTo(baseUrl, path, body, fallback = null) {
+    const base = String(baseUrl || '').replace(/\/$/, '')
+    if (!base) return fallback
+    try {
+      const resp = await fetch(`${base}${path}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-tdai-service-id': this.serviceId || 'default',
+        },
+        body: JSON.stringify(stripUndefined(body ?? {})),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      })
+      const payload = await resp.json().catch(() => ({}))
+      if (!resp.ok) throw new Error(`${TAG} ${base}${path} HTTP ${resp.status}`)
+      if (typeof payload?.code === 'number' && payload.code !== 0) {
+        throw new Error(`${TAG} ${base}${path} code=${payload.code} ${payload.message ?? ''}`.trim())
+      }
+      return payload?.data ?? {}
+    } catch (error) {
+      this.log(`knowledge ${path} failed: ${error.message}`)
+      return fallback
+    }
+  }
+
+  /**
+   * 列出某个知识资源可用的工具（tools/list）。
+   * 失败返回 `null` —— 与"资源确实没有工具"（返回 `[]`）区分开，便于调用方决定要不要缓存。
+   */
+  async knowledgeToolsList(serviceUrl, knowledgeId) {
+    const data = await this.#postTo(serviceUrl, '/tools/list', { knowledge_id: knowledgeId })
+    if (!data || !Array.isArray(data.tools)) return null
+    return data.tools
+  }
+
+  /**
+   * 执行某个知识资源的只读查询工具（tools/call）。
+   *
+   * 返回 `{ ok, text }` 而不是裸数据：知识服务在 code-graph 工具执行失败时仍回 code=0，
+   * 把错误放在 `data.isError` 里（doc:573）。必须显式判一次，否则失败会被当成成功结果喂给模型。
+   */
+  async knowledgeToolsCall(serviceUrl, knowledgeId, toolName, params) {
+    const data = await this.#postTo(serviceUrl, '/tools/call', {
+      knowledge_id: knowledgeId,
+      tool_name: toolName,
+      params: params ?? {},
+    })
+    if (data === null || data === undefined) return { ok: false, text: '知识服务不可达。' }
+    if (data.isError === true) return { ok: false, text: String(data.text ?? '知识工具执行失败。') }
+    if (typeof data.text === 'string') return { ok: true, text: data.text }
+    return { ok: true, text: JSON.stringify(data) }
   }
 
   // ── meta 面（需 userKey；缺省时调用方应跳过并降级）─────────────────────────
