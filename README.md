@@ -178,11 +178,14 @@ fallback), so both spawn and fork children are covered; a session without a head
 top-level session (fail-open to the previous behaviour). `/tdai-status` reports both switches and
 whether the current session is a child session.
 
-**Cache note**: with injection off, a child's system prompt diverges from its parent's at the first
-TDAI block, so everything after that point is a cache *miss* on the child's **first** request —
-measured ≈3.3K tokens of "miss vs hit" difference per child session, one-off (later steps hit the
-child's own cache). If you customise child agents with DSH's native `dsh-tool-subagent` `persona` or
-`toolFilter`, the prefix already diverges at the very front and this degradation becomes cache-free.
+**Cache note (measured, not estimated)**: comparing one real child session before and after this
+change — system prompt 13020 → **6925 bytes**, total tokens per first request 13748 → **10594**
+(-23%), of which **full-price tokens 2214 → 797**; cache hits 11264 → 9728. So turning injection off
+for children does **not** make them pay a cache penalty: the big cache hit comes from the tools array
+at the front of the request (38 schemas, unchanged position), and the 6093 bytes we removed are not
+charged at all. Only DSH's own tail section loses its parent-cache hit (≈500–800 tokens, because it
+shifts position). If you customise child agents with DSH's native `dsh-tool-subagent` `persona` or
+`toolFilter`, the prefix diverges at the very front anyway.
 Full accounting: [docs/prompt-design.zh-CN.md](docs/prompt-design.zh-CN.md) §3.4.
 
 ### Common
