@@ -60,6 +60,9 @@ Everything is injected through **native DSH interfaces**; the request body is ne
 Data sources: `/v3/core/read` (L3), `/v3/scenario/ls` (L2), `/v3/skill/listing` (skills),
 `/v3/knowledge/list` (knowledge), `/v3/atomic/search` (L1 recall), `/v3/meta/*` (agent/task detail).
 
+Delegated **child** sessions skip all of this by default — see
+[Subagent sessions](#subagent-sessions-default-read-side-off-write-side-off).
+
 **Why L1 recall is not written into the user message.** The host persists `decision.messages`
 verbatim after `agent/pre-step` (`session.append("user/message", …)` in `dsh-agent-loop`). Prepending
 the recall block would leave that text permanently inside the *user's* message: the UI would echo it
@@ -151,6 +154,37 @@ an id, the tool refuses it instead of sending it to the server.
   catches those on `agent/error` and `turn/end`: log + drop the buffer, **without writing memory** —
   half a turn would be consumed by extraction as if it were complete.
 
+### Subagent sessions (default: read side off, write side off)
+
+DSH's delegated child sessions (the `subagent` and `subagent_fork` tools) inherit the plugin's
+globally registered sections and are seen by the same process-level listeners. On the default setup
+that meant, measured:
+
+- a child's system prompt was **byte-identical to its parent's** (13020 bytes — our four blocks are
+  6093 of them, 47%), and it received its own L1 recall block (2 messages, ≈4.4 KB);
+- because `captureEnabled` is process-wide, a 23-step research child wrote **37 messages** into L0
+  (task prompt, a full diff, raw test output, every tool call) — background extraction would treat
+  that tool noise as memory about the user.
+
+The plugin now steps back for child sessions by default:
+
+| Switch | Default | Effect inside a child session |
+| --- | --- | --- |
+| `subagentInjectionEnabled` | **off** | no system injection, no L1 recall, no knowledge skill, no asset prewarm; the 10 read-only tools stay registered |
+| `subagentCaptureEnabled` | **off** | the child's conversation is not written back to MemoryCore |
+
+Detection uses DSH's durable `session.header.origin === 'subagent'` (`delegationDepth > 0` as a
+fallback), so both spawn and fork children are covered; a session without a header is treated as a
+top-level session (fail-open to the previous behaviour). `/tdai-status` reports both switches and
+whether the current session is a child session.
+
+**Cache note**: with injection off, a child's system prompt diverges from its parent's at the first
+TDAI block, so everything after that point is a cache *miss* on the child's **first** request —
+measured ≈3.3K tokens of "miss vs hit" difference per child session, one-off (later steps hit the
+child's own cache). If you customise child agents with DSH's native `dsh-tool-subagent` `persona` or
+`toolFilter`, the prefix already diverges at the very front and this degradation becomes cache-free.
+Full accounting: [docs/prompt-design.zh-CN.md](docs/prompt-design.zh-CN.md) §3.4.
+
 ### Common
 
 - **fail-open**: any Gateway failure is logged only, never blocks DSH
@@ -178,6 +212,8 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
 - **Read side**: read master switch, L1 auto recall (with a **per-turn recall cap**), system prompt
   injection, and the 4 sections under it
 - **Write side**: conversation write-back (independent of the read side)
+- **Subagents**: whether child sessions inherit the read side, and whether their conversations are
+  written back (both off by default)
 - **Identity & addresses**: MemoryCore endpoint, instance id, Team / Agent / User / Task id,
   User Key, knowledge-service origin override
 
@@ -193,6 +229,10 @@ read master enabled ──┬─ L1 auto recall recallEnabled (cap recallLimit, 
                       └─ read-only tools (no separate switch)
 
 write master captureEnabled —— independent of both enabled and injectionEnabled
+
+subagents (keyed on the child session, not on the switches above)
+  subagentInjectionEnabled —— read side inherited by child sessions?   (default: no)
+  subagentCaptureEnabled   —— child conversations written back?        (default: no)
 ```
 
 Three easy traps:
@@ -231,6 +271,10 @@ export TDAI_MEMORY_SESSION_CONTEXT_ENABLED=true
 export TDAI_MEMORY_PROFILE_MEMORY_ENABLED=true
 export TDAI_MEMORY_SKILLS_ENABLED=true
 export TDAI_MEMORY_KNOWLEDGE_ENABLED=false  # team knowledge injection, off by default
+
+# ── subagent (child) sessions ──
+export TDAI_MEMORY_SUBAGENT_INJECTION_ENABLED=false  # let child sessions inherit the read side (default: no)
+export TDAI_MEMORY_SUBAGENT_CAPTURE_ENABLED=false    # write child conversations back (default: no)
 
 # ── tuning ──
 export TDAI_MEMORY_ENDPOINT=http://127.0.0.1:8420

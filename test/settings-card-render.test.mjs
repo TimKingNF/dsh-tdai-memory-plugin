@@ -39,8 +39,11 @@ const tmpFile = join(tmpDir, 'card-render.mjs')
 // 组件本身不是导出（只导出 CARD_FIELDS / 纯函数），这里补一行导出以便渲染
 writeFileSync(tmpFile, `${code}\nexport { TdaiMemoryCard };\n`, 'utf8')
 let Card
+let CARD_FIELDS
 try {
-  Card = (await import(pathToFileURL(tmpFile).href)).TdaiMemoryCard
+  const mod = await import(pathToFileURL(tmpFile).href)
+  Card = mod.TdaiMemoryCard
+  CARD_FIELDS = mod.CARD_FIELDS
 } finally {
   rmSync(tmpFile, { force: true })
 }
@@ -73,7 +76,7 @@ function dimmed(html, label) {
 // ── 1) 结构：三个分组 + 召回条数上限是个数字输入 ────────────────────────────
 {
   const html = render()
-  for (const title of ['读侧 · 把记忆读进上下文', '写侧 · 把对话回流给 MemoryCore', '身份与地址']) {
+  for (const title of ['读侧 · 把记忆读进上下文', '写侧 · 把对话回流给 MemoryCore', '子 agent · 委派出去的子会话', '身份与地址']) {
     assert.ok(html.includes(title), `应有分组标题「${title}」`)
   }
   // 条数上限必须紧跟 L1 召回（读起来是同一件事），且在 System prompt 注入之前
@@ -87,15 +90,27 @@ function dimmed(html, label) {
   assert.ok(input.includes('min="1"') && input.includes('max="20"'), '数字框的上下界应与 schema 一致（1–20）')
   assert.ok(input.includes('value="7"'), '数字框应回显当前配置值')
 
-  // checkbox 与标签同一个 <label> 且 nowrap：沿用"逐项不拆行"的既有偏好
-  assert.equal((html.match(/white-space:nowrap/g) || []).length, 9, '8 个开关 + 1 个数字框都应是 nowrap 项')
+  // checkbox 与标签同一个 <label> 且 nowrap：沿用"逐项不拆行"的既有偏好。
+  // 数量从 CARD_FIELDS 推导，避免每加一个开关就要来改这个魔数（原先就是它先红）。
+  assert.equal(
+    (html.match(/white-space:nowrap/g) || []).length,
+    CARD_FIELDS.toggles.length + 1,
+    `${CARD_FIELDS.toggles.length} 个开关 + 1 个数字框都应是 nowrap 项`,
+  )
+  // 子 agent 两个开关默认关：渲染出的 checkbox 必须是未勾选状态
+  const subagentAt = html.indexOf('子 agent 继承注入与召回')
+  const subagentBlock = html.slice(html.lastIndexOf('<label', subagentAt), html.indexOf('</label>', subagentAt))
+  assert.ok(!subagentBlock.includes('checked=""'), '「子 agent 继承注入与召回」默认应为未勾选')
+  const subCaptureAt = html.indexOf('子 agent 对话回流')
+  const subCaptureBlock = html.slice(html.lastIndexOf('<label', subCaptureAt), html.indexOf('</label>', subCaptureAt))
+  assert.ok(!subCaptureBlock.includes('checked=""'), '「子 agent 对话回流」默认应为未勾选')
 }
 
 // ── 2) 身份齐全：无告警，所有开关都不置灰 ───────────────────────────────────
 {
   const html = render()
   assert.ok(!html.includes('身份未填全'), '身份齐全时不应有告警')
-  for (const label of ['L1 自动召回', 'System prompt 注入', 'Skill 列表', '对话回流到 MemoryCore']) {
+  for (const label of ['L1 自动召回', 'System prompt 注入', 'Skill 列表', '对话回流到 MemoryCore', '子 agent 继承注入与召回', '子 agent 对话回流']) {
     assert.equal(dimmed(html, label), false, `身份齐全 + 开关全开时「${label}」不该置灰`)
   }
 }
@@ -107,6 +122,8 @@ function dimmed(html, label) {
     assert.equal(dimmed(html, label), true, `读侧总开关关闭时「${label}」应置灰`)
   }
   assert.equal(dimmed(html, '对话回流到 MemoryCore'), false, '回流是独立的写侧开关，读侧关闭不该影响它')
+  assert.equal(dimmed(html, '子 agent 继承注入与召回'), true, '读侧总开关关闭时「子 agent 继承注入」也该灰（它属于读侧）')
+  assert.equal(dimmed(html, '子 agent 对话回流'), false, '「子 agent 对话回流」属于写侧，读侧关闭不该影响它')
   assert.ok(!html.includes('身份未填全'), '读侧总开关已关时不重复告警（告警只在"开关开着但无效"时才有意义）')
 }
 

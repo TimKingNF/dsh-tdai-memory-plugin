@@ -12,6 +12,10 @@
  * 写侧（captureEnabled，独立开关）：
  *   - 每轮结束旁路回流 /v3/conversation/add（L0）+ /v3/skill/conversation/add（Skill 归档）
  *
+ * 子 agent 会话（DSH 派出去的子会话，session.header.origin === 'subagent'）默认降级：
+ * 不注入 / 不召回 / 不注册知识 skill / 不预热资产 / 不回流（两个开关可改，见 config.mjs
+ * 的 subagentInjectionEnabled / subagentCaptureEnabled 与 lib/subagent.mjs）。
+ *
  * 身份与开关来源（优先级高→低）：
  *   1. Web 设置面板（「设置 → 插件 → TDAI Memory」卡片）
  *   2. env（TDAI_MEMORY_*）
@@ -28,6 +32,7 @@ import { wireCapture } from './lib/capture.mjs'
 import { registerTools, registerKnowledgeTools } from './lib/tools.mjs'
 import { registerCommands } from './lib/commands.mjs'
 import { applySettings } from './lib/settings.mjs'
+import { readSideAllowed, isSubagentSession } from './lib/subagent.mjs'
 
 export const name = 'dsh-tdai-memory-plugin'
 export const inject = ['tools', 'systemPrompt', 'sessions']
@@ -59,6 +64,10 @@ export function apply(ctx, config = {}) {
     get config() { return activeCfg },
     log,
     readEnabled() { return activeCfg.enabled && identityComplete(activeCfg) },
+    /** 读侧对该会话是否生效（子 agent 会话默认降级，见 lib/subagent.mjs）。 */
+    readSideAllowedFor(session) { return readSideAllowed(activeCfg, session) },
+    /** 这个会话是不是 DSH 派出去的子 agent 会话（/tdai-status 用它解释"为什么没注入"）。 */
+    isSubagent(session) { return isSubagentSession(session) },
     identityFor(session) {
       const sessionId = str(session?.id)
       if (!identityComplete(activeCfg) || !sessionId) return undefined
@@ -96,8 +105,16 @@ export function apply(ctx, config = {}) {
   ctx.inject(['commands'], (commandsCtx) => registerCommands(commandsCtx, runtime))
 
   ctx.on('agent/session-start', (payload) => {
-    const sessionId = payload?.agent?.session?.id
-    if (sessionId && runtime.readEnabled() && (runtime.config.injectionEnabled || runtime.config.recallEnabled)) {
+    const session = payload?.agent?.session
+    const sessionId = session?.id
+    // 子 agent 会话按策略降级时**不预热**：整个读侧都不会用到这份资产，预热只是
+    // 白白打一轮网关（并发扇出 N 个子 agent 就是 N 份）。见 lib/subagent.mjs。
+    if (
+      sessionId
+      && runtime.readEnabled()
+      && readSideAllowed(runtime.config, session)
+      && (runtime.config.injectionEnabled || runtime.config.recallEnabled)
+    ) {
       // 后台预热，不 await：会话刚建立时把整包资产拉起来，
       // 让第一次 pre-step / assemble 尽量命中缓存（加载本身有总预算与失败冷却）。
       assets.warm(sessionId)

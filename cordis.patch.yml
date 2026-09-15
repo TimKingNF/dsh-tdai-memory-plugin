@@ -20,6 +20,8 @@
         profileMemoryEnabled: !!js process.env.TDAI_MEMORY_PROFILE_MEMORY_ENABLED ?? ''
         skillsEnabled: !!js process.env.TDAI_MEMORY_SKILLS_ENABLED ?? ''
         knowledgeEnabled: !!js process.env.TDAI_MEMORY_KNOWLEDGE_ENABLED ?? ''
+        subagentInjectionEnabled: !!js process.env.TDAI_MEMORY_SUBAGENT_INJECTION_ENABLED ?? ''
+        subagentCaptureEnabled: !!js process.env.TDAI_MEMORY_SUBAGENT_CAPTURE_ENABLED ?? ''
         recallLimit: !!js process.env.TDAI_MEMORY_RECALL_LIMIT ?? ''
         l2Limit: !!js process.env.TDAI_MEMORY_L2_LIMIT ?? ''
         timeoutMs: !!js process.env.TDAI_MEMORY_TIMEOUT_MS ?? ''

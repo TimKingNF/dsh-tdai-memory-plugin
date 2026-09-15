@@ -164,7 +164,32 @@ system 段注入从 **9953 → 5768 字节（-42%）**，其中团队知识块�
   `cordis.patch.yml` 里有对应行，且 `assetRetryCooldownMs` 的 `0` / `'0'` / `''`
   三种输入语义正确。
 
-#### 10. 其它小修
+#### 10. 子 agent 会话把父 agent 的记忆整套继承，并把执行过程写进长期记忆
+
+- **现象**（实测本机数据）：派一个子 agent 时，子会话的 system prompt 与父会话**逐字节相同**
+  （13020 字节），其中本插件的 4 个注入段占 **6093 字节（47%）**；子会话还会各自做一轮 L1 召回
+  （实测 2 条、共约 4.4KB）。更严重的是回写：`captureEnabled` 是进程级开关，
+  `agent/turn-stopping` 对任何会话都生效 —— 一个 23 步的调查子 agent 把 **37 条消息**
+  （任务 prompt、整份 diff、测试原始输出、每条工具调用）写进了 L0，会被后台抽取当成
+  "关于用户的记忆"。子 agent 的任务通常范围明确，这些内容对长期记忆是工作噪音。
+- **根因**：本插件注册的 section 在**全局层**，`agent/pre-step` 与 `session/event` 监听是进程级的，
+  子会话天然一并继承；插件此前不区分会话类型。
+- **修复**：新增两个开关，**默认都对子 agent 关闭**——
+  `subagentInjectionEnabled=false`（子会话不注入 4 个段、不做 L1 召回、不注册知识 skill、
+  **不预热资产**；只读工具仍在）、`subagentCaptureEnabled=false`（子会话不回流）。
+  判定用 DSH 的 durable 标记 `session.header.origin === 'subagent'`（`delegationDepth` 兜底），
+  spawn 与 fork 两种子会话都覆盖；**缺 header 一律按父会话处理**（fail-open 到"维持现状"）。
+  见 `lib/subagent.mjs`。
+- **缓存代价（如实记录）**：关掉子会话注入会让它的 system prompt 在第一个 TDAI 段处
+  （实测字节 1557）与父会话分叉，其后 11463 字节在**子会话第一次请求**按未命中计价，
+  约 3.3K tokens 的差价 / 子会话，一次性。若部署用 DSH 原生的
+  `dsh-tool-subagent` 的 `persona` 或 `toolFilter` 定制子 agent（前缀在最前面就分叉），
+  这项降级是**零缓存代价**。完整账见 docs/prompt-design.zh-CN.md §3.4。
+- **附带收益**：子会话不再预热资产 —— 每个子会话省掉一整轮资产请求（扇出 N 个子 agent 就省 N 份）。
+- **测试**：新增 `test/subagent.test.mjs`，每个用例**成对**断言"子会话降级 + 父会话照旧"
+  （防止把父会话一起降级这类事故）；已做变异验证：把判定改成恒 true 或恒 false，测试都会红。
+
+#### 11. 其它小修
 
 - `/tdai-help` 里残留了一段**旧版 8 工具清单**，与新写的 10 工具清单重复（`lib/commands.mjs`）。
 - `.gitignore` 补 `test/.tmp/`（设置卡片测试会在这里生成临时 ESM）。
@@ -217,6 +242,15 @@ system 段注入从 **9953 → 5768 字节（-42%）**，其中团队知识块�
 - `/tdai-status` 输出补全：身份来源（env / settings）、缺哪些字段、L3/L2/知识资源的
   装载情况、每个知识资源的工具清单是否预取成功。
 
+#### 子 agent 会话
+
+- 默认不继承读侧、不回流（两个开关见上一条修复）。面板新增「子 agent · 委派出去的子会话」分组，
+  环境变量 `TDAI_MEMORY_SUBAGENT_INJECTION_ENABLED` / `TDAI_MEMORY_SUBAGENT_CAPTURE_ENABLED`。
+- `/tdai-status` 现在会报告两个开关、以及**当前会话是不是子 agent 会话**（含委派深度与父会话），
+  用来解释"开关明明开着却什么都没注入"。
+- 子会话里调 `tdai_knowledge_call` 会得到可解释的提示（"本会话是子 agent 会话，读侧已降级"），
+  而不是容易被误解成配置问题的"当前会话没有绑定团队知识资源"。
+
 #### 文档
 
 - README 拆成英文（`README.md`）与中文（`README_CN.md`）两个版本。
@@ -226,7 +260,7 @@ system 段注入从 **9953 → 5768 字节（-42%）**，其中团队知识块�
 
 ### 测试
 
-`npm test` 覆盖 15 个测试文件 + 13 处 `node --check`，全部通过（≈3s，无网络依赖；
+`npm test` 覆盖 16 个测试文件 + 14 处 `node --check`，全部通过（≈3s，无网络依赖；
 涉及网关的两个用例起本地 HTTP 服务）。新增/接入的测试与它们锁定的行为：
 
 | 测试文件 | 锁定的行为 | 类型 |
@@ -245,6 +279,7 @@ system 段注入从 **9953 → 5768 字节（-42%）**，其中团队知识块�
 | `test/knowledge-tools.test.mjs` | 越权拒绝 / 参数透传 / `isError` 语义 / 缺参 / fail-open / schema / 会话解析 | 回归护栏 |
 | `test/settings-card.test.mjs` | 字段 ↔ schema 一致、数值归一化、身份判定、**`client.js` 与 `client.card.tsx` 同源** | 回归护栏 |
 | `test/settings-card-render.test.mjs` | 面板分组 / 条数上限输入框 / 依赖置灰矩阵 / 身份告警 | 契约 |
+| `test/subagent.test.mjs` | 子会话判定、system 不注入、L1 不召回、不预热资产、不回流、知识工具可解释；**每个用例成对断言父会话照旧** | 回归护栏 |
 | `test/prompt-budget.test.mjs` | 各注入块字节数硬上界（`tdai:knowledge-tools` ≤ 600 等）+ 软基线不增长 | 契约 |
 
 **只有现场验证、没有自动化测试的部分**（如实记录）：
@@ -266,6 +301,9 @@ system 段注入从 **9953 → 5768 字节（-42%）**，其中团队知识块�
   该决定已在 §11 回退，**以 §11 为准**。
 - 工具 schema（10 个 ≈6446 字节）尚未纳入 `test/prompt-budget.test.mjs` 的预算覆盖，
   后续加工具或改 description 时不会有红灯提醒。
+- 子 agent 降级**不含工具**：10 个只读工具在子会话里仍然注册（约 6446 字节 schema）。
+  要连工具一起对子 agent 收紧，用 DSH 原生的 `dsh-tool-subagent` 的 `toolFilter`
+  （`tools.restrict()`）—— 那是部署级选择，且会让前缀在最前面分叉。
 
 ---
 

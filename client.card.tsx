@@ -22,6 +22,11 @@
  *   写侧总开关 captureEnabled —— **完全独立**，既不受 enabled 约束，
  *   也不受 injectionEnabled 约束（lib/capture.mjs 只判它自己）。
  *
+ *   子 agent 会话（DSH 派出去的子会话）：
+ *     subagentInjectionEnabled  默认**关**：子会话不注入 4 个段、不召回、不注册知识 skill
+ *     subagentCaptureEnabled    默认**关**：子 agent 的执行过程不回流 L0
+ *   两者都按 session.header.origin === 'subagent' 判定，见 lib/subagent.mjs。
+
  * 三个容易搞错的点：
  *   1. L1 召回**不**依赖 injectionEnabled（recall.mjs 只判 readEnabled + recallEnabled）；
  *      injectionEnabled 只管 system prompt 的那 4 个段。
@@ -69,8 +74,29 @@ const INJECT_TOGGLES = [
   { key: 'sessionContextEnabled', label: '会话上下文（Agent / Task）' },
   { key: 'profileMemoryEnabled', label: '长期记忆（L3 画像 + L2 索引）' },
   { key: 'skillsEnabled', label: 'Skill 列表' },
-  { key: 'knowledgeEnabled', label: '知识库（wiki / code-graph）', hint: '默认关' },
+  { key: 'knowledgeEnabled', label: '知识库（wiki / code-graph）', hint: '默认关', defaultOff: true },
 ]
+
+/**
+ * 子 agent（DSH 派出去的子会话）的两个降级开关，**默认都关**。
+ *
+ * 默认关的理由：子 agent 的任务通常由父 agent 明确指定（"分析这段 diff"），
+ * 父 agent 的画像 / 召回是干扰；它的整段执行过程属于工作噪音，不该进长期记忆。
+ * 判定与语义见 lib/subagent.mjs（按 session.header.origin === 'subagent'）。
+ */
+const SUBAGENT_INJECT_TOGGLE = {
+  key: 'subagentInjectionEnabled',
+  label: '子 agent 继承注入与召回',
+  hint: '默认关：子会话不注入记忆段、不做 L1 召回、不注册知识 skill（只读工具仍在）',
+  defaultOff: true,
+}
+const SUBAGENT_CAPTURE_TOGGLE = {
+  key: 'subagentCaptureEnabled',
+  label: '子 agent 对话回流',
+  hint: '默认关：子 agent 的执行过程不写进长期记忆',
+  defaultOff: true,
+}
+const SUBAGENT_TOGGLES = [SUBAGENT_INJECT_TOGGLE, SUBAGENT_CAPTURE_TOGGLE]
 
 /** 写侧：唯一的开关，且与读侧完全独立。 */
 const WRITE_TOGGLES = [
@@ -108,7 +134,7 @@ const IDENTITY_FIELDS = [
 
 /** 卡片字段的单一事实来源，导出给 test/settings-card.test.mjs 做一致性断言。 */
 export const CARD_FIELDS = {
-  toggles: [...READ_TOGGLES, ...INJECT_TOGGLES, ...WRITE_TOGGLES],
+  toggles: [...READ_TOGGLES, ...INJECT_TOGGLES, ...WRITE_TOGGLES, ...SUBAGENT_TOGGLES],
   numeric: NUMERIC_FIELDS,
   identity: IDENTITY_FIELDS,
   requiredIdentity: REQUIRED_IDENTITY,
@@ -301,11 +327,12 @@ function TdaiMemoryCard(props: { ctx: Context }) {
    * 但**仍可点击**（允许先配好再开总闸，比强制顺序更省事）。
    */
   const toggleItem = (
-    t: { key: string; label: string; hint?: string },
+    t: { key: string; label: string; hint?: string; defaultOff?: boolean },
     dim: boolean,
     dimReason: string,
   ) => {
-    const checked = t.key === 'knowledgeEnabled' ? value[t.key] === true : value[t.key] !== false
+    // 默认开的项用 `!== false`（快照里缺字段也算开），默认关的项必须显式 `=== true`。
+    const checked = t.defaultOff === true ? value[t.key] === true : value[t.key] !== false
     return (
       <label
         key={t.key}
@@ -395,6 +422,13 @@ function TdaiMemoryCard(props: { ctx: Context }) {
             {groupTitle('写侧 · 把对话回流给 MemoryCore')}
             <div style={flowStyle}>
               {WRITE_TOGGLES.map((t) => toggleItem(t, false, ''))}
+            </div>
+
+            {/* ── 子 agent：默认降级（读侧 + 写侧各一个开关，互相独立）────────── */}
+            {groupTitle('子 agent · 委派出去的子会话')}
+            <div style={flowStyle}>
+              {toggleItem(SUBAGENT_INJECT_TOGGLE, !readOn, READ_DIM_REASON)}
+              {toggleItem(SUBAGENT_CAPTURE_TOGGLE, false, '')}
             </div>
 
             {/* ── 身份与地址（readEnabled = 读侧总开关 && 身份齐全）───────────── */}

@@ -58,6 +58,9 @@ DeepSeek Harness 的 [TencentDB Agent Memory](https://github.com/TencentCloud/Te
 数据来源：`/v3/core/read`（L3）、`/v3/scenario/ls`（L2）、`/v3/skill/listing`（skill）、
 `/v3/knowledge/list`（knowledge）、`/v3/atomic/search`（L1 召回）、`/v3/meta/*`（agent/task 详情）。
 
+**子 agent 会话（DSH 派出去的子会话）默认不继承以上任何一项**，见
+[子 agent 会话](#子-agent-会话默认读侧关写侧关)。
+
 **L1 召回为什么不写进用户那条消息**：宿主要在 `agent/pre-step` 之后把
 `decision.messages` **原样持久化**（`dsh-agent-loop` 的 `session.append("user/message", …)`）。
 如果把召回块 prepend 进真人消息，那段内容就会永久留在"用户发言"里 —— 前端把它当用户输入回显、
@@ -146,6 +149,34 @@ schema 从 2774 → 6446 字节（新增 2 个知识工具 + 记忆工具描述�
   被 pre-step reject 的轮次走不到那里。插件在 `agent/error` 与 `turn/end` 上兜底：
   记日志 + 清缓冲，但**不写记忆** —— 半轮对话进 L0 只会被后台抽取当成"完整的一轮"消费。
 
+### 子 agent 会话（默认：读侧关、写侧关）
+
+DSH 派子 agent（`subagent` / `subagent_fork` 工具）时，子会话会继承本插件注册在全局层的
+section，并且同样触发进程级的监听。默认配置下的实测后果：
+
+- 子会话的 system prompt 与父会话**逐字节相同**（13020 字节，其中我们的 4 个段占 6093 字节 = 47%），
+  并且会各自做一轮 L1 召回（实测 2 条、约 4.4KB）；
+- 由于 `captureEnabled` 是进程级开关，一个 23 步的调查子 agent 往 L0 写了 **37 条消息**
+  （任务 prompt、整份 diff、测试原始输出、每条工具调用）——后台抽取会把这类工作噪音
+  当成"关于用户的记忆"。
+
+所以插件现在默认对子会话退让：
+
+| 开关 | 默认 | 对子会话的效果 |
+| --- | --- | --- |
+| `subagentInjectionEnabled` | **关** | 不注入 system 段、不做 L1 召回、不注册知识 skill、不预热资产；10 个只读工具仍在 |
+| `subagentCaptureEnabled` | **关** | 子会话的对话不回流 MemoryCore |
+
+判定用 DSH 的 durable 标记 `session.header.origin === 'subagent'`（`delegationDepth > 0` 兜底），
+spawn 与 fork 两种子会话都覆盖；**缺 header 一律按顶层会话处理**（fail-open 到"维持现状"）。
+`/tdai-status` 会报告这两个开关，以及当前会话是不是子 agent 会话。
+
+**缓存说明**：关掉子会话注入后，子会话的 system prompt 会在第一个 TDAI 段处与父会话分叉，
+其后所有字节在**子会话第一次请求**按未命中计价（实测约 3.3K tokens 的"未命中 vs 命中"差价，
+每个子会话一次性；之后命中子会话自己的缓存）。如果你用 DSH 原生的 `dsh-tool-subagent` 的
+`persona` / `toolFilter` 定制子 agent，前缀本来就在最前面分叉，这项降级是**零缓存代价**。
+完整账目见 [docs/prompt-design.zh-CN.md](docs/prompt-design.zh-CN.md) §3.4。
+
 ### 通用
 
 - **fail-open**：Gateway 任何故障只记日志，不阻断 DSH
@@ -171,6 +202,7 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
 
 - **读侧**：读侧总开关、L1 自动召回（含**单轮召回条数上限**）、System prompt 注入，以及注入下的 4 个段
 - **写侧**：对话回流（独立于读侧）
+- **子 agent**：子会话是否继承读侧、是否回流（默认都关）
 - **身份与地址**：MemoryCore 地址、实例 ID、Team / Agent / User / Task ID、User Key、
   知识服务地址改写
 
@@ -186,6 +218,10 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
                      └─ 只读工具（无独立开关）
 
 写侧总开关 captureEnabled —— 独立，既不受 enabled 也不受 injectionEnabled 约束
+
+子 agent 会话（按会话判定，不受上面开关影响）
+  subagentInjectionEnabled —— 子会话是否继承读侧   默认关
+  subagentCaptureEnabled   —— 子会话是否回流       默认关
 ```
 
 三个容易踩的点：
@@ -220,6 +256,10 @@ export TDAI_MEMORY_SESSION_CONTEXT_ENABLED=true
 export TDAI_MEMORY_PROFILE_MEMORY_ENABLED=true
 export TDAI_MEMORY_SKILLS_ENABLED=true
 export TDAI_MEMORY_KNOWLEDGE_ENABLED=false  # 团队知识资源注入，默认关
+
+# ── 子 agent（子会话）──
+export TDAI_MEMORY_SUBAGENT_INJECTION_ENABLED=false  # 子会话是否继承读侧（默认关）
+export TDAI_MEMORY_SUBAGENT_CAPTURE_ENABLED=false    # 子会话是否回流（默认关）
 
 # ── 调参 ──
 export TDAI_MEMORY_ENDPOINT=http://127.0.0.1:8420

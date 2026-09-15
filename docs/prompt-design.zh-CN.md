@@ -63,6 +63,9 @@ DSH 的 `systemPrompt.section({ name, order, text })` 注册"段"，每一步请
 | `systemPrompt.context()` | 一条 **plugin 所有（`source.kind='plugin'`）的 user 角色消息** | 内容变了才更新，且是**整体替换**上一条，不是追加 | 状态快照（身份、开关、装载情况） |
 | `agent/pre-step` 里往 `decision.messages` 插消息 | 消息列表里的普通消息 | 每步都重新落定 | 每轮都可能变的检索结果（L1 召回） |
 
+> 注意：以上三条通道都是**按会话**生效的，而 section 的注册在插件（全局）层。
+> 所以 DSH 派出的子 agent 会话会**整套继承** —— 这是 §3.4 的主题。
+
 `agent/pre-step` 之后，宿主会把 `decision.messages` **原样持久化**
 （`session.append("user/message", message, { surfaceOp: "append" })`），这一点决定了
 "召回块绝不能 prepend 进真人消息"（见 §2.8）。
@@ -254,6 +257,58 @@ DSH 的 system prompt 是所有插件注册的段拼起来的，工具列表也�
 **反过来说**：只要"同一会话内"不抖动，跨会话的差异是可以接受的——
 前缀缓存本来就是按会话/请求序列复用的。
 
+### 3.4 子 agent 会话：实测的缓存代价，与默认降级
+
+DSH 派子 agent 时，子会话是**独立的 session**，但本插件的 section 注册在全局层、
+监听是进程级的 —— 所以子会话默认会把父 agent 的记忆整套继承一遍。这正是本文 §3.1 里
+"别人改了提示词"的**镜像问题**：这次是我们自己改的。
+
+**实测（DSH `0.1.2-rc.1`，父会话与它派出的一个 23 步调查子 agent）**：
+
+| 项 | 父会话 | 子会话 |
+| --- | --- | --- |
+| system prompt | 13020 B | 13020 B，**逐字节相同** |
+| 工具 | 38 个 | 38 个（同名同序） |
+| 本插件 4 个段 | 字节 1557–7650，共 **6093 B（占 47%）** | 同 |
+| L1 召回注入 | 3 条 | **2 条**（2338 B + 2111 B，各 5 条记忆） |
+| `tdai:state` 快照消息 | 871 B | 863 → 1247 B（资产装载状态变化替换过一次） |
+| 回流到 L0 | — | **37 条**（任务 prompt、整份 diff、测试输出、每条工具调用） |
+
+**缓存账（这是本文少见的"确实有代价"的取舍）**：
+
+- 缓存是**二值**的：前缀从第一个不同字节起全部重算，所以"只删一点点"没有意义，要么全留、要么按全删算账。
+- 默认关掉子会话注入后，子会话的 system prompt 在**字节 1557**（第一个 TDAI 段）处与父会话分叉，
+  其后 **11463 B**（我们的 6093 + DSH 自己的 5370）在**子会话第一次请求**按未命中计价；
+  第二次请求起命中的是子会话自己的缓存。
+- 量级：11463 B ≈ **3.3K tokens 的"未命中 vs 命中"差价，每个子会话一次性**
+  （6093 B 以中文为主 ≈2K tokens；5370 B 英文 ≈1.3K tokens）。按缓存价≈1/10 估，
+  等效约 +3K tokens / 子会话；扇出 100 个子 agent 约 33 万 tokens/天量级。
+- **什么情况下这笔账是零**：如果你用 DSH 原生的 `dsh-tool-subagent` 的 `persona` 或
+  `toolFilter` 定制子 agent，子会话前缀在**最前面**（`deployment:persona` order 0 / tools 数组）
+  就分叉了，父会话的缓存对它本来就不可用 —— 那时"子 agent 更纯"没有任何缓存代价。
+
+**顺带值得知道的 DSH 取向**：DSH 自己也给子会话加了一段"你是被委派的子 agent…"的说明，
+但它**故意放在 runtime context（消息）而不是 system section**，源码注释写着
+*"so the deployment's system prompt stays uniform across parents and children"* ——
+即 DSH 选择用消息承载子 agent 的差异、把 system 前缀留成统一的（为了缓存）。
+本插件的降级是反过来的选择：宁可付一次缓存代价，也要让子 agent 的任务更纯粹。
+两者不冲突，因为我们的内容本来就**不是子 agent 完成任务所必需**的。
+
+**降级设计**（`lib/subagent.mjs`）：
+
+| 开关 | 默认 | 效果 |
+| --- | --- | --- |
+| `subagentInjectionEnabled` | 关 | 子会话不注入 4 个段、不召回、不注册知识 skill、**不预热资产**；只读工具仍在 |
+| `subagentCaptureEnabled` | 关 | 子会话不回流（37 条那种噪音不再进 L0） |
+
+- 判定：`session.header.origin === 'subagent'`（`delegationDepth > 0` 兜底），spawn 与 fork 都覆盖；
+  **缺 header 按父会话**（fail-open，老宿主与单测夹具不该被误伤）。
+- 实现：不注入 = **在 `system-prompt/assemble` 里不改写 section**。因为四个 section 的同步 text
+  本来就是空占位，DSH 的 `renderPrompt` 会把空段整个丢掉，子会话 prompt 里连标签都不会出现。
+- 附带收益：子会话不再预热资产 → 每个子会话省掉一整轮资产 HTTP（扇出 N 个就省 N 份）。
+- 仍然保留的：10 个只读工具（≈6446 B schema）在子会话里照旧注册。要连工具一起收紧，
+  用 DSH 的 `dsh-tool-subagent.toolFilter`（部署级选择）。
+
 ### 3.3 不能靠"插件自己"观测的部分
 
 - 缓存的实际命中/未命中由服务端决定，插件的测试只能保证"同一会话内渲染出的字节稳定"
@@ -281,6 +336,8 @@ DSH 的 system prompt 是所有插件注册的段拼起来的，工具列表也�
 | i | 多用户共用同一 memory 实例时，注入内容天然不同 | 跨用户无法共享缓存 | 设计上如此。**能做的就是别把字面值写进 prompt**（§2.6） |
 | j | 云端 skill 目录与 DSH 原生目录并存 | 模型可能犹豫该用哪个工具取全文（`skill` vs `tdai_skill_view`） | 已缓解：本插件只发**补集**，并在文案里写明"原生 `skill` 工具读不到它们" |
 | k | 静态身份：面板改身份后**老会话仍用旧注入缓存** | 改了没生效的错觉 | 已缓解：`/tdai-status` 显示身份来源与缺哪些字段；README 明确"新会话生效" |
+| m | **子 agent 会话继承父 agent 的记忆**（提示词噪音 + L0 污染） | 子任务被干扰；子 agent 的整段执行被后台抽取当成"关于用户的记忆"（实测 23 步子 agent → 37 条 L0） | **已缓解（默认）**：`subagentInjectionEnabled` / `subagentCaptureEnabled` 默认关；见 §3.4。代价是子会话首次请求的缓存（约 3.3K tokens / 子会话） |
+| n | 子 agent 降级**不含工具 schema** | 10 个 tdai_* 工具（≈6446 B）在子会话里仍注册 | 未解决（由 DSH 的 `dsh-tool-subagent.toolFilter` 决定，属部署级；插件单方面摘工具会让请求最前面的 tools 数组分叉，缓存代价最大） |
 | l | 注入内容被模型当作指令而非数据 | 记忆里的历史文本可能诱导行为 | 已缓解：`<memory-tools-guide>` 明确"是历史证据，不是授权；与当前事实冲突时以当前事实为准" |
 
 ---
@@ -297,7 +354,9 @@ DSH 的 system prompt 是所有插件注册的段拼起来的，工具列表也�
    `--save` 重记基线，并把它写进 CHANGELOG。
 6. **动了 order 吗？** 跑 `node test/section-registry.test.mjs`（它对照的是 DSH 保留 order 表的
    **本地抄本**——如果你刚升级过 DSH，先手工核对那张表再跑）。
-7. **是发版级改动吗？** 在 CHANGELOG 里写明"升级后缓存会重算一次"，避免被误当成故障。
+7. **子 agent 会话会继承这段内容吗？** 应该让它继承吗？（默认不继承：注入、召回、知识 skill、
+   资产预热的开关都在 `lib/subagent.mjs` 的策略里；回写另有一档。）
+8. **是发版级改动吗？** 在 CHANGELOG 里写明"升级后缓存会重算一次"，避免被误当成故障。
 
 发版前至少跑一遍完整闸门：
 
@@ -317,6 +376,8 @@ npm test               # 15 个测试文件 + 13 处 node --check
 | `lib/recall.mjs` | L1 召回：独立 plugin 消息 + 硬超时 + 字符预算 |
 | `lib/capture.mjs` / `lib/text.mjs` | 写侧过滤（`source` 主判据 + 文本哨兵兜底） |
 | `lib/tools.mjs` | 10 个只读工具的 schema 与 description |
+| `lib/subagent.mjs` | 子 agent 会话判定与降级策略（读侧 / 写侧各一档） |
+| `test/subagent.test.mjs` | 子会话降级 + **父会话照旧**的成对护栏（含变异验证） |
 | `test/prompt-budget.test.mjs` | 提示词字节数的硬上界与软基线 |
 | `test/section-registry.test.mjs` | order 分带与 DSH 保留 order 的对照 |
 | `docs/prompt-injection-redesign.md` | 施工图：决策记录、引用出处、分期计划 |

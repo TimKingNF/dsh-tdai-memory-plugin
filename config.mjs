@@ -16,6 +16,12 @@
  *
  *   captureEnabled     回流（写侧）**完全独立**：既不受 enabled 约束，也不受
  *                      injectionEnabled 约束（lib/capture.mjs 只判它自己），默认开
+ *
+ *   subagentInjectionEnabled  子 agent 会话是否继承读侧。**默认关**：子会话不注入、
+ *                             不召回、不注册知识 skill、不预热资产（只读工具仍在）。
+ *   subagentCaptureEnabled    子 agent 会话是否回流。**默认关**：子 agent 的执行过程
+ *                             不进 L0，避免后台抽取把工作噪音当成用户记忆。
+ *                             两者判定见 lib/subagent.mjs（按 session.header.origin）。
  */
 const FALSEY = /^(0|false|no|off)$/i
 
@@ -60,6 +66,14 @@ export function resolveConfig(config = {}) {
     profileMemoryEnabled: boolOpt(config.profileMemoryEnabled, true),
     skillsEnabled: boolOpt(config.skillsEnabled, true),
     knowledgeEnabled: boolOpt(config.knowledgeEnabled, false),
+
+    /**
+     * 子 agent 会话的降级开关（见 lib/subagent.mjs 顶部注释）。
+     * 默认都是 false = "子会话不继承注入 / 不回流"——子 agent 的任务通常范围明确，
+     * 父 agent 的画像与召回是干扰；它的中间过程也不该进长期记忆。
+     */
+    subagentInjectionEnabled: boolOpt(config.subagentInjectionEnabled, false),
+    subagentCaptureEnabled: boolOpt(config.subagentCaptureEnabled, false),
 
     endpoint: str(config.endpoint) || 'http://127.0.0.1:8420',
     apiKeyEnv: str(config.apiKeyEnv) || 'TDAI_MEMORY_API_KEY',
