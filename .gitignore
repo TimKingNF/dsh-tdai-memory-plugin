@@ -1,2 +1,19 @@
 node_modules/
 test/.tmp/
+
+# ── 凭据与本地环境（防手滑提交）──────────────────────────────────────────────
+# 本插件的密钥只从 env 读（TDAI_MEMORY_API_KEY 等），仓库里不该出现任何真实凭据。
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+.npmrc
+.yarnrc
+credentials.json
+*.local.json
+
+# 真实 prompt 快照：本地产物，含会话内容与本机路径，不入库（`npm run snapshot:prompt` 之类
+# 的本地导出请写到 test/.tmp/）。历史上曾经入库过，已通过重写历史清除。
+test/prompt/prompt.md

@@ -341,7 +341,13 @@ fields are missing.
 npm install
 npm run build:client   # rebuild client.js after editing client.card.tsx
 npm test               # syntax checks + pure-function and wiring tests (no network needed)
+npm run check:secrets  # scan tracked files for credential-looking strings (also the last step of npm test)
 ```
+
+Credentials never belong in this repo — every key is read from the environment at runtime
+(`TDAI_MEMORY_API_KEY` is env-only and never enters the settings panel). `npm test` ends with the
+secret scan, so a pasted token fails the suite; a genuine false positive is suppressed by adding the
+literal to `scripts/secret-scan-allowlist.txt` **with a reason**.
 
 The test suite is the release gate. Two of its guards are worth knowing before you change prompt
 content:

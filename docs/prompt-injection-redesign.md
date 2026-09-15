@@ -3,10 +3,10 @@
 > 本文是施工图。**每一处结论都标注了可追溯的出处**，格式为 `仓库相对路径:行号`。
 > 涉及的三个代码库：
 >
-> - `DSH` = `/home/tim/.nvm/versions/node/v24.13.0/lib/node_modules/@deepseek-ai/dsh/`
+> - `DSH` = `<dsh-install>/`
 >   内部包在 `node_modules/@deepseek-ai/<包名>/`，下文省略这个前缀，直接写 `dsh-system-prompt/lib/index.js`。
-> - `PLUGIN` = 本仓库 `/mnt/d/workspace/github/dsh-tdai-memory-plugin/`
-> - `PROXY` = `/mnt/d/workspace/github/TencentDB-Agent-Memory/MemoryProxy/`
+> - `PLUGIN` = 本仓库 `<repo>/`
+> - `PROXY` = `<tdai-repo>/MemoryProxy/`
 
 ---
 
@@ -367,7 +367,7 @@ DSH 的排序是"先比 order，order 相同才比 name"（`dsh-system-prompt/li
 - **技术上没有冲突**：settings 命名空间是 `settings` 服务的名字表，section 是 `systemPrompt` 的名字表，两张表互不相干。
 - **但排查时无法区分**：`settings.yaml` 里的 `tdai-memory:` 段落和日志里的 section 名长得一样。
 
-**本版处理**：section 层全部改成 `tdai:*`（且不再有 `tdai:overview`）；settings 命名空间**保持 `tdai-memory` 不变**（`PLUGIN/lib/settings.mjs:10`）。原因：`/home/tim/.dsh/settings.yaml` 里已经持久化了 `tdai-memory:` 这个键，改名会导致用户已保存的配置（`serviceId/teamId/agentId/userId/userKey`）失联。前端卡片里的 `const NS = 'tdai-memory'`（`PLUGIN/client.card.tsx:14`）同理不动。
+**本版处理**：section 层全部改成 `tdai:*`（且不再有 `tdai:overview`）；settings 命名空间**保持 `tdai-memory` 不变**（`PLUGIN/lib/settings.mjs:10`）。原因：`~/.dsh/settings.yaml` 里已经持久化了 `tdai-memory:` 这个键，改名会导致用户已保存的配置（`serviceId/teamId/agentId/userId/userKey`）失联。前端卡片里的 `const NS = 'tdai-memory'`（`PLUGIN/client.card.tsx:14`）同理不动。
 
 ### 5.3 规则三：按"稳定性"分通道
 
@@ -460,7 +460,7 @@ proxy 的表单还承担一个 UI 作用：让用户显式确认"本次会话是
 - 插件监听宿主事件 `session/event`（`PLUGIN/lib/capture.mjs:39`）收集每轮消息，在 `agent/turn-stopping` 时双写：`/v3/conversation/add`（L0）+ `/v3/skill/conversation/add`（Skill 归档）（`PLUGIN/lib/capture.mjs:56-60` + `PLUGIN/client.mjs:101-106`）。
 - 它还会剔除插件自己注入的块，避免污染记忆：`INJECTED_MARKERS` 过滤（`PLUGIN/lib/capture.mjs:14-20`），在 `:60` 生效。
 
-**已做的实测（2026-09-14）**：扫描 `/home/tim/.dsh/sessions/` 下全部 13 个会话日志，检索召回标记 `<tdai_recalled_l1_memories>`。命中全部落在 `tool/result`、`assistant/chunk`、`assistant/message`、`tool/call` 这四类事件里——**没有任何一条落在 `user/message` 事件上**。即 `isInjectedContext` 的过滤**当前是生效的**，召回块没有被写进 L0。
+**已做的实测（2026-09-14）**：扫描 `~/.dsh/sessions/` 下全部 13 个会话日志，检索召回标记 `<tdai_recalled_l1_memories>`。命中全部落在 `tool/result`、`assistant/chunk`、`assistant/message`、`tool/call` 这四类事件里——**没有任何一条落在 `user/message` 事件上**。即 `isInjectedContext` 的过滤**当前是生效的**，召回块没有被写进 L0。
 
 **为什么仍要列进验收项**：这个过滤依赖一份**硬编码标记清单**（`PLUGIN/lib/capture.mjs:15`），而不是"凡注入必过滤"的机制。改造会改变注入块的文本形态，一旦标记与实际渲染文本对不上，过滤就会静默失效——而失效的方向是**把注入内容当用户真实发言写进长期记忆**，污染永久且难以事后清理。
 
@@ -835,11 +835,11 @@ skill 机制比方案里设想的更合适：
 
 | 证据 | 位置 | 结论 |
 | --- | --- | --- |
-| `user/message` 正文 = `<tdai_recalled_l1_memories>…` + 真人原话 | `session-87d978e4…` seq 89000（2026-09-15T15:25:05Z） | prepend **真的被持久化成用户发言**：现象 1 的直接原因 |
+| `user/message` 正文 = `<tdai_recalled_l1_memories>…` + 真人原话 | `session-<id>…` seq 89000（2026-09-15T15:25:05Z） | prepend **真的被持久化成用户发言**：现象 1 的直接原因 |
 | 同一条消息的 `source` 仍是 `{ kind: 'user', rpcId: … }` | 同上 | 结构判据认不出注入部分，回写只能靠文本哨兵 |
 | 宿主的 inbox 原始消息（`agent/inbox/spliced` seq 88996）**不含**召回块 | 同上 | 召回块是插件在 pre-step 里加进去的，不是用户输入 |
 | `dsh web` 进程 4 分 38 秒内 CPU 仅 9 秒（3.4%）、RSS 351MB | `ps` 于 23:25（另一会话里跑过） | 现象 2 **不是** JS 忙循环，而是在等 I/O |
-| 受影响会话的日志在投诉时间点**没有** `agent/inbox/spliced` | `session-9d024a8e…` 只有 header + 3 条 preset 事件 | 那条消息**没进到服务端**（前端/连接层的问题），插件侧无法解释"没有事件" |
+| 受影响会话的日志在投诉时间点**没有** `agent/inbox/spliced` | `session-<id>…` 只有 header + 3 条 preset 事件 | 那条消息**没进到服务端**（前端/连接层的问题），插件侧无法解释"没有事件" |
 | 卡住的时间点正值**手工重启**（新 token 的 `dsh web`），页面是上一进程打开的 | `~/.dsh/restart-helper-111898.log`、`dsh-web.log` | 高度怀疑根因是**页面与旧进程的连接**，与召回无关 |
 
 **结论（不夸大）**：现象 1 由 prepend 直接造成，已修（§11.3）。

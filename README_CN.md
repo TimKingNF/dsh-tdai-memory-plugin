@@ -316,7 +316,12 @@ export TDAI_MEMORY_ASSET_RETRY_COOLDOWN_MS=15000  # 加载失败后的冷却期�
 npm install
 npm run build:client   # 修改 client.card.tsx 后重新打 client.js
 npm test               # 语法检查 + 纯函数/接线测试（不依赖网络）
+npm run check:secrets  # 扫描已跟踪文件里的疑似凭据（也是 npm test 的最后一环）
 ```
+
+凭据不进仓库 —— 所有密钥都在运行时从环境读（`TDAI_MEMORY_API_KEY` 只从 env 读、不进设置面板）。
+`npm test` 最后一环就是密钥扫描，所以"顺手把 token 贴进文档"会让测试直接变红；
+确属误报时，把那个字面串连同**理由**加进 `scripts/secret-scan-allowlist.txt`。
 
 测试套件就是发版闸门。动提示词内容前，有两个护栏需要知道：
 

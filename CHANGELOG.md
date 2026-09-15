@@ -312,7 +312,7 @@ system 段注入从 **9953 → 5768 字节（-42%）**，其中团队知识块�
 （`~/.dsh/sessions/<工作区>/<session-id>/session.jsonl.zstd` 里的 `request/header.system`
 与 `user/message` 事件）→ 再用 `tdai_conversation_query` 回查 L0 是否真的没写进去。
 
-#### 1. 子 agent 降级（改前 `ed881f4d`，23 步 ／ 改后 `60453b0d`，3 步）
+#### 1. 子 agent 降级（改前子会话 23 步 ／ 改后子会话 3 步）
 
 | 检查项 | 改前 | 改后 |
 | --- | --- | --- |

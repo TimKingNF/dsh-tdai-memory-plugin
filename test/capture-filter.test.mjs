@@ -49,7 +49,7 @@ function harness() {
 /**
  * 造一条**与真实会话日志同形**的 user/message 事件。
  * 真实结构：{ type:'user/message', seq, data:{ message:{ role, content, source, id }, surfaceOp } }
- * 见 /home/tim/.dsh/sessions/.../session.jsonl.zstd 里的实测记录。
+ * 见 ~/.dsh/sessions/<session-id>/session.jsonl.zstd 里的实测记录。
  */
 const userEvent = (text, source) => {
   const message = { role: 'user', content: [{ type: 'text', text }], id: 'msg-1' }
