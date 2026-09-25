@@ -178,7 +178,7 @@ const BASE = {
     const messages = [{ role: 'user', content: 'hi', id: 'm1' }]
     return { payload: { agent: { session }, messages, turn: 1, step: 1 }, next: async () => ({ kind: 'enter', messages }) }
   }
-  const hasRecall = (decision) => (decision.messages ?? []).some((m) => m?.source?.kind === 'plugin' && m.source.plugin === 'dsh-tdai-memory-plugin')
+  const hasRecall = (decision) => (decision.messages ?? []).some((m) => m?.source?.kind === 'plugin:dsh-tdai-memory-plugin')
 
   // (a) 父会话：检索 + 注入（确认这套夹具本身是会注入的）
   {
@@ -321,7 +321,7 @@ const BASE = {
   assert.ok(inheritMsg.includes('没有绑定团队知识资源'), '开关打开后子会话走原有路径')
 }
 
-// ── 6) 端到端：session-start 不给降级会话预热资产（stub 掉 fetch 计数）────────
+// ── 6) 端到端：会话建立（agent/created）不给降级会话预热资产（stub 掉 fetch 计数）──
 {
   const realFetch = globalThis.fetch
   let fetchCalls = 0
@@ -344,12 +344,12 @@ const BASE = {
     })
     const start = async (session) => {
       fetchCalls = 0
-      for (const cb of registered.listeners['agent/session-start'] || []) cb({ agent: { session } })
+      for (const cb of registered.listeners['agent/created'] || []) cb({ agent: { session } })
       await new Promise((resolve) => setTimeout(resolve, 30))
       return fetchCalls
     }
-    assert.equal(await start(CHILD), 0, '子会话 session-start 不该触发任何资产请求')
-    assert.ok(await start(PARENT) > 0, '父会话 session-start 应照常预热资产')
+    assert.equal(await start(CHILD), 0, '子会话预热不该触发任何资产请求')
+    assert.ok(await start(PARENT) > 0, '父会话预热应照常打网关')
   } finally {
     globalThis.fetch = realFetch
   }

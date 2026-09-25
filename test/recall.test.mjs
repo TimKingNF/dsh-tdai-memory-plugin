@@ -8,7 +8,7 @@
  * 运行：node test/recall.test.mjs
  */
 import assert from 'node:assert'
-import { wireRecall } from '../lib/recall.mjs'
+import { wireRecall, SOURCE_KIND } from '../lib/recall.mjs'
 
 function makeChain() {
   const inner = () => Promise.resolve({ kind: 'enter', messages: [{ role: 'user', content: 'hi', id: 'm1' }] })
@@ -48,7 +48,8 @@ const hit = (content = 'remember X', score = 0.9) => [{ id: '1', type: 'rule', c
 
 /** 找到注入的召回消息（插件消息 + notice 形态）。 */
 function recalledMessage(messages) {
-  return messages.find((m) => m?.source?.kind === 'plugin' && m.source.plugin === 'dsh-tdai-memory-plugin')
+  // 按 v4 的 producer kind 认自己的注入消息（老实现用 kind:'plugin' + plugin 字段）
+  return messages.find((m) => m?.source?.kind === SOURCE_KIND)
 }
 
 // ── A. 防御逻辑 ───────────────────────────────────────────────────────────────
@@ -100,7 +101,8 @@ function recalledMessage(messages) {
   const user = { id: 'm1', role: 'user', content: [{ type: 'text', text: 'hi' }], source: { kind: 'user', rpcId: 'r1' } }
   const snapshot = {
     id: 'ctx1', role: 'user', content: [{ type: 'text', text: 'Current runtime context…' }],
-    source: { kind: 'plugin', plugin: 'dsh-agent-loop', form: 'snapshot', sections: [] },
+    // 宿主 runtime-context 的真实 v4 形态：kind 就是生产者身份（dsh-agent-loop 的 SOURCE）
+    source: { kind: 'runtime-context', form: 'snapshot', sections: [] },
   }
   const decision = { kind: 'enter', messages: [user, snapshot] }
   const payload = { agent: { session: { id: 's1' } }, messages: [user], turn: 1, step: 1 }
@@ -129,8 +131,14 @@ function recalledMessage(messages) {
 
   // source 形态：capture 靠 kind!=='user' 整条丢弃；客户端靠 form:'notice' 渲染成
   // 一行折叠的"上下文注入"（不塞进用户气泡）。
-  assert.equal(injected.source.kind, 'plugin', '注入消息的 source 必须是 plugin')
-  assert.equal(injected.source.plugin, 'dsh-tdai-memory-plugin')
+  //
+  // ⚠️ v4 会话格式**硬拒绝** `kind:'plugin'`（v3 的万能包装）：
+  // dsh-session-format-v3-to-v4 的 `source()` → "format v4 message requires a producer-owned
+  // source kind"。真机表现是**发消息即本轮失败**。这里按 v4 规则钉死三条。
+  assert.equal(injected.source.kind, SOURCE_KIND, '注入消息必须用生产者自己的 kind')
+  assert.notEqual(injected.source.kind, 'plugin', '绝不能退回 v3 的 kind:"plugin"（v4 会拒绝整轮）')
+  assert.ok(typeof injected.source.kind === 'string' && injected.source.kind.length > 0, 'kind 必须是非空字符串')
+  assert.ok(!('plugin' in injected.source), '不该残留 v3 的 plugin 字段')
   assert.equal(injected.source.form, 'notice', 'notice 让前端渲染成折叠的一行说明')
   assert.equal(typeof injected.source.summary, 'string')
   assert.ok(injected.source.summary.length <= 120, 'summary 必须 ≤120 字符（宿主 CONTEXT_SUMMARY_MAX_CHARS）')
@@ -139,6 +147,25 @@ function recalledMessage(messages) {
   assert.equal(typeof injected.id, 'string')
   assert.ok(injected.id.length > 0, '注入消息必须带 id（持久化边界要求）')
   assert.equal(injected.role, 'user', '注入消息走 user 角色随本轮进入')
+}
+
+// 5c) 改写 decision 必须 **spread**：0.1.7-rc.1 的 enter decision 还带 startsRequestSeries
+{
+  const { handler } = harness({ enabled: true, recallEnabled: true, injectionEnabled: false }, {
+    client: { searchL1: async () => hit() },
+  })
+  const user = { id: 'm1', role: 'user', content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } }
+  // 内层 listener 设的字段（0.1.7-rc.1 新增；未来还可能有别的）
+  const inner = { kind: 'enter', messages: [user], startsRequestSeries: true }
+  const payload = { agent: { session: { id: 's1' } }, messages: [user], turn: 1, step: 1 }
+
+  const result = await handler(payload, async () => inner)
+
+  assert.equal(result.startsRequestSeries, true,
+    '必须 { ...decision, messages } 改写：新建对象会把内层 listener 设的字段静默吞掉')
+  assert.equal(result.kind, 'enter', 'kind 必须保留')
+  assert.equal(result.messages.length, 2, '召回消息仍要插进本轮')
+  assert.equal(inner.messages.length, 1, '不得原地修改内层 decision 的 messages 数组')
 }
 
 // 5b) 召回块超字符预算：按分数从低到高丢弃，保证不撑爆上下文
@@ -199,8 +226,7 @@ function recalledMessage(messages) {
   assert.equal(result.messages.length, 2, '无真人消息时追加一条')
   assert.deepEqual(result.messages[0], toolMsg, '工具结果消息不能被改动')
   const appended = result.messages[1]
-  assert.equal(appended.source.kind, 'plugin')
-  assert.equal(appended.source.plugin, 'dsh-tdai-memory-plugin')
+  assert.equal(appended.source.kind, SOURCE_KIND)
   assert.equal(appended.source.form, 'notice')
   assert.ok(Array.isArray(appended.content) && appended.content[0].type === 'text', 'content 必须是块数组')
   assert.ok(appended.content[0].text.startsWith('<tdai_recalled_l1_memories>'))

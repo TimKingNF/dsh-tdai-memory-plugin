@@ -21,11 +21,14 @@ import { registerSections, SECTION_ORDERS } from '../lib/sections.mjs'
 
 // ── DSH 中心 order 表（抄自 @deepseek-ai/dsh-system-prompt 的 SECTION_ORDERS）──
 // DSH 升级后这张表可能变；它变了就该有人来更新这里，而不是让插件悄悄占错位。
+// 当前副本对齐 **DSH 0.1.7-rc.1**（源头：dsh-system-prompt/lib/types/index.d.ts）。
+// 与 0.1.2-rc.1 的差异：删掉已不存在的 TOOL_CORDIS(2500)，补 TOOL_REPORT(2900) /
+// TOOL_COMPUTER_USE(3000) / MCP_SERVERS(3100) / TOOLS_SDK(5000)，
+// HARNESS_SOURCE / WEB_SURFACE 挪到 10000 / 10100，
+// DEPLOYMENT_PERSONA 拆成 PREFIX(0) / SUFFIX(10200)。
 const DSH_SECTION_ORDERS = {
   HARNESS_IDENTITY: -1000,
-  HARNESS_SOURCE: -900,
-  WEB_SURFACE: -800,
-  DEPLOYMENT_PERSONA: 0,
+  DEPLOYMENT_PERSONA_PREFIX: 0,
   PLAN_POLICY: 500,
   TEAM_POLICY: 600,
   PTC_ONLY: 800,
@@ -44,16 +47,30 @@ const DSH_SECTION_ORDERS = {
   TOOL_LSP: 2200,
   TOOL_SESSION_QUERY: 2300,
   TOOL_GOAL: 2400,
-  TOOL_CORDIS: 2500,
   TOOL_WORKFLOW: 2600,
   TOOL_RALPH: 2700,
   TOOL_SUBAGENT: 2800,
   TOOL_REPORT: 2900,
+  TOOL_COMPUTER_USE: 3000,
+  MCP_SERVERS: 3100,
   TOOLS_SDK: 5000,
   DELIVERABLE_FILE_REFERENCES: 9000,
   STRUCTURED_OUTPUT: 9900,
+  HARNESS_SOURCE: 10000,
+  WEB_SURFACE: 10100,
+  DEPLOYMENT_PERSONA_SUFFIX: 10200,
 }
 const DSH_RESERVED = new Set(Object.values(DSH_SECTION_ORDERS))
+
+// ── DSH 中心 runtime-context order 表（CONTEXT_ORDERS，同上）──────────────────
+// context 与 section 是**两张独立的表**（dsh-system-prompt/lib/index.js:185-186），
+// 插件的 tdai:state 走 context 通道，所以也要单独断言不撞位。
+const DSH_CONTEXT_ORDERS = {
+  SANDBOX_POLICY: 110,
+  APPROVAL_POLICY: 115,
+  SUBAGENT_DELEGATION: 120,
+}
+const DSH_CONTEXT_RESERVED = new Set(Object.values(DSH_CONTEXT_ORDERS))
 
 // ── 假 systemPrompt 服务：忠实实现 section() / assemble() / waterfall 语义 ─────
 // 语义依据：dsh-system-prompt/lib/index.js
@@ -173,6 +190,19 @@ const renderPrompt = (assembly) => assembly.sections.map((s) => s.text).filter((
     assert.ok(s.order >= 500 && s.order <= 599,
       `section "${s.name}" order ${s.order} 越出插件分带 500–599`)
     assert.ok(s.name.startsWith('tdai:'), `section "${s.name}" 应以 tdai: 开头`)
+  }
+}
+
+// ── 1b) runtime-context 段位不越界（context 与 section 是两张独立的表）────────
+{
+  const { contexts } = fakeHost({ asset: sampleAsset })
+  assert.ok(contexts.size > 0, '应注册 tdai:state（走 context 通道）')
+  for (const c of contexts.values()) {
+    assert.ok(!DSH_CONTEXT_RESERVED.has(c.order),
+      `context "${c.name}" 占用了 DSH 保留 context order ${c.order}（CONTEXT_ORDERS）`)
+    assert.ok(c.order >= 500 && c.order <= 599,
+      `context "${c.name}" order ${c.order} 越出插件分带 500–599`)
+    assert.ok(c.name.startsWith('tdai:'), `context "${c.name}" 应以 tdai: 开头`)
   }
 }
 

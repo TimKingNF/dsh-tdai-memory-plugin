@@ -12,7 +12,8 @@ MemoryProxy's core memory capabilities — L2/L3 injection, self + borrowed L1 r
 injection, `session_context` — **natively into the DSH process**. No MemoryProxy forwarding layer is
 involved and credentials never leave the process.
 
-> **Version 0.4.0** · read the [CHANGELOG](CHANGELOG.md) · docs: [prompt-injection design notes (中文)](docs/prompt-design.zh-CN.md) ·
+> **Version 0.5.0** · read the [CHANGELOG](CHANGELOG.md) · docs: [DSH 0.1.7-rc.1 compatibility audit & migration](docs/dsh-0.1.7-migration.md) ·
+> [prompt-injection design notes (中文)](docs/prompt-design.zh-CN.md) ·
 > [construction blueprint (中文)](docs/prompt-injection-redesign.md)
 
 ## ⚠️ Compatibility and tested scope
@@ -21,19 +22,32 @@ involved and credentials never leave the process.
 
 | Component | Tested version | Notes |
 | --- | --- | --- |
-| DeepSeek Harness (DSH) | **`0.1.2-rc.1`** | the version installed at release time |
+| DeepSeek Harness (DSH) | **`0.1.7-rc.1`** | the version installed at release time |
 | [TencentDB-Agent-Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory) | **`v2.0.1`** | MemoryCore / MemoryKnowledge HTTP API |
+
+0.5.0 migrated the plugin from the DSH `0.1.2-rc.1` API to `0.1.7-rc.1`. That upgrade **removed two
+APIs this plugin used** (`settings.register()` on the host, the `settingsScope` client service and the
+`settings.plugin.item` slot), so 0.4.0 mounts on 0.1.7-rc.1 but loses its settings page and logs
+`settings unavailable: settingsCtx.settings.register is not a function`. The full audit — every
+contract checked, with live evidence — is in
+[docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md).
 
 Why the pinning matters:
 
 - The read path binds to DSH-internal contracts: `systemPrompt.section()` / `systemPrompt.context()`,
-  the `system-prompt/assemble` waterfall, the `agent/pre-step` waterfall, `skills.register()`,
-  `tools.register()` (including the `render(args, value)` output projection) and `settings.register()`.
-  A DSH refactor of any of these changes plugin behaviour.
+  the `system-prompt/assemble` waterfall, the `agent/pre-step` waterfall, `agent/created`,
+  `skills.register()`, `tools.register()` (including the `render(args, value)` output projection), and
+  the plugin's `export const Config` + `settings.configure()` pair. A DSH refactor of any of these
+  changes plugin behaviour.
+- The **settings page** is a client-side contract too: it registers a top-level page into
+  `settings.section` and reads/writes through the `configForms` client service. Both names are
+  version-specific. On the host side the page only exists if the plugin's `Config` marks its
+  user-editable fields `.volatile()` — `settings.describe()` skips any entry without one — and
+  that requires `@deepseek-ai/schemastery` ≥ 3.18.4.
 - The section **order band** (500–599) is asserted against a **local copy** of DSH's `SECTION_ORDERS`
-  table (`test/section-registry.test.mjs`). If a DSH upgrade moves that table, the test will *not*
-  fail by itself — the copy must be re-synced by hand, otherwise the plugin can silently end up
-  occupying a reserved slot.
+  and `CONTEXT_ORDERS` tables (`test/section-registry.test.mjs`). If a DSH upgrade moves those tables,
+  the test will *not* fail by itself — the copy must be re-synced by hand, otherwise the plugin can
+  silently end up occupying a reserved slot.
 - Recall / write-back call MemoryCore's `/v3/*` HTTP API (`/v3/core/read`, `/v3/scenario/ls`,
   `/v3/skill/listing`, `/v3/knowledge/list`, `/v3/atomic/search`, `/v3/meta/*`,
   `/v3/conversation/add`, `/v3/skill/conversation/add`) and the knowledge service
@@ -191,8 +205,8 @@ Full accounting: [docs/prompt-design.zh-CN.md](docs/prompt-design.zh-CN.md) §3.
 ### Common
 
 - **fail-open**: any Gateway failure is logged only, never blocks DSH
-- **session-level asset cache**: prewarmed at session start with lazy fallback in pre-step; sections
-  read the cache synchronously so the first turn is already injected
+- **session-level asset cache**: prewarmed when the agent is created (`agent/created`) with lazy
+  fallback in pre-step; sections read the cache synchronously so the first turn is already injected
 - **static identity** (single-user assumption); no multi-user support, no auth/verify
 
 ## Install
@@ -201,16 +215,28 @@ Full accounting: [docs/prompt-design.zh-CN.md](docs/prompt-design.zh-CN.md) §3.
 cd dsh-tdai-memory-plugin
 npm install            # pulls schemastery (settings schema dependency)
 npm run build:client   # builds the Web settings card bundle (client.js)
+```
 
+Then install it as a profile bundle. The verified path (DSH `0.1.7-rc.1`) is the Plugin Manager's
+`install_bundle` with this package directory as the target — it adds the dependency, registers the
+bundle, and applies the change live (no restart needed; `application: applied`):
+
+```
+plugin_manager { action: "install_bundle", target: "/path/to/dsh-tdai-memory-plugin" }
+```
+
+The CLI equivalent, if you prefer a shell:
+
+```bash
 dsh plugin --profile web add ./dsh-tdai-memory-plugin
-# restart the target profile to take effect
+# restart the target profile if the change did not apply live
 ```
 
 ## Configuration
 
 ### Option 1: Web settings panel (recommended)
 
-"Settings → Plugins → TDAI Memory" card, switchable live:
+"Settings → TDAI Memory" page (a top-level entry in the settings navigation), switchable live:
 
 - **Read side**: read master switch, L1 auto recall (with a **per-turn recall cap**), system prompt
   injection, and the 4 sections under it
@@ -361,7 +387,8 @@ content:
 
 | Document | Language | Content |
 | --- | --- | --- |
-| [CHANGELOG.md](CHANGELOG.md) | 中文 | release history; 0.4.0 lists every fix with its root cause and covering test |
+| [CHANGELOG.md](CHANGELOG.md) | 中文 | release history; 0.5.0 records the DSH 0.1.7-rc.1 migration, 0.4.0 every fix with its root cause and covering test |
+| [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md) | 中文 | compatibility audit against DSH 0.1.7-rc.1: every contract checked, with live evidence, plus the migration record and verification results |
 | [docs/prompt-design.zh-CN.md](docs/prompt-design.zh-CN.md) | 中文 | the prompt-injection optimisation rationale, prompt-cache risks (including "installing other plugins invalidates the prefix cache") and known open issues |
 | [docs/prompt-injection-redesign.md](docs/prompt-injection-redesign.md) | 中文 | the construction blueprint: every decision, every citation into DSH / plugin / proxy source |
 

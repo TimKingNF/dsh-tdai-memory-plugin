@@ -11,7 +11,8 @@ DeepSeek Harness 的 [TencentDB Agent Memory](https://github.com/TencentCloud/Te
 自有+借入 L1 召回、Skill/Knowledge 注入、session_context）以 **DSH 进程内原生方式**移植过来 ——
 不需要 MemoryProxy 转发层，凭据不出进程。
 
-> **当前版本 0.4.0** · 变更见 [CHANGELOG](CHANGELOG.md) · 文档：
+> **当前版本 0.5.0** · 变更见 [CHANGELOG](CHANGELOG.md) · 文档：
+> [DSH 0.1.7-rc.1 兼容性审计与迁移](docs/dsh-0.1.7-migration.md) ·
 > [提示词注入优化说明](docs/prompt-design.zh-CN.md) ·
 > [改造施工图](docs/prompt-injection-redesign.md)
 
@@ -21,18 +22,28 @@ DeepSeek Harness 的 [TencentDB Agent Memory](https://github.com/TencentCloud/Te
 
 | 组件 | 已验证版本 | 说明 |
 | --- | --- | --- |
-| DeepSeek Harness（DSH） | **`0.1.2-rc.1`** | 发布时安装的版本 |
+| DeepSeek Harness（DSH） | **`0.1.7-rc.1`** | 发布时安装的版本 |
 | [TencentDB-Agent-Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory) | **`v2.0.1`** | MemoryCore / MemoryKnowledge HTTP API |
+
+0.5.0 把插件从 DSH `0.1.2-rc.1` 的 API 迁移到 `0.1.7-rc.1`。这次升级**删掉了本插件用的两个
+API**（host 侧 `settings.register()`、client 侧 `settingsScope` 服务与 `settings.plugin.item`
+槽位），所以 0.4.0 在 0.1.7-rc.1 上虽然能挂载，但设置页整条链失效，并留下一行
+`settings unavailable: settingsCtx.settings.register is not a function`。完整审计（每一项契约
+都带现场证据）见 [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md)。
 
 为什么要写死版本：
 
 - 读侧绑定的是 DSH 的内部契约：`systemPrompt.section()` / `systemPrompt.context()`、
-  `system-prompt/assemble` waterfall、`agent/pre-step` waterfall、`skills.register()`、
-  `tools.register()`（含 `render(args, value)` 输出投影）与 `settings.register()`。
-  DSH 重构其中任何一处都会改变插件行为。
-- 段 **order 分带**（500–599）是对着 DSH `SECTION_ORDERS` 表的**本地副本**断言的
-  （`test/section-registry.test.mjs`）。DSH 升级若调整了那张表，测试**不会自动变红** ——
-  需要有人手工同步副本，否则插件可能悄悄占到保留位。
+  `system-prompt/assemble` waterfall、`agent/pre-step` waterfall、`agent/created`、
+  `skills.register()`、`tools.register()`（含 `render(args, value)` 输出投影），以及插件的
+  `export const Config` + `settings.configure()` 组合。DSH 重构其中任何一处都会改变插件行为。
+- **设置页**同样是一份客户端契约：它把顶层页面注册进 `settings.section`，读写走 `configForms`
+  客户端服务 —— 两个名字都是版本相关的。宿主侧还多一条：`Config` 里**用户可编辑的字段必须
+  标 `.volatile()`**（`settings.describe()` 会跳过没有任何 volatile 字段的 entry），
+  而这要求 `@deepseek-ai/schemastery` ≥ 3.18.4。
+- 段 **order 分带**（500–599）是对着 DSH `SECTION_ORDERS` 与 `CONTEXT_ORDERS` 两张表的
+  **本地副本**断言的（`test/section-registry.test.mjs`）。DSH 升级若调整了那两张表，测试
+  **不会自动变红** —— 需要有人手工同步副本，否则插件可能悄悄占到保留位。
 - 召回与回流调用 MemoryCore 的 `/v3/*` HTTP API（`/v3/core/read`、`/v3/scenario/ls`、
   `/v3/skill/listing`、`/v3/knowledge/list`、`/v3/atomic/search`、`/v3/meta/*`、
   `/v3/conversation/add`、`/v3/skill/conversation/add`）与知识服务
@@ -183,7 +194,7 @@ system prompt 13020 → **6925 字节**，单次请求总 token 13748 → **1059
 ### 通用
 
 - **fail-open**：Gateway 任何故障只记日志，不阻断 DSH
-- **会话级资产缓存**：session-start 预热 + pre-step 懒加载兜底；section 同步读缓存，首轮即可注入
+- **会话级资产缓存**：agent 建立时（`agent/created`）预热 + pre-step 懒加载兜底；section 同步读缓存，首轮即可注入
 - **静态身份**（单人场景），不做多用户与 auth/verify
 
 ## 安装
@@ -192,16 +203,28 @@ system prompt 13020 → **6925 字节**，单次请求总 token 13748 → **1059
 cd dsh-tdai-memory-plugin
 npm install          # 拉 schemastery（settings schema 依赖）
 npm run build:client # 构建 Web 设置卡片 bundle（client.js）
+```
 
+然后把它作为 profile bundle 装进去。已在 DSH `0.1.7-rc.1` 上验证的路径是走 Plugin Manager 的
+`install_bundle`（target 传本包目录）：它会加依赖、注册 bundle，并**即时生效**（无需重启，
+返回 `application: applied`）：
+
+```
+plugin_manager { action: "install_bundle", target: "/path/to/dsh-tdai-memory-plugin" }
+```
+
+习惯命令行的等价做法：
+
+```bash
 dsh plugin --profile web add ./dsh-tdai-memory-plugin
-# 重启目标 profile 生效
+# 若没有即时生效，重启目标 profile
 ```
 
 ## 配置
 
 ### 方式一：Web 设置面板（推荐，快捷切换）
 
-「设置 → 插件 → TDAI Memory」卡片，可即时切换：
+「设置 → TDAI Memory」页（设置导航里的顶层一项），可即时切换：
 
 - **读侧**：读侧总开关、L1 自动召回（含**单轮召回条数上限**）、System prompt 注入，以及注入下的 4 个段
 - **写侧**：对话回流（独立于读侧）
@@ -334,7 +357,8 @@ npm run check:secrets  # 扫描已跟踪文件里的疑似凭据（也是 npm te
 
 | 文档 | 语言 | 内容 |
 | --- | --- | --- |
-| [CHANGELOG.md](CHANGELOG.md) | 中文 | 版本变更；0.4.0 逐条列出修复、根因与覆盖它的测试 |
+| [CHANGELOG.md](CHANGELOG.md) | 中文 | 版本变更；0.5.0 记录 DSH 0.1.7-rc.1 迁移，0.4.0 逐条列出修复、根因与覆盖它的测试 |
+| [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md) | 中文 | DSH 0.1.7-rc.1 兼容性审计：每项契约的核对方式与现场证据、迁移记录与真机验证结果 |
 | [docs/prompt-design.zh-CN.md](docs/prompt-design.zh-CN.md) | 中文 | 提示词注入的优化思路、缓存视角下的风险（含"装别的插件会改提示词 → 前缀缓存失效"）与尚未解决的潜在问题 |
 | [docs/prompt-injection-redesign.md](docs/prompt-injection-redesign.md) | 中文 | 改造施工图：每一条决策、每一处对 DSH / 插件 / proxy 源码的引用 |
 

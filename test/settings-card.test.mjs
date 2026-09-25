@@ -17,7 +17,8 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { dirname, join } from 'node:path'
 import { transform } from 'esbuild'
-import { buildSettingsSchema, SCHEMA_KEYS } from '../lib/settings.mjs'
+import { buildSettingsSchema, SCHEMA_KEYS, VOLATILE_KEYS, PATCH_ONLY_KEYS } from '../lib/settings.mjs'
+import { liveValue } from '../config.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = join(here, '..')
@@ -47,21 +48,65 @@ for (const key of cardKeys) {
   assert.ok(SCHEMA_KEYS.includes(key), `面板字段 "${key}" 不在 settings schema 里 → 用户改了不会生效`)
 }
 // 反向：schema 里剩下的字段是**有意只走 env** 的，列出来防止有人误删了面板入口
-const PANEL_LESS_BY_DESIGN = ['l2Limit', 'timeoutMs', 'recallTimeoutMs', 'assetLoadBudgetMs', 'assetRetryCooldownMs']
+// （apiKeyEnv 是"密钥所在的环境变量名"，属于部署期配置，不该让用户往面板里填）
+const PANEL_LESS_BY_DESIGN = ['apiKeyEnv', 'l2Limit', 'timeoutMs', 'recallTimeoutMs', 'assetLoadBudgetMs', 'assetRetryCooldownMs']
 for (const key of SCHEMA_KEYS) {
   if (PANEL_LESS_BY_DESIGN.includes(key)) continue
   assert.ok(cardKeys.includes(key), `schema 字段 "${key}" 在面板里没有入口，也不在 PANEL_LESS_BY_DESIGN 白名单里`)
 }
+assert.deepEqual(PATCH_ONLY_KEYS, PANEL_LESS_BY_DESIGN, 'lib/settings.mjs 的 PATCH_ONLY_KEYS 与本测试的白名单必须一致')
+
+// ── 2b) volatile 契约：它才是"面板可见性"的开关 ──────────────────────────────
+//
+// 2026-09-25 事故：schema 里一个 volatile 字段都没有 → `dsh-settings` 的
+// `volatileForm()` 返回 undefined → `describe()` 直接跳过这个 entry →
+// 客户端 `configForms.get(ns)` 恒为 unavailable，设置页显示"设置当前不可用"。
+// 所以这两条是硬约束：① 至少一个 volatile；② 面板上每个字段都得 volatile。
+const schema = buildSettingsSchema()
+{
+  // 复刻 dsh-settings/lib/index.js 的 volatileForm（对象只保留 volatile 子字段）
+  const volatileForm = (node) => {
+    if (node.meta?.volatile) return node
+    if (node.type === 'object') {
+      const dict = Object.fromEntries(Object.entries(node.dict ?? {}).flatMap(([key, child]) => {
+        const field = volatileForm(child)
+        return field === undefined ? [] : [[key, field]]
+      }))
+      return Object.keys(dict).length === 0 ? undefined : { dict }
+    }
+    return undefined
+  }
+  const projected = volatileForm(schema)
+  assert.ok(projected, 'Config 至少要有一个 volatile 字段，否则整个 entry 不进 settings.describe()')
+  const projectedKeys = Object.keys(projected.dict ?? {})
+  assert.deepEqual(projectedKeys, VOLATILE_KEYS, 'VOLATILE_KEYS 必须与实际 volatile 投影一致')
+  for (const key of cardKeys) {
+    assert.ok(projectedKeys.includes(key), `面板字段 "${key}" 必须 volatile，否则用户在设置页看不到它`)
+  }
+  for (const key of PANEL_LESS_BY_DESIGN) {
+    assert.ok(!projectedKeys.includes(key), `部署期字段 "${key}" 不该 volatile（会出现在设置页）`)
+  }
+  // volatile 字段校验后必须是 `{ get() }` 访问器：这是 loader 原地更新（不重新 apply）的协议。
+  // 依赖 schemastery ≥3.18.4 —— 3.18.2 只认 meta 标记、不会生成访问器（实测）。
+  const v = schema({ enabled: false })
+  assert.equal(typeof liveValue(v.enabled), 'boolean', 'volatile 字段应可经 liveValue() 取值')
+  assert.equal(typeof v.enabled, 'object', 'volatile 字段必须是 { get() } 访问器（schemastery ≥3.18.4）')
+}
 
 // ── 3) 召回条数上限：卡片的收敛区间必须与 schema 校验区间一致 ────────────────
-const schema = buildSettingsSchema()
 const limit = numeric.recallLimit
 assert.ok(limit, '卡片应声明 recallLimit 数值字段')
-assert.equal(schema({ recallLimit: limit.min }).recallLimit, limit.min, 'schema 应接受卡片下限')
-assert.equal(schema({ recallLimit: limit.max }).recallLimit, limit.max, 'schema 应接受卡片上限')
-assert.throws(() => schema({ recallLimit: limit.min - 1 }), 'schema 应拒绝低于卡片下限的值')
-assert.throws(() => schema({ recallLimit: limit.max + 1 }), 'schema 应拒绝高于卡片上限的值')
-assert.throws(() => schema({ recallLimit: String(limit.min) }), 'schema 拒绝字符串 → 卡片必须转 number')
+assert.equal(liveValue(schema({ recallLimit: limit.min }).recallLimit), limit.min, 'schema 应接受卡片下限')
+assert.equal(liveValue(schema({ recallLimit: limit.max }).recallLimit), limit.max, 'schema 应接受卡片上限')
+assert.throws(() => schema({ recallLimit: limit.min - 1 }), 'schema 应拒绝低于卡片下限的真数字')
+assert.throws(() => schema({ recallLimit: limit.max + 1 }), 'schema 应拒绝高于卡片上限的真数字')
+// 字符串必须被接受：组合层（cordis.patch.yml 的 env）只有字符串形态 `"8"`。
+// 卡片保存时**仍然**转 number —— 用户层存数字，override 语义才干净。
+assert.equal(
+  liveValue(schema({ recallLimit: String(limit.min) }).recallLimit),
+  String(limit.min),
+  'schema 应接受 env 字符串（组合层形态）',
+)
 
 // ── 4) 保存归一化：空串回落 / 数值转 number / 越界收敛 / 非法值拦下 ──────────
 {
@@ -129,6 +174,19 @@ assert.deepEqual(card.missingIdentity(undefined), ['serviceId', 'teamId', 'agent
   for (const key of cardKeys) {
     assert.ok(bundle.includes(key), `client.js 里找不到字段 "${key}"（忘了 npm run build:client？）`)
   }
+
+  // ── DSH 0.1.7-rc.1 客户端契约（迁移护栏）────────────────────────────────────
+  // settingsScope 服务与 settings.plugin.item 槽位都已从 DSH 删除；跑回旧名字的症状是
+  // "卡片静默不挂载"（cordis 永远等不到依赖），所以必须在产物里钉死新契约。
+  for (const dead of ['settingsScope', 'settings.plugin.item']) {
+    assert.ok(!bundle.includes(dead), `client.js 仍引用已被 DSH 删除的 ${dead}`)
+  }
+  for (const live of ['configForms', 'settings.section']) {
+    assert.ok(bundle.includes(live), `client.js 缺 0.1.7-rc.1 的新契约 ${live}`)
+  }
+  // 挂顶层设置导航（settings.section），不是「内置插件」里的二级 tab —— 后者在实测中
+  // 会让人以为"没有设置项"。
+  assert.ok(!bundle.includes('settings.plugins.tab'), 'client.js 不该再挂 settings.plugins.tab（藏得太深）')
 }
 
 console.log('settings card tests passed: 字段↔schema 一致 / 数值归一化 / 身份判定 / client.js 与 tsx 同源')
