@@ -4,10 +4,190 @@
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-> **测试范围声明（0.4.0）**：本版本只在 **DeepSeek Harness `0.1.2-rc.1`** 与
+> **测试范围声明（0.5.0）**：本版本只在 **DeepSeek Harness `0.1.7-rc.1`** 与
 > **TencentDB-Agent-Memory `v2.0.1`** 上做过验证。其它 DSH / MemoryCore 组合未验证，
-> 尤其 DSH 的 `SECTION_ORDERS` 表与 `agent/pre-step`、`system-prompt/assemble` 的契约
-> 变化会影响本插件的注入行为（见 README「兼容性与测试范围」）。
+> 尤其 DSH 的 `SECTION_ORDERS` / `CONTEXT_ORDERS` 两张表、`agent/pre-step`、
+> `system-prompt/assemble`、以及设置页的 `Config` + `configForms` 契约变化会影响本插件
+> （见 README「兼容性与测试范围」，以及 [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md)）。
+
+---
+
+## [0.5.0] - 2026-09-25
+
+**DSH `0.1.2-rc.1` → `0.1.7-rc.1` 兼容性迁移。** 起因是一次真实升级后的兼容性审计：
+在本机把 DSH 升到 `0.1.7-rc.1` 后，0.4.0 仍然能挂载、召回与回流都正常，但**设置页整条链
+失效**，启动日志里留下一行
+
+```
+[tdai-memory] settings unavailable: settingsCtx.settings.register is not a function
+```
+
+完整审计过程（每一项契约的核对方式与现场证据）见
+[docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md)。这里只记结论与修复。
+
+### 变更（DSH 侧删掉的 API）
+
+#### 1. host 设置命名空间：`settings.register()` → `export const Config`
+
+- **现象**：面板命名空间不存在；`settings.register` 抛 `TypeError`，被插件的 try/catch 吞掉，
+  只留一行日志。
+- **根因**：0.1.7-rc.1 的 live `settings` 服务只剩
+  `configure / prepareDocument / describe / update / replace / mutate`，`register` 被整体删除；
+  新模型是**声明式**的：插件导出 `Config`（schemastery schema），settings 服务据此校验 entry
+  config 并投影表单，命名空间 key 就是 profile patch 的 entry id。
+- **修复**：`index.mjs` 导出 `export const Config = buildSettingsSchema()`；
+  `lib/settings.mjs` 改为只做两件事——提供 schema、`settings.configure({ auto: false })`（本插件
+  自带设置页，别让宿主再生成一个）。插件不再自行 merge 配置：写入后 Loader 带着新 config
+  **重新 apply**（`applies: 'live'`），`client` / `assets` 随之整体重建，旧的 `rebuild()` 删除。
+- **踩坑记录（已用测试锁住）**：`cordis.patch.yml` 的 `!!js process.env.X ?? ''` 在 env 未设置时给
+  **空字符串**，而裸 `z.boolean()` / `z.natural()` 遇到 `''` 会抛
+  `expected boolean but got` → **整个 entry 加载失败**。所以布尔/数字字段用
+  `z.union([z.boolean(), z.string()])` / `z.union([z.natural().min().max(), z.string()])`，
+  归一化仍交给 `config.mjs` 的 `boolOpt` / `numOpt`。
+  另：**不用 `z.transform()`** —— 它的回调会被 `toJSON()` 按源码序列化进 schema 包络，
+  客户端 rehydrate 时重新求值，回调引用外部常量（如 FALSEY）就会在浏览器侧抛
+  `FALSEY is not defined`（已实测）。
+- **顺带修好的一处静默缺陷**：`apiKeyEnv` 原先不在 schema 里。schemastery 的 object 会保留未知
+  键，所以它侥幸能用；但现在显式声明，避免换校验实现时被剥掉（丢了就是
+  `process.env[undefined]` → 凭据静默失效）。
+
+#### 2. client 设置页：`settingsScope` → `configForms`，`settings.plugin.item` → `settings.section`
+
+- **现象**：卡片静默不挂载（不报错、不占位）——`inject = ['settingsScope', 'slots']` 的服务
+  永远不出现，cordis 就不会执行 apply。
+- **根因**：0.1.7-rc.1 **整个装机里没有 `settingsScope`**（覆盖全部 `@deepseek-ai/dsh-*`、
+  预构建前端 `dsh-web-frontend/dist`、profile 的 `node_modules`；唯一命中是 `dsh-context` /
+  `dshmarket` 的客户端**消费**代码），槽位 `settings.plugin.item` 也不存在了。
+- **修复**：`client.card.tsx` 改用
+  - `ctx.configForms.get('tdai-memory')` 取表单（`getSnapshot/subscribe/mutate/set/unset`）；
+  - 注册进 **`settings.section`** —— 设置面板左侧的**顶层导航页**，与 profile 里其它第三方
+    插件（`dsh-better-sidebar` / `dsh-workspace-drag` / `dshmarket`）一致；
+  - **无条件注册**（不用 `whileServed` 包）：命名空间缺失时卡片渲染一条可见的自解释说明，
+    而不是静默消失——故障可诊断性优先；
+  - secret 字段（`userKey`）明文跨 wire 就被 redact 删掉，卡片改为从 `describe()` 的
+    `secrets` 侧信道显示「已设置（留空表示不改动）」。
+- **踩坑记录**：最初挂的是 `settings.plugins.tab`（「内置插件」分区里的二级 tab，官方
+  inventory 用那个）。实测用户**在设置导航里根本看不到**，直接反馈"没有设置项"——藏在二级
+  tab 等于没有。改挂 `settings.section` 后与其它第三方插件同层可见。
+- **外观不变**：分组、依赖置灰、身份告警、草稿式提交全部保留（渲染测试原样通过）。
+
+#### 3. `agent/session-start` → `agent/created`
+
+- **现象**：会话建立的资产预热是**静默死代码**（监听永不触发）。
+- **根因**：0.1.7-rc.1 全源码 grep `session-start` 为 0 处；对应事件是 `agent/created`
+  （serial，`{ agent, source, signal? }`）/ `session/created`。
+- **修复**：改听 `agent/created`；测试同时断言**不再**监听已不存在的旧名。
+
+#### 4. `agent/pre-step` 改写 decision 必须 spread
+
+- **现象**：注入召回块时返回 `{ kind: 'enter', messages }`（新建对象），会吞掉内层 listener 设的
+  字段。
+- **根因**：0.1.7-rc.1 的 `PreStepDecision.enter` 多了可选 `startsRequestSeries`（"在本步准入的
+  消息之前开一段新的 model 消息序列"），官方 practices 明确要求不拥有决策的 listener 用
+  `{ ...decision, messages }`。
+- **修复**：改为 spread，并加回归测试（断言自定义字段存活、内层 messages 不被原地修改）。
+
+#### 5. 设置页可见性：`Config` 必须有 `.volatile()` 字段（且 schemastery ≥ 3.18.4）
+
+- **现象**：设置导航里出现了「TDAI Memory」，但内容写「设置当前不可用：宿主没有暴露本插件的
+  设置命名空间（tdai-memory）」。
+- **根因**：`dsh-settings` 的 `describe()` 对每个 loader entry 先算 `volatileForm(schema)`：
+  对象节点只保留**标了 volatile 的子字段**，一个都没有就返回 `undefined`，而 `describe()` 对
+  `undefined` 的 entry **直接 `return []`**。本插件最初**故意没有给任何字段加 `.volatile()`**
+  （以为配置变更走"重新 apply"更干净），于是这个 entry 在 `describe()` 里根本不存在，
+  客户端 `configForms.get('tdai-memory')` 恒为 `unavailable`。
+- **修复**：`volatile` = **"用户可在设置页编辑"**（0.1.7-rc.1 的约定，官方
+  `dsh-client-ui-conversation` / `dsh-agent-default-model` 都只把用户可编辑字段标 volatile）：
+  - 面板上的 19 个字段全部 `.volatile()`（新增导出 `VOLATILE_KEYS`）；
+  - 部署期字段（`apiKeyEnv` / `l2TimeoutMs` / 各类预算与冷却）保持**非 volatile**，
+    既不出现在设置页，也不受面板写入影响；
+  - **依赖升到 `@deepseek-ai/schemastery@^3.18.4`**：`.volatile()` 与"校验后生成
+    `{ get() }` 访问器"都是 3.18.4 才有的；3.18.2 里只认 meta 标记、不会生成访问器，
+    而 loader 的 `_commitVolatile` 靠访问器原地更新配置（跨副本安全：标记是
+    `Symbol.for("cosmokit.volatile.write")`）。
+- **连带改造（volatile 变更不会重新 apply 插件）**：
+  - `config.mjs` 新增 `liveValue()`，`resolveConfig` 对 volatile 访问器和普通值都能归一化；
+  - `index.mjs` 的 `client` / `assets` 改为**按配置签名惰性重建**——每次都重新
+    `resolveConfig()`（所以面板改完立即生效），签名变了就重建派生对象（顺带丢弃会话资产缓存，
+    因为资产内容本身就依赖 `skillsEnabled` / `knowledgeEnabled` 这些开关）。
+- **诊断加固**：`applySettings` 在启动后自检一次并写**宿主日志**
+  （`settings: namespace "tdai-memory" served/NOT served`）——这正是本次唯一无法从客户端
+  看清、只能靠宿主日志定位的一环。
+
+#### 6. 召回注入的 `source.kind:'plugin'` 会让**整轮运行失败**（v4 会话格式硬拒绝）
+
+- **现象**：读侧开关打开后，发消息即
+  `本轮运行失败 format v4 message requires a producer-owned source kind`；把开关关掉
+  （`enabled=false`）就正常 —— 故障被精确定位在**注入路径**，而不是请求链路。
+- **根因**：召回块是独立注入的一条 `user/message`，其 `source` 用了 **v3 的万能包装**
+  `{ kind: 'plugin', plugin: 'dsh-tdai-memory-plugin', form: 'notice', summary }`。
+  v4 会话格式在入库处直接拒绝这个 kind
+  （`dsh-session-format-v3-to-v4/lib/index.js:126` 的 `source()`：`value["kind"] === "plugin"` → 抛错）。
+- **审计判断错在哪**：只验了 `dsh-session` 的 `assertMessageEventShape`（它对 `user/message`
+  仅要求 `source.kind` 是非空字符串），于是把这一项记成"类型层漂移、运行时可用"。
+  真正的门在**会话格式层**（`assertV4RowAdmission`），审计没覆盖到 —— 这是本次唯一一处
+  "审计结论错误、并因此把 bug 放到真机上"的地方。
+- **修复**：`lib/recall.mjs` 改用 v4 的 producer kind
+  `SOURCE_KIND = 'plugin:dsh-tdai-memory-plugin'`（正是 v3→v4 迁移对未知第三方插件
+  `producerKind(plugin, role)` 给出的规范取值），并**去掉 v3 的 `plugin` 字段**。
+  这样老会话（迁移后）与新消息的 kind 完全一致。
+- **验证**：用真校验器 `assertV4RowAdmission` 跑过 —— 旧形态
+  `REJECT: format v4 message requires a producer-owned source kind`（复现线上报错），新形态 `PASS`。
+  测试侧钉死三条：kind 非空、`!== 'plugin'`、无残留 `plugin` 字段。
+- 顺带把测试夹具里的旧形态改成 v4 真实形态（`kind:'runtime-context'` 对应宿主的 runtime context；
+  `plugin:dsh-tdai-memory-plugin` 对应本插件）。
+
+#### 7. 审计确认「未变」的部分（因此没有改动）
+
+`tools.register`（`output:{schema,render}` 仍必填）、`systemPrompt.section/context`、
+`system-prompt/assemble`、`skills.register`（`source:'runtime'` 仍合法）、`commands.register`
+及 `{kind:'success'|'error',text}`、`tools/skills/commands/sessions` 服务名、
+`session/event` / `agent/error` / `agent/turn-stopping` / `session/flush` / `session/disposed`、
+durable 事件名（`user/message` / `assistant/message` / `tool/result` / `turn/start` /
+`step/start` / `turn/end`）、`SessionHeader.origin/delegationDepth`、客户端模块格式
+（`__ModuleLoader__.load({id:包名, factory})`）、`dsh.bundle.patch` / `dsh.client.platform`、
+patch 的 `!!js`。
+
+> 例外：`source.kind` 一项原先被归到"未变/无害"，后被真机证明是硬失败，已按上面 §6 修复。
+
+### 其它
+
+- `test/section-registry.test.mjs` 的手抄 order 表同步到 0.1.7-rc.1，并把 `CONTEXT_ORDERS`
+  也纳入断言（插件 Section 520–523 / context 560 仍然安全）。
+- 新增护栏：patch 透传的 env 值必须能通过 `Config` 校验；pre-step 必须保留 decision 的额外字段；
+  客户端产物不得再出现 `settingsScope` / `settings.plugin.item`，必须出现 `configForms` /
+  `settings.section`；命名空间缺失时必须渲染可见的自解释说明；不再监听 `agent/session-start`；
+  **注入消息的 `source.kind` 不得为 `'plugin'`**（v4 硬拒绝）。
+- 设置页交互（2026-09-25 二次调整）：挂成**顶层设置导航页**（`settings.section`，与 profile 里其它
+  第三方插件一致）之后，去掉了原来的二级折叠头（`aria-expanded` / chevron / `open` 状态）——
+  进页面即见全部开关，少一次点击；渲染测试新增"不得再有折叠头部"的护栏。
+- 真机验证（`0.1.7-rc.1`）：entry `include:tdai-memory` 以 `status: "schema"` 挂载；
+  10 个 `tdai_*` 工具出现在 live Tool 目录；客户端产物进入 `__DSH_BOOT__` 并被
+  `plugins/??…/client.js` 批次实际下发；身份恢复后 `tdai_memory_query` 返回真实记忆
+  （26 条），运行态快照显示 L3 1 段 / L2 3 条 / 知识资源 1 个。
+
+### 历史设置的找回（迁移操作，不是代码改动）
+
+升级到 0.1.7-rc.1 时，DSH 的 settings 导入器把旧的 `~/.dsh/settings.yaml` 改名为
+`settings.yaml.imported`，再**逐段** `settings.update(ns, values)`；**导入当刻本插件已被 profile
+重建丢掉**，没有 `tdai-memory` 这个 entry，于是该段更新失败，只留在改名后的文件里
+（`dsh-settings` 注释原文：*"a section the running composition rejects is logged and remains
+only in the renamed file"*）。用户此前配置的身份与知识库设置因此**没有丢，只是没被迁移**。
+
+找回办法（本次执行）：插件装回来后，把 `settings.yaml.imported` 复制回 `settings.yaml` 并重启
+一次让导入器重跑 → `tdai-memory` 段的 `serviceId / teamId / agentId / userId / userKey /
+knowledgeEnabled / knowledgeEndpoint` 全部落进 profile 的用户层，其余字段的 `!!js` env 表达式
+原样保留（合并而非整段替换）。
+
+> ⚠️ **一处未解释的异常（如实记录）**：该段里 `enabled: true` 与 `captureEnabled: true` 被导入器
+> 写成了 `false`（同段的 `knowledgeEnabled: true` 正确）。已用**导入器自己的 `yaml` 包**复核：
+> 解析结果是布尔 `true`；本插件 schema 对 `true → true` 也正确。无法从已读代码复现，暂记为待查。
+> 处理：在 profile 用户层把这两个字段改回 `true`（`patchReload: live` 立即生效）。
+> **再次导入后需复查这两个开关。**
+>
+> 对照：**面板保存路径已验证正常** —— 用户在设置页把开关改成 false 并保存后，profile 用户层
+> 精确落盘（`enabled: false` / `captureEnabled: false`），说明 `configForms.mutate` → `settings.write`
+> → 用户层这条链是通的。
 
 ---
 

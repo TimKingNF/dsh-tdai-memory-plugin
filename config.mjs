@@ -25,15 +25,29 @@
  */
 const FALSEY = /^(0|false|no|off)$/i
 
+/**
+ * 取"实时值"。
+ *
+ * DSH 0.1.7-rc.1 起，`Config` 里标了 `.volatile()` 的字段经 cordis 校验后会变成
+ * **`{ get() }` 访问器**（`{a: z.boolean().volatile()}` → `config.a.get()`），在面板写入时
+ * **原地更新**（loader 的 `_commitVolatile` 改的是这个访问器，不会重新 apply 插件）。
+ * 没标 volatile 的字段仍是普通值（部署期配置，如 `apiKeyEnv`）。这里统一拆掉这层，
+ * 让下面的归一化逻辑对两种形态都成立。见 lib/settings.mjs 顶部对 volatile 约定的说明。
+ */
+export function liveValue(value) {
+  return value && typeof value === 'object' && typeof value.get === 'function' ? value.get() : value
+}
+
 function boolOpt(value, dflt) {
-  if (value === undefined || value === null || value === '') return dflt
-  if (typeof value === 'boolean') return value
-  if (typeof value === 'number') return value !== 0
-  return !FALSEY.test(String(value).trim())
+  const v = liveValue(value)
+  if (v === undefined || v === null || v === '') return dflt
+  if (typeof v === 'boolean') return v
+  if (typeof v === 'number') return v !== 0
+  return !FALSEY.test(String(v).trim())
 }
 
 function numOpt(value, dflt) {
-  const n = Number(value)
+  const n = Number(liveValue(value))
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : dflt
 }
 
@@ -46,13 +60,15 @@ function numOpt(value, dflt) {
  * 空串/缺省仍回落默认值（空串不能被 Number('') 的 0 骗过去）。
  */
 function numOptZero(value, dflt) {
-  if (value === undefined || value === null || value === '') return dflt
-  const n = Number(value)
+  const raw = liveValue(value)
+  if (raw === undefined || raw === null || raw === '') return dflt
+  const n = Number(raw)
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : dflt
 }
 
 export function str(value) {
-  const text = typeof value === 'string' ? value.trim() : ''
+  const raw = liveValue(value)
+  const text = typeof raw === 'string' ? raw.trim() : ''
   return text || undefined
 }
 

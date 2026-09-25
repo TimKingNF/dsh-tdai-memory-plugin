@@ -4,7 +4,7 @@
  *   - 模块树可正常 import（含 schemastery）
  *   - apply() 不抛异常
  *   - 工具 schema 是合法的 JSON Schema（parameters.type === 'object'）
- *   - settings 命名空间注册成功（host 侧）
+ *   - 导出 Config 且关掉自动生成页（settings.configure）
  *   - systemPrompt sections 注册成功
  *   - slash 命令注册成功
  *
@@ -14,9 +14,9 @@ import assert from 'node:assert'
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { apply } from '../index.mjs'
+import { apply, Config } from '../index.mjs'
 import { resolveConfig } from '../config.mjs'
-import { SCHEMA_KEYS } from '../lib/settings.mjs'
+import { SCHEMA_KEYS, identitySourceOf } from '../lib/settings.mjs'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -26,25 +26,37 @@ const registered = {
   commands: [],
   listeners: [],
   settings: null,
+  effects: [],
 }
 
-const scope = {
-  get() {
-    return {
-      enabled: true, captureEnabled: true, recallEnabled: true, injectionEnabled: true,
-      sessionContextEnabled: true, profileMemoryEnabled: true, skillsEnabled: true, knowledgeEnabled: false,
-      endpoint: '', serviceId: 'mem-demo', teamId: 'team-x', agentId: 'agt-x', userId: 'usr-x',
-      userKey: '', taskId: '', recallLimit: 5, l2Limit: 3, timeoutMs: 5000,
-    }
-  },
-  watch() { return () => {} },
-}
-
+/**
+ * 假 settings 服务（DSH 0.1.7-rc.1 形状）。
+ *
+ * `register(ns, schema, opts)` 已在 0.1.7-rc.1 被删除，这里**故意不提供它**：
+ * 一旦插件代码又退回去调用它，本测试会以 `is not a function` 直接红。
+ */
 const mockSettingsCtx = {
+  // cordis 的 effect(fn) 会立即执行 fn 并登记它的清理函数
+  effect(fn) {
+    registered.effects.push(fn)
+    const disposer = fn()
+    return typeof disposer === 'function' ? disposer : () => {}
+  },
   settings: {
-    register(ns, schema, opts) {
-      registered.settings = { ns, schema, opts }
-      return scope
+    configure(presentation, owner) {
+      registered.settings = { presentation, owner }
+    },
+    describe() {
+      return [{
+        ns: 'tdai-memory',
+        autoGenerate: false,
+        schema: {},
+        value: {},
+        user: { serviceId: 'from-panel' },
+        base: { serviceId: 'from-env' },
+        revision: 1,
+        applies: 'live',
+      }]
     },
   },
 }
@@ -57,6 +69,7 @@ const mockCommandsCtx = {
 
 const ctx = {
   logger: { warn() {} },
+  fiber: { id: 'tdai-memory' },
   inject(deps, cb) {
     if (Array.isArray(deps)) {
       if (deps.includes('settings')) cb(mockSettingsCtx)
@@ -99,34 +112,57 @@ const kCall = registered.tools.find((t) => t.name === 'tdai_knowledge_call')
 assert.deepEqual(kCall.parameters.required, ['knowledge_id', 'tool_name'], '知识执行工具的必填参数')
 assert.equal(kCall.parameters.properties.params.type, 'object', 'params 应是 JSON 对象')
 
-// settings 命名空间注册
-assert.ok(registered.settings, '应注册 settings 命名空间')
-assert.equal(registered.settings.ns, 'tdai-memory')
+// ── settings（0.1.7-rc.1 模型）───────────────────────────────────────────────
+// 插件只做两件事：导出 Config（schema），并关掉宿主的自动生成页。
+assert.ok(registered.settings, '应调用 settings.configure')
+assert.deepEqual(registered.settings.presentation, { auto: false }, '自带设置页 → 关掉自动生成页')
+assert.ok(registered.settings.owner, 'configure 应绑定到本插件 fiber')
 
-// 设置面板字段必须真的能落到 config：漏一个 → 面板改了不生效（静默）
+// identitySource：用户层出现身份键才算"来自设置面板"
+assert.equal(
+  identitySourceOf([{ ns: 'tdai-memory', user: { serviceId: 'x' } }]),
+  'settings',
+  '用户层有身份键 → settings',
+)
+assert.equal(
+  identitySourceOf([{ ns: 'tdai-memory', user: {} }]),
+  'env',
+  '用户层为空 → env',
+)
+assert.equal(identitySourceOf([], 'tdai-memory'), 'env', 'entry 不存在 → env')
+assert.equal(identitySourceOf(undefined), 'env', 'describe 不可用 → env')
+
+// ── Config schema 必须能吃下 cordis.patch.yml 透传进来的 env 值（回归护栏）────
+//
+// 这是升级到 0.1.7-rc.1 最容易踩的坑：patch 的 `!!js process.env.X ?? ''` 在 env 未设置时
+// 给的是**空字符串**。裸 `z.boolean()` / `z.natural()` 遇到 `''` 会抛
+// `expected boolean but got`，**整个 entry 加载失败**（插件完全不挂载）。
+// 所以布尔/数字字段用 union 接受字符串，归一化交给 config.mjs 的 boolOpt/numOpt。
 {
-  const { applySettings } = await import('../lib/settings.mjs')
-  const { identityComplete } = await import('../config.mjs')
-  let pushed
-  const settingsCtx = {
-    inject(deps, cb) { if (deps.includes('settings')) cb(settingsCtx) },
-    settings: {
-      register(ns, schema, opts) {
-        assert.equal(ns, 'tdai-memory')
-        return {
-          // 模拟用户层：面板里填了知识服务地址改写
-          get() { return { ...opts.base, knowledgeEndpoint: 'http://127.0.0.1:8424' } },
-          watch(push) { pushed = push },
-        }
-      },
-    },
-  }
-  const envCfg = { enabled: true, serviceId: 'default', teamId: 't', agentId: 'a', userId: 'u', knowledgeEnabled: true }
-  applySettings(settingsCtx, envCfg, () => {}, (cfg) => { pushed = cfg })
-  assert.ok(pushed, 'settings 就绪时应推一次当前值')
-  assert.equal(pushed.knowledgeEndpoint, 'http://127.0.0.1:8424', '面板里的知识服务地址改写必须落到 config')
-  assert.equal(pushed.knowledgeEnabled, true, '布尔开关不能被面板层丢掉')
-  assert.ok(identityComplete(pushed), '身份字段应完整传递')
+  const blank = {}
+  for (const key of SCHEMA_KEYS) blank[key] = ''
+  const parsed = Config(blank) // 不能抛
+  const cfg = resolveConfig(parsed)
+  assert.equal(cfg.enabled, true, '空串布尔应回落默认 true')
+  assert.equal(cfg.knowledgeEnabled, false, '空串布尔应回落默认 false')
+  assert.equal(cfg.recallLimit, 5, '空串数字应回落默认 5')
+  assert.equal(cfg.assetRetryCooldownMs, 15000, '空串数字应回落默认 15000')
+
+  // env 里显式设成字符串（这是 patch 的真实形态）
+  const fromEnv = resolveConfig(Config({ enabled: 'false', recallLimit: '8', assetRetryCooldownMs: '0' }))
+  assert.equal(fromEnv.enabled, false, 'env "false" 必须生效')
+  assert.equal(fromEnv.recallLimit, 8, 'env "8" 必须生效')
+  assert.equal(fromEnv.assetRetryCooldownMs, 0, 'env "0" 必须生效（0 是合法值）')
+
+  // 设置面板写的是真布尔 / 真数字
+  const fromPanel = resolveConfig(Config({ enabled: false, recallLimit: 7 }))
+  assert.equal(fromPanel.enabled, false, '面板布尔必须生效')
+  assert.equal(fromPanel.recallLimit, 7, '面板数字必须生效')
+
+  // secret 字段：schema 里声明了 role('secret')，宿主才能把它从 wire 值里剥掉
+  const json = Config.toJSON()
+  const refs = JSON.stringify(json)
+  assert.ok(refs.includes('"role":"secret"'), 'userKey 必须声明 role(secret)')
 }
 
 // systemPrompt sections
@@ -145,6 +181,9 @@ for (const n of ['tdai-sync', 'tdai-status', 'tdai-archive', 'tdai-help']) {
 const events = registered.listeners.map(([ev]) => ev)
 assert.ok(events.includes('agent/pre-step'), '应监听 agent/pre-step')
 assert.ok(events.includes('session/event'), '应监听 session/event')
+// 0.1.7-rc.1 的 `agent/session-start` 已不存在（预热监听曾是静默死代码），改听 agent/created
+assert.ok(events.includes('agent/created'), '应监听 agent/created 做会话预热')
+assert.ok(!events.includes('agent/session-start'), '不应再监听已不存在的 agent/session-start')
 
 // ── 配置键 ↔ env 透传（回归护栏）─────────────────────────────────────────────
 //
@@ -169,4 +208,4 @@ assert.ok(events.includes('session/event'), '应监听 session/event')
   assert.equal(resolveConfig({ assetRetryCooldownMs: '' }).assetRetryCooldownMs, 15000, '留空回落到默认值')
 }
 
-console.log(`load test passed: ${registered.tools.length} tools, settings ns, ${registered.sections.length} sections, ${registered.commands.length} commands, lifecycle listeners`)
+console.log(`load test passed: ${registered.tools.length} tools, Config schema + settings.configure, ${registered.sections.length} sections, ${registered.commands.length} commands, lifecycle listeners`)

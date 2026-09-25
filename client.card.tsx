@@ -5,8 +5,24 @@
  * 可折叠头部（标题+副标题+自定义 SVG 箭头）、字段为「标签在上控件在下」的堆叠行、
  * 底部「放弃修改(ghost) + 保存(primary)」草稿式提交。全部行内样式 + --dsw-* 变量。
  *
- * 读写：通过 settingsScope 绑定命名空间。编辑进草稿（secret 字段脱敏显示、初始置空），
- * 用 touched 集合记录用户改过的字段（避免脱敏导致"永远脏"），保存时只批量 mutate 改过的字段。
+ * 读写（DSH 0.1.7-rc.1）：通过 `ctx.configForms.get(ENTRY_ID)` 拿到本 entry 的设置表单；
+ * 旧的 `ctx.settingsScope.bind({namespace})` 已随 0.1.7-rc.1 一起被删除。编辑进草稿
+ * （secret 字段脱敏显示、初始置空），用 touched 集合记录用户改过的字段（避免脱敏导致
+ * "永远脏"），保存时只批量 mutate 改过的字段。
+ *
+ * 挂载位置：`settings.section` —— 设置面板左侧的**顶层导航页**（「设置 → TDAI Memory」），
+ * 与 profile 里其它第三方插件（`dsh-better-sidebar` / `dsh-workspace-drag` / `dshmarket`）一致。
+ *
+ * 走过的弯路：先挂的是 `settings.plugins.tab`（「内置插件」分区里的二级 tab，官方 inventory
+ * 用那个）——实测用户**在设置导航里根本看不到**，反馈"没有设置项"。旧的 `settings.plugin.item`
+ * 已不存在；`plugins.item` 是 Plugin Manager 的 **keyed** 槽（要 `bundle#rowId` 的 key +
+ * summary/full 双视图），语义不符。
+ *
+ * 这里**无条件注册**（不用 `configForms.whileServed` 包）：命名空间缺失时渲染一条可见的
+ * 自解释说明——"客户端加载成功但宿主命名空间缺失"是可诊断状态，不该被藏成"什么都没有"。
+ *
+ * secret 字段（userKey）：`ConfigFormSnapshot.value` 里**没有**它（宿主的 redact 会把它从
+ * value 里删掉），所以只能"留空 = 不改动"。是否已设置从 `describe()` 的 `secrets` 侧信道读。
  *
  * ── 开关的依赖关系（文案必须与真实语义一致，改动前先看这张表）─────────────────
  *
@@ -203,14 +219,6 @@ const C = {
   secondary: 'var(--dsw-alias-label-secondary, inherit)',
 }
 
-function Chevron({ open }: { open: boolean }) {
-  return (
-    <svg width={16} height={16} viewBox="0 0 16 16" style={{ color: C.tertiary, flex: 'none', transition: 'transform .16s', transform: open ? 'rotate(180deg)' : 'none' }}>
-      <path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
-}
-
 function blankSecrets(value: Record<string, unknown>): Record<string, unknown> {
   const next = { ...value }
   for (const f of IDENTITY_FIELDS) if (f.secret) next[f.key] = ''
@@ -230,17 +238,65 @@ function identityWarningNote(missing: string[], readOn: boolean): React.ReactNod
   )
 }
 
-function TdaiMemoryCard(props: { ctx: Context }) {
-  const { ctx } = props
-  const [scope] = React.useState(() => ctx.settingsScope.bind({ namespace: NS }))
-  const [snap, setSnap] = React.useState(() => scope.getSnapshot())
-  const [open, setOpen] = React.useState(false)
+/**
+ * 本卡片用到的最小设置表单契约（对应 dsh-client-ui-settings 的 `ConfigForm`）。
+ *
+ * 只声明用到的部分：客户端插件**不能**把 `@deepseek-ai/dsh-client-ui-*` 当模块导入
+ * （跨包值导入被 client bundle 的纯度门禁拒绝，且随版本变），所以这里用结构化类型。
+ */
+export interface SettingsForm {
+  getSnapshot(): {
+    status: 'loading' | 'ready' | 'unavailable'
+    value?: unknown
+    writable?: boolean
+  }
+  subscribe(listener: () => void): () => void
+  mutate(ops: unknown[]): Promise<unknown>
+}
+
+/** 只读的 describe 面：用来判断 secret 字段"是否已设置"（明文永远拿不到）。 */
+export interface SettingsDescribeFace {
+  getSnapshot(): {
+    view?: { namespaces?: Array<{ ns: string; secrets?: Array<{ path: string[]; set: boolean }> }> }
+  }
+  subscribe(listener: () => void): () => void
+}
+
+function TdaiMemoryCard(props: { form: SettingsForm; describe?: SettingsDescribeFace; entryId?: string }) {
+  const { form, describe } = props
+  const entryId = props.entryId ?? NS
+  const [snap, setSnap] = React.useState(() => form.getSnapshot())
   const [draft, setDraft] = React.useState<Record<string, unknown> | null>(null)
   const [touched, setTouched] = React.useState<Set<string>>(() => new Set())
   const [note, setNote] = React.useState('')
-  React.useEffect(() => scope.subscribe(() => setSnap(scope.getSnapshot())), [scope])
+  React.useEffect(() => form.subscribe(() => setSnap(form.getSnapshot())), [form])
 
-  if (snap.status === 'unavailable') return null
+  // secret 的"是否已设置"侧信道（值本身跨 wire 就被删掉了）
+  const [dsnap, setDsnap] = React.useState(() => describe?.getSnapshot())
+  React.useEffect(
+    () => (describe ? describe.subscribe(() => setDsnap(describe.getSnapshot())) : undefined),
+    [describe],
+  )
+  const secretSet = (key: string) => {
+    const entry = dsnap?.view?.namespaces?.find((n) => n.ns === entryId)
+    return entry?.secrets?.some((s) => s.path.length === 1 && s.path[0] === key && s.set) === true
+  }
+
+  if (snap.status === 'unavailable') {
+    // 无条件注册成顶层设置页之后，这个分支是有意的"自解释失败"：
+    // 页面在 → 说明客户端半边已加载；这句在 → 说明宿主没暴露本插件的设置命名空间。
+    // 两者都没有 → 客户端半边根本没加载（那是另一类问题，别再猜这一层）。
+    return (
+      <div style={{ border: C.border, borderRadius: '12px', padding: '14px 16px' }} role="status">
+        <div style={{ fontSize: '14px', fontWeight: 600 }}>TDAI Memory</div>
+        <div style={{ color: C.tertiary, fontSize: '13px', marginTop: '6px' }}>
+          设置当前不可用：宿主没有暴露本插件的设置命名空间（<code>{entryId}</code>）。
+          请确认 dsh-tdai-memory-plugin 已在 profile 中启用（entry 状态应为 <code>schema</code>），
+          并检查宿主日志里是否有 <code>[tdai-memory]</code> 的报错。
+        </div>
+      </div>
+    )
+  }
   const current = snap.status === 'ready' && snap.value ? snap.value as Record<string, unknown> : {}
   const writable = snap.writable !== false
 
@@ -280,7 +336,7 @@ function TdaiMemoryCard(props: { ctx: Context }) {
     if (invalid) { setNote(invalid); return }
 
     setNote('保存中…')
-    Promise.resolve(scope.mutate(ops))
+    Promise.resolve(form.mutate(ops))
       .then(() => {
         // 回填草稿：让面板显示与真正落库的值一致（数值字段会把 "07" / 50 收敛掉）
         setDraft((d) => (d ? { ...d, ...patch } : d))
@@ -376,28 +432,12 @@ function TdaiMemoryCard(props: { ctx: Context }) {
     )
   }
 
-  const openStyle = open
-    ? { ...C, background: 'var(--dsw-alias-bg-layer-2, rgba(127,127,127,0.10))', borderRadius: '12px' }
-    : { ...C, background: 'var(--dsw-alias-bg-layer-3, rgba(127,127,127,0.05))', borderRadius: '12px' }
-
   return (
-    <div style={{ ...openStyle, transition: 'border-color .16s, background .16s' }}>
-      <button
-        type="button"
-        aria-expanded={open}
-        onClick={() => setOpen(!open)}
-        style={{ appearance: 'none', width: '100%', font: 'inherit', color: 'inherit', textAlign: 'left', cursor: 'pointer', background: 'none', border: 0, borderRadius: '12px', display: 'flex', alignItems: 'center', gap: '12px', padding: '14px 16px' }}
-      >
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div style={{ fontSize: '14px', fontWeight: 600 }}>TDAI Memory</div>
-          <div style={{ color: C.tertiary, fontSize: '12px', marginTop: '2px' }}>团队记忆接入：读侧（召回 / 注入 / 工具）与写侧（回流）开关互相独立</div>
-        </div>
-        <Chevron open={open} />
-      </button>
-      {open && (
-        <>
-          <div style={{ borderTop: C.border, margin: '0 16px' }}>
-            {!writable && <p style={{ color: C.tertiary, margin: '12px 0 4px', fontSize: '12px' }} role="status">当前设置为只读。</p>}
+    <div style={{ border: C.border, background: 'var(--dsw-alias-bg-layer-3, rgba(127,127,127,0.05))', borderRadius: '12px' }}>
+      {/* 顶层设置页已由左侧导航承担"标题"职责，这里不再放可折叠头部：
+          少一次点击，进页面即见全部开关（2026-09-25 改）。 */}
+      <div style={{ margin: '0 16px', paddingTop: '4px' }}>
+        {!writable && <p style={{ color: C.tertiary, margin: '12px 0 4px', fontSize: '12px' }} role="status">当前设置为只读。</p>}
 
             {/* ── 读侧：把记忆读进上下文（召回 / 注入 / 只读工具）─────────────── */}
             {groupTitle('读侧 · 把记忆读进上下文')}
@@ -440,7 +480,7 @@ function TdaiMemoryCard(props: { ctx: Context }) {
                 <input
                   type={f.secret ? 'password' : 'text'}
                   value={shown}
-                  placeholder={f.placeholder}
+                  placeholder={f.secret && secretSet(f.key) ? '已设置（留空表示不改动）' : f.placeholder}
                   disabled={!writable || saving}
                   style={inputStyle}
                   onChange={(e) => edit(f.key, e.target.value)}
@@ -454,20 +494,42 @@ function TdaiMemoryCard(props: { ctx: Context }) {
             <button type="button" disabled={!dirty || saving} onClick={reset} style={ghostBtn}>放弃修改</button>
             <button type="button" disabled={!dirty || saving} onClick={save} style={primaryBtn}>保存</button>
           </div>
-        </>
-      )}
     </div>
   )
 }
 
 export const name = 'dsh-tdai-memory-plugin-client'
-export const inject = ['settingsScope', 'slots']
+export const inject = ['configForms', 'slots']
+
+/**
+ * 设置命名空间 = profile patch 的 entry id，必须与 lib/settings.mjs 的
+ * `SETTINGS_NAMESPACE` 和 cordis.patch.yml 的 `id` 三处一致。
+ *
+ * 依据（0.1.7-rc.1 实测）：settings 命名空间就是 **profile patch 的 entry id**
+ * （官方 `dsh-client-ui-settings-*` 的 `_NS` 分别等于 `agent-loop` /
+ * `web-search-deepseek` / `subagent-model-selection-settings`），不是带 `include:` 前缀的
+ * loader 路径。
+ */
+export const SETTINGS_ENTRY_ID = NS
 
 export function apply(ctx: Context) {
-  // 槽位由 client-ui-settings-plugins 在运行时声明，跨插件注册必须走 slots.inject
-  ctx.slots.inject('settings.plugin.item', () =>
-    ctx.slots.register({ name: 'settings.plugin.item', key: NS }, () =>
-      React.createElement(TdaiMemoryCard, { ctx }),
-    ),
+  // 读侧只读面：用来在卡片里显示 secret 字段"是否已设置"
+  const describe = ctx.configForms.describe()
+  const form = ctx.configForms.get(NS)
+  // 挂到 **settings.section**（设置面板左侧的顶层导航页），与 profile 里其它第三方插件
+  // （dsh-better-sidebar / dsh-workspace-drag / dshmarket）一致。
+  //
+  // 为什么不挂 settings.plugins.tab：那是「内置插件」分区里的二级 tab，藏得深、且那是给
+  // DSH 内置插件清单用的；挂在那里用户会以为"没有设置项"（实测踩过）。
+  // 为什么不用 whileServed 包一层：无条件注册让"客户端加载了但命名空间缺失"变成**可见**的
+  // 自解释条目，而不是静默消失（故障可诊断性 > 少一次空条目）。
+  ctx.slots.inject('settings.section', () =>
+    ctx.slots.register({
+      name: 'settings.section',
+      id: NS,
+      order: 200,
+      label: () => 'TDAI Memory',
+      inject: () => ({ form, describe, entryId: NS }),
+    }, TdaiMemoryCard),
   )
 }

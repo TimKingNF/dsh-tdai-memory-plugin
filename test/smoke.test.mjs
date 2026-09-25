@@ -9,6 +9,7 @@ import {
   renderSkillsBlock,
 } from '../lib/prompts.mjs'
 import { buildSettingsSchema } from '../lib/settings.mjs'
+import { liveValue } from '../config.mjs'
 
 // chunkConversationMessages：8192 分片
 const long = 'a'.repeat(9000)
@@ -83,10 +84,12 @@ assert.equal(renderSkillsBlock({ listing: '(none)' }), '')
 assert.ok(renderSkillsBlock({ listing: '<available_skills>\n- foo: bar\n</available_skills>' }).includes('tdai_skill_view'))
 
 // settings schema：校验合法值、拒绝越界
+// 注意 volatile 字段校验后是 `{ get() }` 访问器（0.1.7-rc.1 的实时配置协议），
+// 所以用 liveValue() 取值 —— 这也是插件运行时读配置的同一条路径。
 const schema = buildSettingsSchema()
 const good = schema({ enabled: true, teamId: 'team-x', recallLimit: 7, l2Limit: 3, timeoutMs: 5000 })
-assert.equal(good.teamId, 'team-x')
-assert.equal(good.recallLimit, 7)
+assert.equal(liveValue(good.teamId), 'team-x')
+assert.equal(liveValue(good.recallLimit), 7)
 assert.throws(() => schema({ recallLimit: 999 }), 'recallLimit 越界应被拒')
 assert.throws(() => schema({ timeoutMs: 1 }), 'timeoutMs 低于下限应被拒')
 

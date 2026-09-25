@@ -81,17 +81,17 @@ const assistantEvent = (text) => ({
 {
   const h = harness()
   h.emit('turn/start', { turn: 1 })
-  // 宿主 runtime context 快照
+  // 宿主 runtime context 快照（v4：kind 就是生产者身份）
   h.emit('user/message', userEvent('Current runtime context. … Approval policy: ask.', {
-    kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt', form: 'snapshot',
+    kind: 'runtime-context', form: 'snapshot',
   }))
   // 宿主 skill 目录
   h.emit('user/message', userEvent('<system-reminder>A skill is …</system-reminder>', {
     kind: 'skill-catalog', form: 'catalog', entries: [],
   }))
-  // 本插件注入的独立消息
+  // 本插件注入的独立消息（v4：`plugin:<插件名>`；老会话里的 `kind:'plugin'` 迁移后是同名 kind）
   h.emit('user/message', userEvent('<tdai_profile_memory>…</tdai_profile_memory>', {
-    kind: 'plugin', plugin: 'dsh-tdai-memory-plugin', form: 'snapshot',
+    kind: 'plugin:dsh-tdai-memory-plugin', form: 'snapshot',
   }))
   // 真人消息
   h.emit('user/message', userEvent('真正的用户输入', { kind: 'user', rpcId: 'r2' }))
@@ -138,7 +138,7 @@ const assistantEvent = (text) => ({
   const h = harness()
   h.emit('turn/start', { turn: 1 })
   h.emit('user/message', userEvent('<tdai_recalled_l1_memories>\n1. [rule] [self] x\n</tdai_recalled_l1_memories>', {
-    kind: 'plugin', plugin: 'dsh-tdai-memory-plugin',
+    kind: 'plugin:dsh-tdai-memory-plugin',
   }))
   h.emit('user/message', userEvent('正常问题', { kind: 'user', rpcId: 'r4' }))
   await h.stopTurn(1)

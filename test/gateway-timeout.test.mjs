@@ -13,7 +13,7 @@ import assert from 'node:assert'
 import http from 'node:http'
 import { GatewayClient } from '../client.mjs'
 import { SessionAssets } from '../lib/assets.mjs'
-import { wireRecall } from '../lib/recall.mjs'
+import { wireRecall, SOURCE_KIND } from '../lib/recall.mjs'
 
 /** 起一个假 MemoryCore：mode='hang' 时只挂住请求不回；mode='ok' 时延迟后回合法 envelope。 */
 function gateway(mode, delayMs = 0) {
@@ -140,7 +140,7 @@ function harness(runtime) {
     assert.equal(result.messages.length, 2, '应注入一条召回消息')
     assert.deepEqual(result.messages[0], userMessage, '真人消息必须原样保留')
     const injected = result.messages[1]
-    assert.equal(injected.source.kind, 'plugin')
+    assert.equal(injected.source.kind, SOURCE_KIND, 'v4 要求生产者自己的 kind（不能是 plugin）')
     assert.equal(injected.source.form, 'notice')
     assert.ok(injected.content[0].text.includes('remember X'), '真实 HTTP 命中的内容应进块')
   } finally {
