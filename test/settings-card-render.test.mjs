@@ -10,8 +10,8 @@
  *   - 身份不全 → 在读侧那组下面显式告警（这是"开关都开着却没注入"最常见的原因）。
  *
  * 做法：esbuild 把 tsx 转成 ESM 后用 react-dom/server 静态渲染，不引 jsdom。
- * 面板默认折叠、body 在 `{open && …}` 里，所以转换前把初始值改成 true ——
- * 源码里找不到那行会**直接抛错**，不会静默退化成"什么都没测"。
+ * 卡片**没有折叠头**（全部字段直接渲染；测试反过来断言产物里不含 `aria-expanded`），
+ * 所以不需要"把折叠初始值改成 true"这类预处理。
  *
  * 运行：node test/settings-card-render.test.mjs
  */
@@ -89,7 +89,7 @@ function dimmed(html, label) {
   return html.slice(start, at).includes('opacity:0.55')
 }
 
-// ── 1) 结构：三个分组 + 召回条数上限是个数字输入 ────────────────────────────
+// ── 1) 结构：四个分组 + 召回条数上限是个数字输入 ────────────────────────────
 {
   const html = render()
   for (const title of ['读侧 · 把记忆读进上下文', '写侧 · 把对话回流给 MemoryCore', '子 agent · 委派出去的子会话', '身份与地址']) {
@@ -117,9 +117,9 @@ function dimmed(html, label) {
     `${CARD_FIELDS.toggles.length} 个开关 + 1 个数字框都应是 nowrap 项`,
   )
   // 子 agent 两个开关默认关：渲染出的 checkbox 必须是未勾选状态
-  const subagentAt = html.indexOf('子 agent 继承注入与召回')
+  const subagentAt = html.indexOf('子 agent 全量继承读侧')
   const subagentBlock = html.slice(html.lastIndexOf('<label', subagentAt), html.indexOf('</label>', subagentAt))
-  assert.ok(!subagentBlock.includes('checked=""'), '「子 agent 继承注入与召回」默认应为未勾选')
+  assert.ok(!subagentBlock.includes('checked=""'), '「子 agent 全量继承读侧」默认应为未勾选')
   const subCaptureAt = html.indexOf('子 agent 对话回流')
   const subCaptureBlock = html.slice(html.lastIndexOf('<label', subCaptureAt), html.indexOf('</label>', subCaptureAt))
   assert.ok(!subCaptureBlock.includes('checked=""'), '「子 agent 对话回流」默认应为未勾选')
@@ -129,7 +129,7 @@ function dimmed(html, label) {
 {
   const html = render()
   assert.ok(!html.includes('身份未填全'), '身份齐全时不应有告警')
-  for (const label of ['L1 自动召回', 'System prompt 注入', 'Skill 列表', '对话回流到 MemoryCore', '子 agent 继承注入与召回', '子 agent 对话回流']) {
+  for (const label of ['L1 自动召回', 'System prompt 注入', 'Skill 列表', '对话回流到 MemoryCore', '子 agent 全量继承读侧', '子 agent 对话回流']) {
     assert.equal(dimmed(html, label), false, `身份齐全 + 开关全开时「${label}」不该置灰`)
   }
 }
@@ -141,7 +141,7 @@ function dimmed(html, label) {
     assert.equal(dimmed(html, label), true, `读侧总开关关闭时「${label}」应置灰`)
   }
   assert.equal(dimmed(html, '对话回流到 MemoryCore'), false, '回流是独立的写侧开关，读侧关闭不该影响它')
-  assert.equal(dimmed(html, '子 agent 继承注入与召回'), true, '读侧总开关关闭时「子 agent 继承注入」也该灰（它属于读侧）')
+  assert.equal(dimmed(html, '子 agent 全量继承读侧'), true, '读侧总开关关闭时「子 agent 全量继承读侧」也该灰（它属于读侧）')
   assert.equal(dimmed(html, '子 agent 对话回流'), false, '「子 agent 对话回流」属于写侧，读侧关闭不该影响它')
   assert.ok(!html.includes('身份未填全'), '读侧总开关已关时不重复告警（告警只在"开关开着但无效"时才有意义）')
 }

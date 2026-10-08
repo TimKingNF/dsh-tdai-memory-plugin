@@ -5,16 +5,19 @@
  *   - system prompt 注入：<session_context>（agent/task 详情）、<tdai_profile_memory>
  *     （L3 persona + L2 场景索引，自有+借入）、<available_skills>、<knowledge_tools>
  *   - L1 自动召回：agent/pre-step 按本轮用户输入做自有+借入合并 top-K 检索
- *   - 只读工具：tdai_memory_search / tdai_conversation_search / tdai_skill_search /
+ *   - 只读工具（10 个）：tdai_memory_search / tdai_conversation_search / tdai_skill_search /
  *     tdai_read_scene / tdai_skill_view / tdai_memory_query / tdai_conversation_query / tdai_scenario_ls
+ *     + 知识工具 tdai_knowledge_tools / tdai_knowledge_call
  *   - slash 命令：/tdai-sync /tdai-status /tdai-archive /tdai-help
  *
  * 写侧（captureEnabled，独立开关）：
  *   - 每轮结束旁路回流 /v3/conversation/add（L0）+ /v3/skill/conversation/add（Skill 归档）
  *
- * 子 agent 会话（DSH 派出去的子会话，session.header.origin === 'subagent'）默认降级：
- * 不注入 / 不召回 / 不注册知识 skill / 不预热资产 / 不回流（两个开关可改，见 config.mjs
- * 的 subagentInjectionEnabled / subagentCaptureEnabled 与 lib/subagent.mjs）。
+ * 子 agent 会话（DSH 派出去的子会话，session.header.origin === 'subagent'）默认
+ * **只保留知识库与工具**：不注入身份（`tdai:session-context`）与记忆（`tdai:profile-memory`
+ * / L1 召回 / `tdai:state` 快照）、不预热这些资产、不回流；但知识资产、`tdai:knowledge-tools`
+ * 路由、`tdai-team-knowledge` skill 与全部 10 个只读工具照常可用。`subagentInjectionEnabled=true`
+ * 恢复"全量继承"（连身份与记忆一起给子会话）。能力面定义见 lib/subagent.mjs。
  *
  * 身份与开关来源（优先级高→低）：
  *   1. Web 设置面板（「设置 → TDAI Memory」页）
@@ -24,9 +27,12 @@
  * ── DSH 0.1.7-rc.1 的配置模型 ────────────────────────────────────────────────
  *
  * 插件**导出 `Config`**（schemastery schema），由宿主 settings 服务负责表单、校验、
- * 层叠与写盘；写入后 Loader 会带着新 config **重新 apply 本插件**（`applies: 'live'`）。
- * 因此这里不再有"自己 merge 设置 + rebuild"的逻辑：每次 apply 拿到的就是当前生效配置，
- * `client` / `assets` 随之一起重建。详见 lib/settings.mjs 顶部。
+ * 层叠与写盘。写入后分两种：
+ *   - **非 volatile** 字段变化 → Loader 带着新 config **重新 apply** 本插件（`applies: 'live'`）；
+ *   - **volatile** 字段（= 面板上的字段）变化 → 只原地更新 `{ get() }` 访问器，**不重新 apply**，
+ *     插件靠 `config.mjs` 的 `liveValue()` 与下面的 `live()` 惰性重建派生对象。
+ * 两种情况下"当前生效配置"都从 `live()` 取，不再有"自己 merge 设置 + rebuild"的逻辑。
+ * 详见 lib/settings.mjs 顶部。
  *
  * 所有远端调用 fail-open，不阻断 DSH。
  */
@@ -39,7 +45,7 @@ import { wireCapture } from './lib/capture.mjs'
 import { registerTools, registerKnowledgeTools } from './lib/tools.mjs'
 import { registerCommands } from './lib/commands.mjs'
 import { buildSettingsSchema, applySettings, identitySourceOf, SETTINGS_NAMESPACE } from './lib/settings.mjs'
-import { readSideAllowed, isSubagentSession } from './lib/subagent.mjs'
+import { subagentReadPolicy, isSubagentSession } from './lib/subagent.mjs'
 
 export const name = 'dsh-tdai-memory-plugin'
 export const inject = ['tools', 'systemPrompt', 'sessions']
@@ -88,8 +94,8 @@ export function apply(ctx, config = {}) {
     get config() { return live().cfg },
     log,
     readEnabled() { const cfg = live().cfg; return cfg.enabled && identityComplete(cfg) },
-    /** 读侧对该会话是否生效（子 agent 会话默认降级，见 lib/subagent.mjs）。 */
-    readSideAllowedFor(session) { return readSideAllowed(live().cfg, session) },
+    /** 该会话的读侧能力面（身份 / 记忆 / 云端 skill 目录 / 知识，见 lib/subagent.mjs）。 */
+    readPolicyFor(session) { return subagentReadPolicy(live().cfg, session) },
     /** 这个会话是不是 DSH 派出去的子 agent 会话（/tdai-status 用它解释"为什么没注入"）。 */
     isSubagent(session) { return isSubagentSession(session) },
     identityFor(session) {
@@ -146,18 +152,20 @@ export function apply(ctx, config = {}) {
   ctx.on('agent/created', (payload) => {
     const session = payload?.agent?.session
     const sessionId = session?.id
-    // 子 agent 会话按策略降级时**不预热**：整个读侧都不会用到这份资产，预热只是
-    // 白白打一轮网关（并发扇出 N 个子 agent 就是 N 份）。见 lib/subagent.mjs。
-    if (
-      sessionId
-      && runtime.readEnabled()
-      && readSideAllowed(runtime.config, session)
-      && (runtime.config.injectionEnabled || runtime.config.recallEnabled)
-    ) {
-      // 后台预热，不 await：会话刚建立时把整包资产拉起来，
-      // 让第一次 pre-step / assemble 尽量命中缓存（加载本身有总预算与失败冷却）。
-      live().assets.warm(sessionId)
-    }
+    if (!sessionId || !runtime.readEnabled()) return
+    // 子 agent 会话按策略降级时**只预热它真会用到的那几面**：子会话默认只有知识面，
+    // 就不再为一份用不到的画像 / skill listing 打网关（并发扇出 N 个子 agent 就是 N 份）。
+    // 见 lib/subagent.mjs 的能力面表。
+    const cfg = runtime.config
+    const policy = subagentReadPolicy(cfg, session)
+    const needsAssets = (policy.identity && cfg.injectionEnabled && cfg.sessionContextEnabled)
+      || (policy.memory && ((cfg.injectionEnabled && cfg.profileMemoryEnabled) || cfg.recallEnabled))
+      || (policy.skills && cfg.injectionEnabled && cfg.skillsEnabled)
+      || (policy.knowledge && cfg.knowledgeEnabled)
+    if (!needsAssets) return
+    // 后台预热，不 await：会话刚建立时把整包资产拉起来，
+    // 让第一次 pre-step / assemble 尽量命中缓存（加载本身有总预算与失败冷却）。
+    live().assets.warm(sessionId, policy)
   })
   ctx.on('session/disposed', (session) => {
     live().assets.dispose(session?.id)

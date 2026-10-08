@@ -110,7 +110,7 @@ assert.equal(
 
 // ── 4) 保存归一化：空串回落 / 数值转 number / 越界收敛 / 非法值拦下 ──────────
 {
-  // (a) 正常数值：必须落成 number（z.natural() 对字符串直接抛）
+  // (a) 正常数值：必须落成 number（用户层存数字；schema 的 string 分支只服务组合层 env）
   const a = card.buildSaveOps({ recallLimit: '7' }, ['recallLimit'])
   assert.equal(a.error, '', '合法数字不应报错')
   assert.deepEqual(a.ops, [{ op: 'set', path: ['recallLimit'], value: 7 }])

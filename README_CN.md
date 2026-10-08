@@ -25,8 +25,8 @@ DeepSeek Harness 的 [TencentDB Agent Memory](https://github.com/TencentCloud/Te
 | DeepSeek Harness（DSH） | **`0.1.7-rc.1`** | 发布时安装的版本 |
 | [TencentDB-Agent-Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory) | **`v2.0.1`** | MemoryCore / MemoryKnowledge HTTP API |
 
-0.5.0 把插件从 DSH `0.1.2-rc.1` 的 API 迁移到 `0.1.7-rc.1`。这次升级**删掉了本插件用的两个
-API**（host 侧 `settings.register()`、client 侧 `settingsScope` 服务与 `settings.plugin.item`
+0.5.0 把插件从 DSH `0.1.2-rc.1` 的 API 迁移到 `0.1.7-rc.1`。这次升级**删掉了本插件用的三处
+API**（host 侧 `settings.register()`，加上 client 侧 `settingsScope` 服务与 `settings.plugin.item`
 槽位），所以 0.4.0 在 0.1.7-rc.1 上虽然能挂载，但设置页整条链失效，并留下一行
 `settings unavailable: settingsCtx.settings.register is not a function`。完整审计（每一项契约
 都带现场证据）见 [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md)。
@@ -69,15 +69,16 @@ API**（host 侧 `settings.register()`、client 侧 `settingsScope` 服务与 `s
 数据来源：`/v3/core/read`（L3）、`/v3/scenario/ls`（L2）、`/v3/skill/listing`（skill）、
 `/v3/knowledge/list`（knowledge）、`/v3/atomic/search`（L1 召回）、`/v3/meta/*`（agent/task 详情）。
 
-**子 agent 会话（DSH 派出去的子会话）默认不继承以上任何一项**，见
-[子 agent 会话](#子-agent-会话默认读侧关写侧关)。
+**子 agent 会话（DSH 派出去的子会话）默认只保留其中的「知识库 + 工具」**（知识路由、
+`tdai-team-knowledge` skill 与 10 个只读工具），身份与会记忆相关的那几项不注入，见
+[子 agent 会话](#子-agent-会话默认保留知识库与工具不注入身份与记忆)。
 
 **L1 召回为什么不写进用户那条消息**：宿主要在 `agent/pre-step` 之后把
 `decision.messages` **原样持久化**（`dsh-agent-loop` 的 `session.append("user/message", …)`）。
 如果把召回块 prepend 进真人消息，那段内容就会永久留在"用户发言"里 —— 前端把它当用户输入回显、
 回写 L0 只能靠文本哨兵裁剪、任何按 `source.kind === 'user'` 判真人发言的地方都会误判。
-所以召回块走独立消息：正文干净、`source.kind === 'plugin'` 让回写整条丢弃、前端渲染成一行
-可折叠的"上下文注入"（不塞进用户气泡）。
+所以召回块走独立消息：正文干净、`source.kind === 'plugin:dsh-tdai-memory-plugin'` 让回写整条丢弃、
+前端渲染成一行可折叠的"上下文注入"（不塞进用户气泡）。
 
 **段 order 为什么连号**：DSH 先比 order、order 相同才比 name。插件各段用连号（520–523），
 别人只能插在整块之前或之后，不会把 TDAI 内容切成两半。
@@ -150,7 +151,7 @@ schema 从 2774 → 6446 字节（新增 2 个知识工具 + 记忆工具描述�
 | 端点 | role | 工具怎么表示 |
 | --- | --- | --- |
 | `/v3/skill/conversation/add` | user / assistant / `tool_call` / `tool_result` / system | 独立消息 + `tool_call_id` 配对锚点 |
-| `/v3/conversation/add`（L0） | 只有 user / assistant | 折叠成 `[tool_call] name(args)` / `[tool_result:name] …` |
+| `/v3/conversation/add`（L0） | 只有 user / assistant / system | 折叠成 `[tool_call] name(args)` / `[tool_result:name] …` |
 
 - **内部思考（`reasoning`）与图片一律丢弃**，对齐
   `MemoryProxy/src/skill/normalize-conversation.ts`。reasoning 与可见回复在 DSH 里
@@ -160,10 +161,10 @@ schema 从 2774 → 6446 字节（新增 2 个知识工具 + 记忆工具描述�
   被 pre-step reject 的轮次走不到那里。插件在 `agent/error` 与 `turn/end` 上兜底：
   记日志 + 清缓冲，但**不写记忆** —— 半轮对话进 L0 只会被后台抽取当成"完整的一轮"消费。
 
-### 子 agent 会话（默认：读侧关、写侧关）
+### 子 agent 会话（默认：保留知识库与工具，不注入身份与记忆）
 
 DSH 派子 agent（`subagent` / `subagent_fork` 工具）时，子会话会继承本插件注册在全局层的
-section，并且同样触发进程级的监听。默认配置下的实测后果：
+section，并且同样触发进程级的监听。不设策略时的实测后果：
 
 - 子会话的 system prompt 与父会话**逐字节相同**（13020 字节，其中我们的 4 个段占 6093 字节 = 47%），
   并且会各自做一轮 L1 召回（实测 2 条、约 4.4KB）；
@@ -171,24 +172,39 @@ section，并且同样触发进程级的监听。默认配置下的实测后果�
   （任务 prompt、整份 diff、测试原始输出、每条工具调用）——后台抽取会把这类工作噪音
   当成"关于用户的记忆"。
 
-所以插件现在默认对子会话退让：
+所以读侧按**能力面**拆成四块（`lib/subagent.mjs`）：子会话默认拿到**知识库与工具**，
+**身份与记忆**不给：
+
+| 能力面 | 子会话默认 | 它管什么 |
+| --- | --- | --- |
+| `identity` | 关 | `tdai:session-context`（agent / task 身份） |
+| `memory` | 关 | `tdai:profile-memory`（L3 画像 + L2 索引）、L1 召回、`tdai:state` 快照 |
+| `skills` | 关 | `tdai:available-skills`（云端 skill 目录，由记忆服务的 skill 库派生） |
+| `knowledge` | **开** | 知识资产、`tdai:knowledge-tools` 路由、`tdai-team-knowledge` skill、知识工具 |
+
+初版是"读侧一刀切"，落地后撞了真实事故：一个四人调查团队的所有 `tdai_knowledge_call`
+都被策略闸门拒绝，谁都读不到 wiki，只能由父会话逐页投喂原文。**知识库恰恰是范围明确的
+子任务干活要用的能力**，所以它留在子会话里；而 10 个只读工具本来就没被摘掉。
 
 | 开关 | 默认 | 对子会话的效果 |
 | --- | --- | --- |
-| `subagentInjectionEnabled` | **关** | 不注入 system 段、不做 L1 召回、不注册知识 skill、不预热资产；10 个只读工具仍在 |
+| `subagentInjectionEnabled` | **关** | 不注入身份 + 记忆 + 云端 skill 目录，也不为这些面预热资产；**知识资产、知识 skill 与 10 个只读工具照常可用** |
 | `subagentCaptureEnabled` | **关** | 子会话的对话不回流 MemoryCore |
+
+打开 `subagentInjectionEnabled` = 恢复"与父会话完全一致"（含身份与记忆）。
 
 判定用 DSH 的 durable 标记 `session.header.origin === 'subagent'`（`delegationDepth > 0` 兜底），
 spawn 与 fork 两种子会话都覆盖；**缺 header 一律按顶层会话处理**（fail-open 到"维持现状"）。
-`/tdai-status` 会报告这两个开关，以及当前会话是不是子 agent 会话。
+`/tdai-status` 会报告这两个开关、**本会话的能力面矩阵**，以及当前会话是不是子 agent 会话。
 
-**缓存说明（实测，非估算）**：对比改动前后各一个真实子会话的第一步请求 ——
+**缓存说明（实测，非估算）**：下面这组数字测于初版的"全量降级"（连知识侧一起关）——
 system prompt 13020 → **6925 字节**，单次请求总 token 13748 → **10594**（−23%），
-其中**全价 token 2214 → 797**，缓存命中 11264 → 9728。也就是说：**关掉子会话注入不会让它
-多付缓存差价** —— 大额命中来自请求最前面的工具数组（38 个 schema，位置没动），
-而被删掉的 6093 字节根本不再计价；唯一失去父缓存的只有 DSH 自己的尾部段
-（约 500–800 tokens，因为位置前移）。如果你用 DSH 原生的 `dsh-tool-subagent` 的
-`persona` / `toolFilter` 定制子 agent，前缀本来就最先分叉。
+其中**全价 token 2214 → 797**，缓存命中 11264 → 9728。现在的默认策略只是把那 6093 字节里的
+知识路由块（**307 字节**，由 `test/prompt-budget.test.mjs` 量出）加了回来，知识 skill 正文
+不常驻、按需加载。结论不变：**关掉身份与记忆不会让子会话多付缓存差价** —— 大额命中来自请求
+最前面的工具数组（38 个 schema，位置没动），被删掉的字节根本不再计价；唯一失去父缓存的只有
+DSH 自己的尾部段（约 500–800 tokens，因为位置前移）。如果你用 DSH 原生的 `dsh-tool-subagent`
+的 `persona` / `toolFilter` 定制子 agent，前缀本来就最先分叉。
 完整账目见 [docs/prompt-design.zh-CN.md](docs/prompt-design.zh-CN.md) §3.4。
 
 ### 通用
@@ -228,7 +244,8 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
 
 - **读侧**：读侧总开关、L1 自动召回（含**单轮召回条数上限**）、System prompt 注入，以及注入下的 4 个段
 - **写侧**：对话回流（独立于读侧）
-- **子 agent**：子会话是否继承读侧、是否回流（默认都关）
+- **子 agent**：子会话是否**全量继承**读侧（身份 + 记忆 + 云端 skill 目录）、是否回流（默认都关；
+  知识库与 10 个只读工具在子会话里本就可用）
 - **身份与地址**：MemoryCore 地址、实例 ID、Team / Agent / User / Task ID、User Key、
   知识服务地址改写
 
@@ -245,9 +262,10 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
 
 写侧总开关 captureEnabled —— 独立，既不受 enabled 也不受 injectionEnabled 约束
 
-子 agent 会话（按会话判定，不受上面开关影响）
-  subagentInjectionEnabled —— 子会话是否继承读侧   默认关
-  subagentCaptureEnabled   —— 子会话是否回流       默认关
+子 agent 会话（按会话判定，不受上面开关影响；能力面见 lib/subagent.mjs）
+  subagentInjectionEnabled —— 子会话是否全量继承读侧（身份 + 记忆）  默认关
+                              （知识库与工具在子会话里始终可用）
+  subagentCaptureEnabled   —— 子会话是否回流                        默认关
 ```
 
 三个容易踩的点：
@@ -284,7 +302,7 @@ export TDAI_MEMORY_SKILLS_ENABLED=true
 export TDAI_MEMORY_KNOWLEDGE_ENABLED=false  # 团队知识资源注入，默认关
 
 # ── 子 agent（子会话）──
-export TDAI_MEMORY_SUBAGENT_INJECTION_ENABLED=false  # 子会话是否继承读侧（默认关）
+export TDAI_MEMORY_SUBAGENT_INJECTION_ENABLED=false  # 子会话是否全量继承读侧（默认关；知识库与工具本就可用）
 export TDAI_MEMORY_SUBAGENT_CAPTURE_ENABLED=false    # 子会话是否回流（默认关）
 
 # ── 调参 ──

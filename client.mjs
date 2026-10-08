@@ -27,6 +27,21 @@ function stripUndefined(body) {
   return Object.fromEntries(Object.entries(body).filter(([, v]) => v !== undefined))
 }
 
+/**
+ * 错误摘要：fetch 的网络级失败会把真实原因藏在 `error.cause` 里
+ * （`ECONNREFUSED` / `ENOTFOUND` / `UND_ERR_CONNECT_TIMEOUT` …），只打
+ * `error.message`（就是一句 "fetch failed"）等于没打 —— 排查时定位不到连接层。
+ * 这一层约定：日志里 cause 的 code 优先，没有 code 才退 message。
+ */
+function describeError(error) {
+  const cause = error?.cause
+  const causeText = typeof cause?.code === 'string' && cause.code
+    ? cause.code
+    : (typeof cause?.message === 'string' ? cause.message : '')
+  const message = String(error?.message ?? error)
+  return causeText ? `${message}（cause: ${causeText}）` : message
+}
+
 function toCtxIds(ctx) {
   return { team_id: ctx.teamId, user_id: ctx.userId, agent_id: ctx.agentId }
 }
@@ -89,7 +104,7 @@ export class GatewayClient {
     try {
       return await this.post(path, body, opts)
     } catch (error) {
-      this.log(`${path} failed: ${error.message}`)
+      this.log(`${path} failed: ${describeError(error)}`)
       return fallback
     }
   }
@@ -260,30 +275,69 @@ export class GatewayClient {
   //   POST {service_url}/tools/call  body { knowledge_id, tool_name, params }
   // 两者都要求 `x-tdai-service-id`（租户标识），无需密钥。
 
-  /** 对任意 base 发一次 POST，错误语义与主客户端一致（fail-open → fallback）。 */
+  /**
+   * 对任意 base 发一次 POST（**带 1 次重试**），错误语义与主客户端一致
+   * （fail-open → fallback，绝不外抛）。
+   *
+   * ── 为什么重试 ──────────────────────────────────────────────────────────────
+   * 知识这条链路实测出现过"同一 host:port，直连 curl 每次成功、插件进程偶发失败"
+   * 的形态（2026-10-05 排查，根因未坐实）。原先是单次尝试 + 立刻 fail-open，模型
+   * 拿到的只有一句"知识服务不可达"就放弃整条取证链路。只读查询重试一次的成本极低，
+   * 能吸收掉偶发的连接层抖动。
+   *
+   * ── 重试判据（别把确定性失败也重试一遍）─────────────────────────────────────
+   *   - 网络错误 / 超时：重试（`error.retryable` 缺省为真）；
+   *   - HTTP 5xx / 429：重试；
+   *   - HTTP 4xx 与信封里的 `code != 0`：**不重试** —— 请求本身有问题，
+   *     再要一遍只会得到同样的答案，白等一个 timeout。
+   *
+   * 日志把每次尝试分开打，并带上失败原因（含 cause 的 code）与耗时：
+   * 重试成功留痕（"第 2 次尝试成功"），最终失败写明是第几次、是否重试过。
+   */
   async #postTo(baseUrl, path, body, fallback = null) {
     const base = String(baseUrl || '').replace(/\/$/, '')
     if (!base) return fallback
-    try {
-      const resp = await fetch(`${base}${path}`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-tdai-service-id': this.serviceId || 'default',
-        },
-        body: JSON.stringify(stripUndefined(body ?? {})),
-        signal: AbortSignal.timeout(this.timeoutMs),
-      })
-      const payload = await resp.json().catch(() => ({}))
-      if (!resp.ok) throw new Error(`${TAG} ${base}${path} HTTP ${resp.status}`)
-      if (typeof payload?.code === 'number' && payload.code !== 0) {
-        throw new Error(`${TAG} ${base}${path} code=${payload.code} ${payload.message ?? ''}`.trim())
+    const maxAttempts = 2
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const startedAt = Date.now()
+      try {
+        const resp = await fetch(`${base}${path}`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-tdai-service-id': this.serviceId || 'default',
+          },
+          body: JSON.stringify(stripUndefined(body ?? {})),
+          signal: AbortSignal.timeout(this.timeoutMs),
+        })
+        const payload = await resp.json().catch(() => ({}))
+        if (!resp.ok) {
+          const error = new Error(`${TAG} ${base}${path} HTTP ${resp.status}`)
+          error.retryable = resp.status >= 500 || resp.status === 429
+          throw error
+        }
+        if (typeof payload?.code === 'number' && payload.code !== 0) {
+          const error = new Error(`${TAG} ${base}${path} code=${payload.code} ${payload.message ?? ''}`.trim())
+          error.retryable = false // 业务拒绝：重试无意义
+          throw error
+        }
+        if (attempt > 1) {
+          this.log(`knowledge ${path} 第 ${attempt} 次尝试成功（${Date.now() - startedAt}ms）`)
+        }
+        return payload?.data ?? {}
+      } catch (error) {
+        const detail = describeError(error)
+        const elapsed = Date.now() - startedAt
+        if (error?.retryable !== false && attempt < maxAttempts) {
+          this.log(`knowledge ${path} 第 ${attempt}/${maxAttempts} 次尝试失败（${elapsed}ms）：${detail} —— 重试一次`)
+          continue
+        }
+        const why = error?.retryable === false ? '确定性失败，不重试' : `重试后仍失败（共 ${attempt} 次）`
+        this.log(`knowledge ${path} ${why}（${elapsed}ms）：${detail}`)
+        return fallback
       }
-      return payload?.data ?? {}
-    } catch (error) {
-      this.log(`knowledge ${path} failed: ${error.message}`)
-      return fallback
     }
+    return fallback
   }
 
   /**

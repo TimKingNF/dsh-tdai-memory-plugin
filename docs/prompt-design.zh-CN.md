@@ -5,8 +5,9 @@
 > 本文件讲**思路、权衡与风险**。施工细节（每一处改动的依据、引用到的 DSH / 插件 / proxy
 > 源码行号、分期计划）见 [prompt-injection-redesign.md](prompt-injection-redesign.md)。
 >
-> 下面所有数字都是在 **DSH `0.1.2-rc.1` + TencentDB-Agent-Memory `v2.0.1`** 上实测的；
-> 换版本后请以 `node test/prompt-budget.test.mjs` 的输出为准。
+> 下面所有数字都是在 **DSH `0.1.2-rc.1` + TencentDB-Agent-Memory `v2.0.1`** 上实测的，
+> 属于**当时的基线**（插件现已在 `0.1.7-rc.1` 上运行，但这些字节/token 数字没有在
+> `0.1.7-rc.1` 上复测）；换版本后请以 `node test/prompt-budget.test.mjs` 的输出为准。
 
 ---
 
@@ -60,11 +61,11 @@ DSH 的 `systemPrompt.section({ name, order, text })` 注册"段"，每一步请
 | 通道 | 产出 | 更新语义 | 适合放什么 |
 | --- | --- | --- | --- |
 | `systemPrompt.section()` | system 字符串里的一段 | 每步重新组装（可被 `system-prompt/assemble` 覆盖） | 会话内**字节不变**的内容 |
-| `systemPrompt.context()` | 一条 **plugin 所有（`source.kind='plugin'`）的 user 角色消息** | 内容变了才更新，且是**整体替换**上一条，不是追加 | 状态快照（身份、开关、装载情况） |
+| `systemPrompt.context()` | 一条 **宿主/插件产出的 user 角色消息**（宿主 runtime context 的 `source.kind='runtime-context'`；本插件自己的召回消息是 `plugin:dsh-tdai-memory-plugin`，见 §2.8） | 内容变了才更新，且是**整体替换**上一条，不是追加 | 状态快照（身份、开关、装载情况） |
 | `agent/pre-step` 里往 `decision.messages` 插消息 | 消息列表里的普通消息 | 每步都重新落定 | 每轮都可能变的检索结果（L1 召回） |
 
 > 注意：以上三条通道都是**按会话**生效的，而 section 的注册在插件（全局）层。
-> 所以 DSH 派出的子 agent 会话会**整套继承** —— 这是 §3.4 的主题。
+> 所以不设策略时，DSH 派出的子 agent 会话会**整套继承** —— 这是 §3.4 的主题。
 
 `agent/pre-step` 之后，宿主会把 `decision.messages` **原样持久化**
 （`session.append("user/message", message, { surfaceOp: "append" })`），这一点决定了
@@ -159,7 +160,7 @@ skill 目录只发**补集**（云端 skill），不再复述 DSH 原生的"怎�
 ### 2.5 能写进工具描述的，不写进 prompt
 
 **规则**：`<memory-tools-guide>` 从 40 余行瘦到 3 行（342 B）；
-"哪种问题该调哪个工具""什么时候不必查"逐条搬进 10 个工具的 `description`。
+"哪种问题该调哪个工具""什么时候不必查"逐条搬进 8 个记忆 / Skill 工具的 `description`。
 
 **为什么**：工具 schema 本来就要随请求发给模型，所以把规则从 system 搬进 `description`，
 **不会新增"发规则"这件事本身的开销**（省下的是 system 里那一份），也避免了同一件事两边写、
@@ -194,7 +195,8 @@ skill 目录只发**补集**（云端 skill），不再复述 DSH 原生的"怎�
 
 ### 2.8 注入要"可识别"，回写才敢用结构判据
 
-**规则**：插件注入的独立消息一律带 `source: { kind: 'plugin', plugin, form }`；
+**规则**：插件注入的独立消息一律带 `source: { kind: 'plugin:dsh-tdai-memory-plugin', form, summary }`
+（生产者自己的 kind；v4 对笼统的 `'plugin'` 是**硬拒绝**，见 §1.2）；
 写侧回流的**主判据是 `source.kind`**（结构），文本哨兵只作**兜底**。
 
 **为什么**：召回块曾经以 prepend 语义插进真人消息里，于是那段内容**永久留在用户发言中**：
@@ -257,11 +259,28 @@ DSH 的 system prompt 是所有插件注册的段拼起来的，工具列表也�
 **反过来说**：只要"同一会话内"不抖动，跨会话的差异是可以接受的——
 前缀缓存本来就是按会话/请求序列复用的。
 
-### 3.4 子 agent 会话：实测的缓存代价，与默认降级
+### 3.4 子 agent 会话：能力面拆分，与实测的缓存代价
 
 DSH 派子 agent 时，子会话是**独立的 session**，但本插件的 section 注册在全局层、
-监听是进程级的 —— 所以子会话默认会把父 agent 的记忆整套继承一遍。这正是本文 §3.1 里
+监听是进程级的 —— 不设策略时子会话会把父 agent 的记忆整套继承一遍。这正是本文 §3.1 里
 "别人改了提示词"的**镜像问题**：这次是我们自己改的。
+
+> **2026-10-05 修正（能力面拆分）**：初版是"子会话读侧**一刀切**降级"，落地后撞了真实事故 ——
+> 一个四人调查团队的所有 `tdai_knowledge_call` 都被策略闸门拒绝，谁都读不到 wiki，
+> 只能由父会话逐页投喂原文（§3.4 下面那组实测数字就是"连知识侧一起关"的状态）。
+> 根因是把「身份与记忆」和「知识库与工具」混在同一个闸门里。现在读侧按四个能力面独立判定
+> （`lib/subagent.mjs` 的 `subagentReadPolicy()`）：
+>
+> | 能力面 | 子会话默认 | 管什么 |
+> | --- | --- | --- |
+> | `identity` | 关 | `tdai:session-context` |
+> | `memory` | 关 | `tdai:profile-memory`（L3/L2）、L1 召回、`tdai:state` 快照 |
+> | `skills` | 关 | `tdai:available-skills`（云端 skill 目录，由记忆服务派生） |
+> | `knowledge` | **开** | 知识资产、`tdai:knowledge-tools` 路由、`tdai-team-knowledge` skill、知识工具 |
+>
+> 资产加载也随面收窄（`SessionAssets.ensure(sessionId, policy)`）：子会话只拉知识资源，
+> 不再为 meta 详情、借入 agent、L3/L2、skill listing 各打一轮 HTTP。`subagentInjectionEnabled`
+> 仍是"全量继承"逃生门。
 
 **实测（DSH `0.1.2-rc.1`，父会话与它派出的一个 23 步调查子 agent）**：
 
@@ -276,14 +295,17 @@ DSH 派子 agent 时，子会话是**独立的 session**，但本插件的 secti
 
 **缓存账（实测；并修正了本节初版的估算）**：
 
-改前 / 改后各一个真实子会话（同机同模型）**第一步请求**的 usage：
+改前 / 改后（初版的"读侧全关"）各一个真实子会话（同机同模型）**第一步请求**的 usage：
 
-| | 改前（继承注入） | 改后（默认降级） |
+| | 改前（继承注入） | 改后（初版：读侧全关） |
 | --- | --- | --- |
 | 子会话 system prompt | 13020 B | **6925 B** |
 | 总 token | 13748 | **10594**（−3154，−23%） |
 | 其中缓存命中 `cacheRead` | 11264 | 9728 |
 | 其中**全价** `inputTokens` | 2214 | **797**（−1417） |
+
+> 现在的默认策略比上表右列多回一块知识路由（`<knowledge_tools>`，**307 B**，由
+> `test/prompt-budget.test.mjs` 量出；知识 skill 正文不常驻、按需加载），其余不变。
 
 结论：**关掉子会话注入并没有让它多付缓存差价**，反而每一步都更小、更便宜。原因是：
 
@@ -310,21 +332,25 @@ DSH 派子 agent 时，子会话是**独立的 session**，但本插件的 secti
 但它**故意放在 runtime context（消息）而不是 system section**，源码注释写着
 *"so the deployment's system prompt stays uniform across parents and children"* ——
 即 DSH 选择用消息承载子 agent 的差异、把 system 前缀留成统一的（为了缓存）。
-本插件的降级是反过来的选择：宁可付一次缓存代价，也要让子 agent 的任务更纯粹。
+本插件反过来在 system 层做差异，但**只差"身份与记忆"这一半**：那张能力面表里唯一被判定为
+"子任务必需"的 `knowledge` 面留在子会话里，噪音面才被摘掉 —— 这样"任务更纯粹"和"干活有工具"
+不必二选一（初版的一刀切就是在这里翻的车）。
 两者不冲突，因为我们的内容本来就**不是子 agent 完成任务所必需**的。
 
 **降级设计**（`lib/subagent.mjs`）：
 
 | 开关 | 默认 | 效果 |
 | --- | --- | --- |
-| `subagentInjectionEnabled` | 关 | 子会话不注入 4 个段、不召回、不注册知识 skill、**不预热资产**；只读工具仍在 |
+| `subagentInjectionEnabled` | 关 | 子会话不注入身份（session_context）与记忆（画像 / L1 召回 / 状态快照）、不预热这些面；**知识库、知识 skill 与 10 个只读工具照常可用** |
 | `subagentCaptureEnabled` | 关 | 子会话不回流（37 条那种噪音不再进 L0） |
 
 - 判定：`session.header.origin === 'subagent'`（`delegationDepth > 0` 兜底），spawn 与 fork 都覆盖；
   **缺 header 按父会话**（fail-open，老宿主与单测夹具不该被误伤）。
-- 实现：不注入 = **在 `system-prompt/assemble` 里不改写 section**。因为四个 section 的同步 text
-  本来就是空占位，DSH 的 `renderPrompt` 会把空段整个丢掉，子会话 prompt 里连标签都不会出现。
-- 附带收益：子会话不再预热资产 → 每个子会话省掉一整轮资产 HTTP（扇出 N 个就省 N 份）。
+- 实现：被关的面 = **在 `system-prompt/assemble` 里把对应 section 渲染成空**。因为四个 section
+  的同步 text 本来就是空占位，DSH 的 `renderPrompt` 会把空段整个丢掉，子会话 prompt 里连标签
+  都不会出现；一个面都不用时（子会话 + 知识总开关关）连 `assets.ensure()` 都跳过。
+- 附带收益：子会话不再预热 meta / 借入 / L3/L2 / skill listing → 每个子会话省掉那几轮 HTTP
+  （扇出 N 个就省 N 份）；知识资源仍按需拉取。
 - 仍然保留的：10 个只读工具（≈6446 B schema）在子会话里照旧注册。要连工具一起收紧，
   用 DSH 的 `dsh-tool-subagent.toolFilter`（部署级选择）。
 
@@ -381,7 +407,7 @@ DSH 派子 agent 时，子会话是**独立的 session**，但本插件的 secti
 
 ```bash
 npm run build:client   # 改过 client.card.tsx 才需要
-npm test               # 15 个测试文件 + 13 处 node --check
+npm test               # 14 处 node --check + 17 个测试文件 + 1 次密钥扫描（以 package.json 的 test 脚本为准）
 ```
 
 ---

@@ -161,7 +161,10 @@
 - 现有后果：监听永不触发 → 新会话首轮少一次预热。因为 `system-prompt/assemble` 里仍会
   `assets.ensure()`，表现为「每会话第一次稍慢」，不会丢功能。
 
-## 3. 契约漂移（现在能跑，但已违反新版明文约定）
+## 3. 契约漂移与硬失败（均已修复）
+
+> §3.1 / §3.2 是"漂移"（当时还能跑，但已违反新版明文约定），§3.3 是**硬失败**（整轮直接 error），
+> 三者都已按 §6 的清单修掉。
 
 ### 3.1 `agent/pre-step` 的 enter decision 需要 spread
 
@@ -249,8 +252,9 @@
 | `dsh` manifest | `dsh.bundle.patch` 与 `dsh.client.{ platform, inject?, immediately?, external? }` | `{ platform: 'web' }` 合法 |
 | patch 方言 | `insert` / `id` / `name` / `inject` / `config` / `!!js` 均支持 | 一致 |
 
-自测状态：`npm test` 26 项全绿，但宿主全是**自己写的 mock**（连 `settings.register` 的假实现
-也是 mock 的），因此**不能作为 0.1.7-rc.1 兼容证据**。
+自测状态：`npm test` 全绿，但宿主全是**自己写的 mock**（连 `settings.register` 的假实现
+也是 mock 的），因此**不能作为 0.1.7-rc.1 兼容证据**。（脚本数量随版本变化，
+以 `package.json` 的 `test` 脚本为准。）
 
 ## 5. 审计时的程序集状态：插件根本没被加载
 
@@ -277,7 +281,7 @@
 | 密钥字段 | `z.string().role('secret')` 保留；明文跨 wire 就被 redact 删掉，卡片改为"留空 = 不改动"，并从 `describe().secrets` 侧信道显示「已设置」 | `lib/settings.mjs`、`client.card.tsx` |
 | 预热事件 | `agent/session-start` → `agent/created`（`payload.agent.session`） | `index.mjs` |
 | pre-step | 注入召回块改为 `{ ...decision, messages }` | `lib/recall.mjs` |
-| 召回消息来源 | 保留 `form: 'notice'` + `summary` 与 `kind: 'plugin'`（运行时可持久化），把新版 kind 语义写进注释 | `lib/recall.mjs` |
+| 召回消息来源 | `kind` 用生产者自己的 `SOURCE_KIND = 'plugin:dsh-tdai-memory-plugin'`（v4 对笼统的 `'plugin'` 是硬拒绝），保留 `form: 'notice'` + `summary`，且不再带 v3 的 `plugin` 字段 | `lib/recall.mjs` |
 | order 表 | 同步 `SECTION_ORDERS` + `CONTEXT_ORDERS` 到 0.1.7-rc.1，并断言 520–523 / 560 未被占用 | `test/section-registry.test.mjs` |
 | 兼容性声明 | README 双语「测试范围」表改钉 `0.1.7-rc.1`，并记录 0.4.0 在 0.1.7-rc.1 上的失效现象 | `README.md`、`README_CN.md`、`CHANGELOG.md` |
 | 新增护栏 | ① patch 透传的 env 值必须能通过 `Config` 校验；② pre-step 必须保留 decision 的额外字段；③ 客户端产物不得再含 `settingsScope` / `settings.plugin.item`，必须含 `configForms` / `settings.section`，且不得再出现 `settings.plugins.tab`；④ 命名空间缺失时必须渲染可见的自解释说明；⑤ 不再监听 `agent/session-start`；⑥ **`Config` 的 volatile 投影必须非空、且覆盖面板上的每个字段**（复刻 `volatileForm` 语义），volatile 字段校验后必须是 `{ get() }` 访问器 | `test/load.test.mjs`、`test/recall.test.mjs`、`test/settings-card.test.mjs`、`test/settings-card-render.test.mjs`、`test/subagent.test.mjs`、`test/smoke.test.mjs` |
@@ -295,7 +299,7 @@
 | 工具端到端 | 直接调用 `tdai_scenario_ls`：经 live tool pipeline 派发到本插件的 `execute(args, exec)`，按预期返回「TDAI memory 未启用（总开关关闭或身份未配置）」——证明注册→schema→dispatch→`exec.agent.session` 解析整条链在 0.1.7-rc.1 上可用 |
 | 客户端产物 | 页面 `__DSH_BOOT__` 含 `{"id":"dsh-tdai-memory-plugin","url":"plugins/??dsh-tdai-memory-plugin/client.js&rev=…"}`，并被 application 批次脚本实际下发 |
 | 客户端产物内容 | 直接从运行中的 server 取该 URL（`HTTP 200`，13231 bytes）：**含 `configForms`，`settingsScope` 出现 0 次** —— 浏览器拿到的是迁移后的产物，不是旧卡片 |
-| 自测 | `npm test` 全绿（16 个测试脚本，含新增护栏） |
+| 自测 | `npm test` 全绿（含新增护栏；脚本数量以 `package.json` 的 `test` 脚本为准） |
 
 **未覆盖 / 限制**：浏览器侧 inspect（`platform: "client"`）**会对页面发起一次需要页面应答的查询**，
 应答不了就一直挂着，把页面和当轮一起堵住 —— 本次踩过两次，后续一律不再用它做常规诊断，改用

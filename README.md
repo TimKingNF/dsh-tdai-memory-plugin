@@ -25,9 +25,9 @@ involved and credentials never leave the process.
 | DeepSeek Harness (DSH) | **`0.1.7-rc.1`** | the version installed at release time |
 | [TencentDB-Agent-Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory) | **`v2.0.1`** | MemoryCore / MemoryKnowledge HTTP API |
 
-0.5.0 migrated the plugin from the DSH `0.1.2-rc.1` API to `0.1.7-rc.1`. That upgrade **removed two
-APIs this plugin used** (`settings.register()` on the host, the `settingsScope` client service and the
-`settings.plugin.item` slot), so 0.4.0 mounts on 0.1.7-rc.1 but loses its settings page and logs
+0.5.0 migrated the plugin from the DSH `0.1.2-rc.1` API to `0.1.7-rc.1`. That upgrade **removed three
+APIs this plugin used** (`settings.register()` on the host, plus the `settingsScope` client service and
+the `settings.plugin.item` slot), so 0.4.0 mounts on 0.1.7-rc.1 but loses its settings page and logs
 `settings unavailable: settingsCtx.settings.register is not a function`. The full audit — every
 contract checked, with live evidence — is in
 [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md).
@@ -74,16 +74,18 @@ Everything is injected through **native DSH interfaces**; the request body is ne
 Data sources: `/v3/core/read` (L3), `/v3/scenario/ls` (L2), `/v3/skill/listing` (skills),
 `/v3/knowledge/list` (knowledge), `/v3/atomic/search` (L1 recall), `/v3/meta/*` (agent/task detail).
 
-Delegated **child** sessions skip all of this by default — see
-[Subagent sessions](#subagent-sessions-default-read-side-off-write-side-off).
+Delegated **child** sessions keep only the knowledge-bearing parts of this by default (the
+`tdai:knowledge-tools` route, the `tdai-team-knowledge` skill and the tools); identity and memory
+sections are skipped — see
+[Subagent sessions](#subagent-sessions-default-knowledge-and-tools-stay-identity-and-memory-do-not).
 
 **Why L1 recall is not written into the user message.** The host persists `decision.messages`
 verbatim after `agent/pre-step` (`session.append("user/message", …)` in `dsh-agent-loop`). Prepending
 the recall block would leave that text permanently inside the *user's* message: the UI would echo it
 as user input, write-back would have to trim it by text sentinels, and any `source.kind === 'user'`
 check would misclassify it. A separate message fixes all three at once — clean body,
-`source.kind === 'plugin'` makes write-back drop it wholesale, and it renders as a collapsible
-"context injection" row instead of a user bubble.
+`source.kind === 'plugin:dsh-tdai-memory-plugin'` makes write-back drop it wholesale, and it renders
+as a collapsible "context injection" row instead of a user bubble.
 
 **Why the section orders are consecutive.** DSH sorts by `order` first and only compares `name` on
 ties. Consecutive numbers (520–523) mean other plugins can only insert *before or after* the whole
@@ -156,7 +158,7 @@ an id, the tool refuses it instead of sending it to the server.
 | Endpoint | roles | how tools are represented |
 | --- | --- | --- |
 | `/v3/skill/conversation/add` | user / assistant / `tool_call` / `tool_result` / system | separate messages + `tool_call_id` pairing anchor |
-| `/v3/conversation/add` (L0) | user / assistant only | folded into `[tool_call] name(args)` / `[tool_result:name] …` |
+| `/v3/conversation/add` (L0) | user / assistant / system | folded into `[tool_call] name(args)` / `[tool_result:name] …` |
 
 - **Internal reasoning and images are always dropped**, matching
   `MemoryProxy/src/skill/normalize-conversation.ts`. In DSH, reasoning and visible reply live in the
@@ -168,11 +170,10 @@ an id, the tool refuses it instead of sending it to the server.
   catches those on `agent/error` and `turn/end`: log + drop the buffer, **without writing memory** —
   half a turn would be consumed by extraction as if it were complete.
 
-### Subagent sessions (default: read side off, write side off)
+### Subagent sessions (default: knowledge and tools stay, identity and memory do not)
 
 DSH's delegated child sessions (the `subagent` and `subagent_fork` tools) inherit the plugin's
-globally registered sections and are seen by the same process-level listeners. On the default setup
-that meant, measured:
+globally registered sections and are seen by the same process-level listeners. Unguarded, measured:
 
 - a child's system prompt was **byte-identical to its parent's** (13020 bytes — our four blocks are
   6093 of them, 47%), and it received its own L1 recall block (2 messages, ≈4.4 KB);
@@ -180,26 +181,43 @@ that meant, measured:
   (task prompt, a full diff, raw test output, every tool call) — background extraction would treat
   that tool noise as memory about the user.
 
-The plugin now steps back for child sessions by default:
+The read side is therefore split into four facets (`lib/subagent.mjs`). A child session gets
+**knowledge and tools** by default; **identity and memory** are withheld:
+
+| Facet | Child default | What it covers |
+| --- | --- | --- |
+| `identity` | off | `tdai:session-context` (agent / task identity) |
+| `memory` | off | `tdai:profile-memory` (L3 profile + L2 index), L1 recall, `tdai:state` snapshot |
+| `skills` | off | `tdai:available-skills` (cloud skill catalogue, derived from the memory service) |
+| `knowledge` | **on** | knowledge assets, the `tdai:knowledge-tools` route, the `tdai-team-knowledge` skill and the knowledge tools |
+
+The all-or-nothing first cut broke real work: in one four-member research team every
+`tdai_knowledge_call` was refused by the policy gate, so no child could read the team wiki at all —
+the parent had to paste pages in by hand. Knowledge is exactly what a scoped child task needs, so it
+stays on; the 10 read-only tools were never taken away.
 
 | Switch | Default | Effect inside a child session |
 | --- | --- | --- |
-| `subagentInjectionEnabled` | **off** | no system injection, no L1 recall, no knowledge skill, no asset prewarm; the 10 read-only tools stay registered |
+| `subagentInjectionEnabled` | **off** | withhold identity + memory + the cloud skill catalogue, and skip prewarming those; **knowledge assets, the knowledge skill and all 10 read-only tools stay available** |
 | `subagentCaptureEnabled` | **off** | the child's conversation is not written back to MemoryCore |
+
+Setting `subagentInjectionEnabled` restores full inheritance (identity and memory included).
 
 Detection uses DSH's durable `session.header.origin === 'subagent'` (`delegationDepth > 0` as a
 fallback), so both spawn and fork children are covered; a session without a header is treated as a
-top-level session (fail-open to the previous behaviour). `/tdai-status` reports both switches and
-whether the current session is a child session.
+top-level session (fail-open to the previous behaviour). `/tdai-status` reports both switches, the
+per-session facet matrix, and whether the current session is a child session.
 
-**Cache note (measured, not estimated)**: comparing one real child session before and after this
-change — system prompt 13020 → **6925 bytes**, total tokens per first request 13748 → **10594**
-(-23%), of which **full-price tokens 2214 → 797**; cache hits 11264 → 9728. So turning injection off
-for children does **not** make them pay a cache penalty: the big cache hit comes from the tools array
-at the front of the request (38 schemas, unchanged position), and the 6093 bytes we removed are not
-charged at all. Only DSH's own tail section loses its parent-cache hit (≈500–800 tokens, because it
-shifts position). If you customise child agents with DSH's native `dsh-tool-subagent` `persona` or
-`toolFilter`, the prefix diverges at the very front anyway.
+**Cache note (measured, not estimated)**: the figures below come from the all-off first cut —
+system prompt 13020 → **6925 bytes**, total tokens per first request 13748 → **10594** (-23%), of
+which **full-price tokens 2214 → 797**; cache hits 11264 → 9728. The current default only adds the
+knowledge route block back (307 bytes, measured by `test/prompt-budget.test.mjs`); the knowledge
+skill body is not resident, it loads on demand. So withholding identity and memory does **not** make
+children pay a cache penalty: the big cache hit comes from the tools array at the front of the
+request (38 schemas, unchanged position), and the bytes we drop are not charged at all. Only DSH's
+own tail section loses its parent-cache hit (≈500–800 tokens, because it shifts position). If you
+customise child agents with DSH's native `dsh-tool-subagent` `persona` or `toolFilter`, the prefix
+diverges at the very front anyway.
 Full accounting: [docs/prompt-design.zh-CN.md](docs/prompt-design.zh-CN.md) §3.4.
 
 ### Common
@@ -241,8 +259,9 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
 - **Read side**: read master switch, L1 auto recall (with a **per-turn recall cap**), system prompt
   injection, and the 4 sections under it
 - **Write side**: conversation write-back (independent of the read side)
-- **Subagents**: whether child sessions inherit the read side, and whether their conversations are
-  written back (both off by default)
+- **Subagents**: whether child sessions fully inherit the read side (identity + memory) and whether
+  their conversations are written back (both off by default — knowledge and the 10 read-only tools
+  are available in child sessions regardless)
 - **Identity & addresses**: MemoryCore endpoint, instance id, Team / Agent / User / Task id,
   User Key, knowledge-service origin override
 
@@ -260,8 +279,9 @@ read master enabled ──┬─ L1 auto recall recallEnabled (cap recallLimit, 
 write master captureEnabled —— independent of both enabled and injectionEnabled
 
 subagents (keyed on the child session, not on the switches above)
-  subagentInjectionEnabled —— read side inherited by child sessions?   (default: no)
-  subagentCaptureEnabled   —— child conversations written back?        (default: no)
+  subagentInjectionEnabled —— child sessions fully inherit the read side (identity + memory)?  (default: no)
+                              knowledge + tools are available in child sessions either way
+  subagentCaptureEnabled   —— child conversations written back?                                (default: no)
 ```
 
 Three easy traps:
@@ -302,7 +322,7 @@ export TDAI_MEMORY_SKILLS_ENABLED=true
 export TDAI_MEMORY_KNOWLEDGE_ENABLED=false  # team knowledge injection, off by default
 
 # ── subagent (child) sessions ──
-export TDAI_MEMORY_SUBAGENT_INJECTION_ENABLED=false  # let child sessions inherit the read side (default: no)
+export TDAI_MEMORY_SUBAGENT_INJECTION_ENABLED=false  # full read-side inheritance for child sessions (default: no; knowledge + tools are on regardless)
 export TDAI_MEMORY_SUBAGENT_CAPTURE_ENABLED=false    # write child conversations back (default: no)
 
 # ── tuning ──

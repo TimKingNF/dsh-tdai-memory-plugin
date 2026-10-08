@@ -38,10 +38,12 @@
  *   写侧总开关 captureEnabled —— **完全独立**，既不受 enabled 约束，
  *   也不受 injectionEnabled 约束（lib/capture.mjs 只判它自己）。
  *
- *   子 agent 会话（DSH 派出去的子会话）：
- *     subagentInjectionEnabled  默认**关**：子会话不注入 4 个段、不召回、不注册知识 skill
+ *   子 agent 会话（DSH 派出去的子会话）——能力面拆分，见 lib/subagent.mjs：
+ *     subagentInjectionEnabled  默认**关**：子会话不注入身份（session_context）与记忆
+ *                               （画像 / L1 召回 / 状态快照）、不为这些面预热资产；
+ *                               但**团队知识库、知识 skill 与 10 个只读工具照常可用**
  *     subagentCaptureEnabled    默认**关**：子 agent 的执行过程不回流 L0
- *   两者都按 session.header.origin === 'subagent' 判定，见 lib/subagent.mjs。
+ *   两者都按 session.header.origin === 'subagent' 判定。
 
  * 三个容易搞错的点：
  *   1. L1 召回**不**依赖 injectionEnabled（recall.mjs 只判 readEnabled + recallEnabled）；
@@ -94,16 +96,17 @@ const INJECT_TOGGLES = [
 ]
 
 /**
- * 子 agent（DSH 派出去的子会话）的两个降级开关，**默认都关**。
+ * 子 agent（DSH 派出去的子会话）的两个开关，**默认都关**。
  *
  * 默认关的理由：子 agent 的任务通常由父 agent 明确指定（"分析这段 diff"），
- * 父 agent 的画像 / 召回是干扰；它的整段执行过程属于工作噪音，不该进长期记忆。
- * 判定与语义见 lib/subagent.mjs（按 session.header.origin === 'subagent'）。
+ * 父 agent 的身份与画像 / 召回是干扰；它的整段执行过程属于工作噪音，不该进长期记忆。
+ * 但**知识库与工具是子 agent 干活要用的能力**，不随这两个开关关闭（见 lib/subagent.mjs
+ * 的能力面表）—— 打开第一个开关只是把身份 / 记忆 / 云端 skill 目录也一并给子会话。
  */
 const SUBAGENT_INJECT_TOGGLE = {
   key: 'subagentInjectionEnabled',
-  label: '子 agent 继承注入与召回',
-  hint: '默认关：子会话不注入记忆段、不做 L1 召回、不注册知识 skill（只读工具仍在）',
+  label: '子 agent 全量继承读侧',
+  hint: '默认关：子会话不注入身份与记忆、不做 L1 召回（团队知识库与 10 个只读工具本就可用）',
   defaultOff: true,
 }
 const SUBAGENT_CAPTURE_TOGGLE = {
@@ -126,9 +129,11 @@ const WRITE_TOGGLES = [
 /**
  * 数值字段：面板里以字符串草稿编辑，**保存时**转成 number 再落库。
  *
- * 必须转 number：宿主 schema 是 `z.natural()`（= number().step(1).min(0)，见 settings.mjs），
- * 校验是 `typeof data !== 'number'` 直接抛，字符串 "5" 会被拒；越界同样被拒，
- * 所以这里在保存前就收敛到 [min, max]，并把收敛结果回填草稿 + 提示用户。
+ * 为什么必须转 number：用户层（面板）要存**真数字**，区间约束（1–20）与"面板改过"的
+ * override 语义才干净。宿主 schema 另有 string 分支，但那是给组合层
+ * （`cordis.patch.yml` 的 env 只能是 `"5"` 这种字符串）用的，不能据此让用户层也存字符串
+ * —— 见 `lib/settings.mjs` 的 `numField` 与 `test/settings-card.test.mjs` 的两侧断言。
+ * 越界按 [min, max] 收敛，并把收敛结果回填草稿 + 提示用户。
  */
 const NUMERIC_FIELDS: Record<string, { min: number; max: number; label: string }> = {
   recallLimit: { min: 1, max: 20, label: '单轮召回条数上限' },
@@ -169,8 +174,9 @@ export function missingIdentity(value: Record<string, unknown> | undefined): str
  *
  * 两条规则：
  *   - 空字符串 = `unset`，即清掉用户层、回落到 env / schema 默认值（文本框与数字框一致）；
- *   - 数值字段必须转成 **number**（宿主 schema 是 z.natural()，字符串会被直接拒绝），
- *     越界按 [min, max] 收敛并把收敛结果回填草稿（patch）+ 记一句提示（adjusted）。
+ *   - 数值字段必须转成 **number**（schema 的 string 分支只服务组合层 env；用户层存数字，
+ *     区间约束与 override 语义才干净），越界按 [min, max] 收敛并把收敛结果回填草稿（patch）
+ *     + 记一句提示（adjusted）。
  *
  * @returns ops 提交给 scope.mutate；patch 回填草稿；adjusted 面向用户的收敛说明；
  *          error 非空时不提交、直接提示（例如数字框里填了非数字）。
@@ -464,7 +470,7 @@ function TdaiMemoryCard(props: { form: SettingsForm; describe?: SettingsDescribe
               {WRITE_TOGGLES.map((t) => toggleItem(t, false, ''))}
             </div>
 
-            {/* ── 子 agent：默认降级（读侧 + 写侧各一个开关，互相独立）────────── */}
+            {/* ── 子 agent：能力面拆分（读侧只关身份/记忆，写侧独立）───────────── */}
             {groupTitle('子 agent · 委派出去的子会话')}
             <div style={flowStyle}>
               {toggleItem(SUBAGENT_INJECT_TOGGLE, !readOn, READ_DIM_REASON)}

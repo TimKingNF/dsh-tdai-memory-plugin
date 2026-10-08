@@ -12,6 +12,46 @@
 
 ---
 
+## [Unreleased]
+
+**子 agent 策略从"读侧一刀切降级"改为"能力面拆分"；知识端点加 1 次重试。** 起因是一次真实事故：
+四人调查团队的子 agent 全部被策略闸门挡在知识库之外（`tdai_knowledge_call` 直接返回
+"本会话是子 agent 会话，读侧已按子 agent 策略降级"），wiki 原文只能由父会话逐页投喂。
+
+### 修复：子 agent 默认保留知识库与工具
+
+- `lib/subagent.mjs` 新增 `subagentReadPolicy(config, session)`，把读侧拆成四个能力面：
+  `identity`（`tdai:session-context`）、`memory`（画像 / L1 召回 / `tdai:state` 快照）、
+  `skills`（`tdai:available-skills` 云端目录）、`knowledge`（知识资产 / 知识路由 /
+  `tdai-team-knowledge` skill / 知识工具）。子会话默认 `knowledge=true`，其余三个 false；
+  `subagentInjectionEnabled=true` 仍是"全量继承"逃生门（`readSideAllowed()` 语义不变）。
+- 接线全部按面判定：`index.mjs`（`agent/created` 预热只预热用得着的面）、`lib/sections.mjs`
+  （section 渲染 + 知识 skill 注册）、`lib/recall.mjs`（L1 召回）、`lib/tools.mjs`
+  （删掉子会话拒绝分支，改为"知识面 + 缓存未就绪时按面补一次 `ensure`"）、`lib/commands.mjs`
+  （`/tdai-status` 现在打印本会话的能力面矩阵）。
+- `lib/assets.mjs`：`ensure/warm/refresh(sessionId, policy)` 按能力面加载 —— 子会话不再为 meta
+  详情、借入 agent、L3/L2、skill listing 各打一轮 HTTP；策略签名变化会让同会话旧缓存失效。
+
+### 修复：知识服务调用 1 次重试 + 日志
+
+- `client.mjs` 的 `#postTo` 从"单次尝试"改为"最多 2 次"：网络 / 超时 / HTTP 5xx / 429 重试；
+  HTTP 4xx 与业务 `code != 0` 直接返回（确定性失败不重试，只白等一个 timeout）。
+- 每次尝试分开打日志，带失败原因（含 `error.cause` 的 code）与耗时；重试成功也留痕，
+  否则看不见这条链路是抖的。主网关的 `safe()` 失败日志同样带上 cause。
+
+### 文档与注释更正
+
+- README / README_CN / `docs/prompt-design.zh-CN.md` §3.4 / 设置卡片文案与注释：按能力面重写
+  子 agent 一节，并标明那组缓存实测数字属于"连知识侧一起关"的初版配置（现默认多回一块
+  307 B 的知识路由）。
+- 修正 `source.kind === 'plugin'` 的写法：v4 硬拒绝笼统的 `plugin`；宿主 runtime context 是
+  `runtime-context`，本插件召回消息是 `plugin:dsh-tdai-memory-plugin`。
+- 新增 `test/knowledge-retry.test.mjs`（6 组真 HTTP 断言：连接层/5xx 重试、4xx 与业务码不重试、
+  cause 日志）；`test/subagent.test.mjs` 改为"知识面保留 + 身份与记忆不注入"的成对断言，
+  并锁住"子会话的资产加载只带知识面"。
+
+---
+
 ## [0.5.0] - 2026-09-25
 
 **DSH `0.1.2-rc.1` → `0.1.7-rc.1` 兼容性迁移。** 起因是一次真实升级后的兼容性审计：
@@ -37,8 +77,10 @@
   config 并投影表单，命名空间 key 就是 profile patch 的 entry id。
 - **修复**：`index.mjs` 导出 `export const Config = buildSettingsSchema()`；
   `lib/settings.mjs` 改为只做两件事——提供 schema、`settings.configure({ auto: false })`（本插件
-  自带设置页，别让宿主再生成一个）。插件不再自行 merge 配置：写入后 Loader 带着新 config
-  **重新 apply**（`applies: 'live'`），`client` / `assets` 随之整体重建，旧的 `rebuild()` 删除。
+  自带设置页，别让宿主再生成一个）。插件不再自行 merge 配置：**非 volatile** 字段写入后
+  Loader 带着新 config **重新 apply**（`applies: 'live'`），`client` / `assets` 随之整体重建，
+  旧的 `rebuild()` 删除；**volatile** 字段（面板字段）写入只原地更新访问器，走下面的
+  「连带改造」。
 - **踩坑记录（已用测试锁住）**：`cordis.patch.yml` 的 `!!js process.env.X ?? ''` 在 env 未设置时给
   **空字符串**，而裸 `z.boolean()` / `z.natural()` 遇到 `''` 会抛
   `expected boolean but got` → **整个 entry 加载失败**。所以布尔/数字字段用
@@ -99,7 +141,7 @@
 - **修复**：`volatile` = **"用户可在设置页编辑"**（0.1.7-rc.1 的约定，官方
   `dsh-client-ui-conversation` / `dsh-agent-default-model` 都只把用户可编辑字段标 volatile）：
   - 面板上的 19 个字段全部 `.volatile()`（新增导出 `VOLATILE_KEYS`）；
-  - 部署期字段（`apiKeyEnv` / `l2TimeoutMs` / 各类预算与冷却）保持**非 volatile**，
+  - 部署期字段（`apiKeyEnv` / `l2Limit` / 各类预算与冷却）保持**非 volatile**，
     既不出现在设置页，也不受面板写入影响；
   - **依赖升到 `@deepseek-ai/schemastery@^3.18.4`**：`.volatile()` 与"校验后生成
     `{ get() }` 访问器"都是 3.18.4 才有的；3.18.2 里只认 meta 标记、不会生成访问器，
@@ -527,8 +569,10 @@ system 段注入从 **9953 → 5768 字节（-42%）**，其中团队知识块�
 
 ### 未发布 / 已知限制
 
-- 设置面板里 `l2Limit` / `timeoutMs` / `recallTimeoutMs` / `assetLoadBudgetMs` /
-  `assetRetryCooldownMs` **刻意不上面板**（面板只放日常会调的项），只能用 env 配置。
+- 设置面板里 `apiKeyEnv` / `l2Limit` / `timeoutMs` / `recallTimeoutMs` / `assetLoadBudgetMs` /
+  `assetRetryCooldownMs` **刻意不上面板**（面板只放日常会调的项；`apiKeyEnv` 是"环境变量名"而不是
+  凭据本身，放进面板只会让人把密钥误填进一个期望变量名的格子），只能用 env 配置。
+  这六个键 = `lib/settings.mjs` 的 `PATCH_ONLY_KEYS`。
 - `lib/capture.mjs` 的 `INJECTED_MARKERS` 只用于文档化与测试断言（真正的剔除逻辑在
   `lib/text.mjs` 的 `stripInjectedBlocks`），运行时不读它；`capture-filter` 用例 6
   断言"清单里的每个标记都必须真能被剥掉"。

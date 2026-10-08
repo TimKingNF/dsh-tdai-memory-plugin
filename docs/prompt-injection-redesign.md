@@ -47,8 +47,9 @@ prepend 是把召回内容**插进"真人发的那条 user 消息"里**，而那
 **解法（现在只剩一条主判据，§11 之后）**：
 
 - **`source` 通道（唯一主判据）**：插件注入的独立消息一律带
-  `source: { kind: 'plugin', plugin: 'dsh-tdai-memory-plugin', ... }`，回写按
-  `source.kind/plugin` 过滤。L1 召回块现在也走这条通道，不再需要"靠文本猜"。
+  `source: { kind: 'plugin:dsh-tdai-memory-plugin', form, summary }`（生产者自己的 kind；
+  笼统的 `'plugin'` 是 v3 包装、v4 硬拒绝，见 §11.3），回写按 `source.kind` 过滤。
+  L1 召回块现在也走这条通道，不再需要"靠文本猜"。
 - **文本哨兵降级为兜底**：只为**存量**历史消息（prepend 时代写下的正文）和丢失
   `source` 的外部文本服务；`test/capture-filter.test.mjs` 用例 3/3b 继续锁住它。
 
@@ -852,14 +853,15 @@ skill 机制比方案里设想的更合适：
 
 ```js
 { id: <uuid>, role: 'user', content: [{ type: 'text', text: block }],
-  source: { kind: 'plugin', plugin: 'dsh-tdai-memory-plugin', form: 'notice', summary: 'TDAI L1 召回 4 条（最高分 0.683）' } }
+  source: { kind: 'plugin:dsh-tdai-memory-plugin', form: 'notice', summary: 'TDAI L1 召回 4 条（最高分 0.683）' } }
 ```
 
 插在本轮**真人消息之后**（与 `dsh-session-reference` 的 `additionalContext` 一致），
 不追加到末尾。三条收益，全部对应上面那张证据表：
 
 1. 真人消息**一个字节都不动** → 前端气泡干净（`unshift` 之前是把它写进用户发言）；
-2. `source.kind === 'plugin'` → `lib/capture.mjs` 按结构整条丢弃，L0 不再需要靠文本猜；
+2. `source.kind === 'plugin:dsh-tdai-memory-plugin'`（生产者自己的 kind；v4 硬拒绝笼统的
+   `'plugin'`，见 §2.8）→ `lib/capture.mjs` 按结构整条丢弃，L0 不再需要靠文本猜；
 3. 宿主所有"真人发言"判据（`turn-outline` 的 prompt、`titleInput`、
    `lastPromptAt`、客户端按 `rpcId` 清 pending echo）都只认 `source.kind === 'user'`，
    自动忽略这条消息 —— 我们不再污染它们。

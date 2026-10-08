@@ -1,11 +1,14 @@
 /**
- * 子 agent 会话降级测试（默认策略：**读侧不注入、写侧不回流**）。
+ * 子 agent 会话策略测试（默认：**能力面拆分 —— 保留知识库与工具，关闭身份与记忆**）。
  *
- * 为什么必须有这个测试：这是一条"沉默的默认行为"——子 agent 会话不再继承父 agent 的
- * 记忆注入与回流。它失效的方向有两种，都不会报错：
+ * 为什么必须有这个测试：这是一条"沉默的默认行为"——子 agent 会话拿不到父 agent 的
+ * 身份与记忆注入，但**知识库（wiki / code-graph）与 10 个只读工具照常可用**。它失效的
+ * 方向有三种，都不会报错：
  *   1. **降级没生效**：子会话又拿到父 agent 的画像 / 召回，任务被干扰，且整段执行过程
  *      作为 L0 语料回流（实测一个 23 步的调查子 agent 写入了 37 条）；
- *   2. **降级过度**：把**父会话**也一起降级了（判据写错、header 读不到就一律当子会话），
+ *   2. **降级过度**：把**知识面**也一起关掉了 —— 这是真实事故：一个四人调查团队的
+ *      `tdai_knowledge_call` 全部被策略拒绝，wiki 原文只能由父会话逐页投喂；
+ *   3. **降级越界**：把**父会话**也一起降级了（判据写错、header 读不到就一律当子会话），
  *      结果是正常会话突然没有记忆——这类事故用户只会觉得"插件坏了"。
  * 所以每个用例都**成对**断言：子会话降级 + 父会话照旧。
  *
@@ -16,7 +19,7 @@
  * 运行：node test/subagent.test.mjs
  */
 import assert from 'node:assert'
-import { isSubagentSession, readSideAllowed, captureAllowed } from '../lib/subagent.mjs'
+import { isSubagentSession, readSideAllowed, subagentReadPolicy, captureAllowed } from '../lib/subagent.mjs'
 import { registerSections } from '../lib/sections.mjs'
 import { wireRecall } from '../lib/recall.mjs'
 import { wireCapture } from '../lib/capture.mjs'
@@ -45,6 +48,8 @@ const BASE = {
   recallLimit: 5, recallTimeoutMs: 3000,
 }
 
+const FULL_FACETS = { identity: true, memory: true, skills: true, knowledge: true }
+
 // ── 1) 判定与策略（纯函数）──────────────────────────────────────────────────
 {
   assert.equal(isSubagentSession(CHILD), true, 'origin=subagent 应判为子会话')
@@ -54,24 +59,40 @@ const BASE = {
   assert.equal(isSubagentSession(NO_HEADER), false, '缺 header 一律按父会话（fail-open）')
   assert.equal(isSubagentSession(undefined), false, '空会话不崩')
 
-  // 默认配置（两个开关都关）：子会话降级、父会话照旧
-  assert.equal(readSideAllowed(BASE, CHILD), false, '默认：子会话读侧降级')
-  assert.equal(readSideAllowed(BASE, PARENT), true, '默认：父会话读侧照旧')
+  // 默认配置（两个开关都关）：
+  //   子会话 —— 身份 / 记忆 / 云端 skill 目录关闭，**知识面打开**；
+  //   父会话 —— 四个面全开，不受子 agent 开关影响。
+  assert.deepEqual(subagentReadPolicy(BASE, CHILD), {
+    subagent: true, inherit: false, identity: false, memory: false, skills: false, knowledge: true,
+  }, '默认：子会话只保留知识面')
+  assert.deepEqual(subagentReadPolicy(BASE, PARENT), {
+    subagent: false, inherit: true, ...FULL_FACETS,
+  }, '默认：父会话四个面全开')
+  assert.deepEqual(subagentReadPolicy(BASE, NO_HEADER), {
+    subagent: false, inherit: true, ...FULL_FACETS,
+  }, '默认：缺 header 按父会话')
+  // 旧口径（全量继承）在子会话上仍是 false —— 语义没被偷偷放宽
+  assert.equal(readSideAllowed(BASE, CHILD), false, '默认：子会话不继承身份与记忆')
+  assert.equal(readSideAllowed(BASE, PARENT), true, '默认：父会话照旧')
   assert.equal(readSideAllowed(BASE, NO_HEADER), true, '默认：缺 header 按父会话')
   assert.equal(captureAllowed(BASE, CHILD), false, '默认：子会话不回流')
   assert.equal(captureAllowed(BASE, PARENT), true, '默认：父会话照常回流')
 
-  // 开关打开：恢复继承现状
+  // 开关打开：子会话恢复"与父会话完全一致"
   const inheritAll = { ...BASE, subagentInjectionEnabled: true, subagentCaptureEnabled: true }
+  assert.deepEqual(subagentReadPolicy(inheritAll, CHILD), {
+    subagent: true, inherit: true, ...FULL_FACETS,
+  }, '开了开关子会话应全量继承（含身份与记忆）')
   assert.equal(readSideAllowed(inheritAll, CHILD), true, '开了开关子会话应继承读侧')
   assert.equal(captureAllowed(inheritAll, CHILD), true, '开了开关子会话应回流')
 }
 
-// ── 2) 读侧 · system 注入：子会话连标签都不出现 ──────────────────────────────
+// ── 2) 读侧 · system 注入：子会话只少身份 / 记忆 / 云端 skill 目录 ───────────
 {
   const cfg = { ...BASE, enabled: true }
   const listeners = {}
   const skills = []
+  const ensurePolicies = []
   let ensureCalls = 0
   const asset = {
     identity: {},
@@ -93,7 +114,10 @@ const BASE = {
   const runtime = {
     readEnabled: () => cfg.enabled,
     config: cfg,
-    assets: { ensure: async () => { ensureCalls += 1; return null }, peek: () => asset },
+    assets: {
+      ensure: async (_sessionId, policy) => { ensureCalls += 1; ensurePolicies.push(policy); return null },
+      peek: () => asset,
+    },
     log: () => {},
   }
   registerSections(ctx, runtime)
@@ -121,22 +145,29 @@ const BASE = {
   }
   assert.equal(skills.length, 1, '父会话应注册知识 skill')
   assert.ok(stateText(PARENT).includes('TDAI memory 状态'), '父会话应有状态快照')
-  // 唯一性：本用例先跑父会话，后面的子会话断言不能受它影响 ——
-  // 所以每跑一个会话都重置"资产加载次数"归零再测。
   const parentEnsure = ensureCalls
   assert.ok(parentEnsure > 0, '父会话 assemble 应触发资产加载')
+  assert.deepEqual(ensurePolicies.at(-1), { subagent: false, inherit: true, ...FULL_FACETS },
+    '父会话按全量面加载资产')
 
-  // (b) 子会话（默认）：4 段全空（DSH 的 renderPrompt 会把空段整个丢掉）、不注册 skill、
-  //     状态快照为空、**且没有为一份用不到的资产打网关**
+  // (b) 子会话（默认）：身份 / 记忆 / 云端 skill 目录三段为空（DSH 的 renderPrompt 会把
+  //     空段整个丢掉），状态快照为空；但**知识路由在、知识 skill 注册了、资产按知识面加载**
+  //     —— 子 agent 要能自己查 wiki / code-graph。
   ensureCalls = 0
+  ensurePolicies.length = 0
   const childResult = await assemble(CHILD)
-  for (const name of ['tdai:session-context', 'tdai:profile-memory', 'tdai:available-skills', 'tdai:knowledge-tools']) {
+  for (const name of ['tdai:session-context', 'tdai:profile-memory', 'tdai:available-skills']) {
     assert.equal(text(childResult, name), '', `子会话不应注入 ${name}`)
   }
+  assert.ok(text(childResult, 'tdai:knowledge-tools').includes('<knowledge_tools>'),
+    '子会话应注入知识路由（知识库与工具对子 agent 可用）')
   assert.equal(text(childResult, 'harness:identity'), 'You are an AI agent.', '别人的段不许动')
-  assert.equal(skills.length, 1, '子会话不应额外注册知识 skill')
+  assert.equal(skills.length, 2, '子会话应注册知识 skill')
   assert.equal(stateText(CHILD), '', '子会话不应有状态快照')
-  assert.equal(ensureCalls, 0, '子会话不该为用不到的资产打一轮网关（并发扇出时这是 N 份）')
+  assert.ok(ensureCalls > 0, '子会话应按知识面加载资产（知识库要能用）')
+  assert.deepEqual(ensurePolicies.at(-1), {
+    subagent: true, inherit: false, identity: false, memory: false, skills: false, knowledge: true,
+  }, '子会话的资产加载必须只带知识面（不为画像 / skill listing 打网关）')
 
   // (c) fork 子会话同样降级（它带着父会话的 seed 历史，更容易被误当父会话）
   assert.equal(stateText(FORK_CHILD), '', 'fork 子会话同样降级')
@@ -146,7 +177,7 @@ const BASE = {
   ensureCalls = 0
   const inherited = await assemble(CHILD)
   assert.ok(text(inherited, 'tdai:profile-memory').includes('<tdai_profile_memory>'), '开关打开后子会话应注入')
-  assert.equal(skills.length, 2, '开关打开后子会话应注册知识 skill（按 session 幂等）')
+  assert.equal(skills.length, 2, '知识 skill 按 session 幂等：这个子会话在 (b) 已注册过，不再重复')
   assert.ok(stateText(CHILD).includes('TDAI memory 状态'), '开关打开后子会话应有状态快照')
   assert.ok(ensureCalls > 0, '开关打开后子会话照常加载资产')
 
@@ -159,13 +190,13 @@ const BASE = {
 {
   const make = (cfgOverrides) => {
     const cfg = { ...BASE, ...cfgOverrides }
-    const calls = { search: 0, warm: 0 }
+    const calls = { search: 0, warm: 0, policy: null }
     const events = []
     const runtime = {
       readEnabled: () => cfg.enabled,
       config: cfg,
       assets: {
-        warm: () => { calls.warm += 1; return Promise.resolve(null) },
+        warm: (_sessionId, policy) => { calls.warm += 1; calls.policy = policy; return Promise.resolve(null) },
         peek: () => ({ ctxs: [] }),
       },
       client: { searchL1: async () => { calls.search += 1; return [{ id: '1', type: 'rule', content: 'remember X', score: 0.9 }] } },
@@ -187,16 +218,17 @@ const BASE = {
     const decision = await handler(payload, next)
     assert.equal(calls.search, 1, '父会话应做一次 L1 检索')
     assert.equal(calls.warm, 1, '父会话应预热资产')
+    assert.equal(calls.policy?.memory, true, '父会话预热应带记忆面')
     assert.ok(hasRecall(decision), '父会话应注入召回块')
   }
-  // (b) 子会话：一次都不检索、不预热、决策原样
+  // (b) 子会话：一次都不检索、不预热、决策原样（L1 召回属记忆面）
   {
     const { handler, calls } = make({})
     const { payload, next } = chain(CHILD)
     const expected = await next()
     const decision = await handler(payload, () => Promise.resolve(expected))
     assert.equal(calls.search, 0, '子会话不应做 L1 检索')
-    assert.equal(calls.warm, 0, '子会话不应预热资产')
+    assert.equal(calls.warm, 0, '子会话不应在召回路径上预热资产')
     assert.deepEqual(decision, expected, '子会话的 decision 应原样透传（不加消息）')
   }
   // (c) 开关打开：恢复继承
@@ -290,69 +322,132 @@ const BASE = {
   }
 }
 
-// ── 5) 知识工具：子会话给出可解释的拒绝，而不是"未绑定"的误导文案 ──────────
+// ── 5) 知识工具：子会话**照常可用**（这正是本次修正的动机）──────────────────
 {
-  const registered = []
-  const make = (cfgOverrides = {}) => {
+  const make = (cfgOverrides = {}, { asset, policy } = {}) => {
     const cfg = { ...BASE, knowledgeEnabled: true, ...cfgOverrides }
     const tools = []
-    const ctx = { tools: { register: (def) => { tools.push(def); registered.push(def) } } }
+    const calls = { ensure: 0, executed: 0 }
+    const ctx = { tools: { register: (def) => { tools.push(def) } } }
     const runtime = {
       readEnabled: () => true,
       config: cfg,
-      // 与 index.mjs 的接线一致
-      readSideAllowedFor: (session) => readSideAllowed(cfg, session),
-      assets: { peek: () => undefined },
-      client: { knowledgeToolsList: async () => [], knowledgeToolsCall: async () => ({ ok: true, text: 'x' }) },
+      // 与 index.mjs 的接线一致：能力面按会话算
+      readPolicyFor: (session) => policy ?? subagentReadPolicy(cfg, session),
+      assets: {
+        peek: () => asset,
+        ensure: async () => { calls.ensure += 1; return asset },
+      },
+      client: {
+        knowledgeToolsList: async () => [],
+        knowledgeToolsCall: async () => { calls.executed += 1; return { ok: true, text: '结果原文' } },
+      },
       log: () => {},
     }
     registerKnowledgeTools(ctx, runtime)
     const tool = tools.find((t) => t.name === 'tdai_knowledge_call')
-    return (session) => tool.execute({ knowledge_id: 'k1', tool_name: 'explore' }, { agent: { session } })
+    return { call: (session) => tool.execute({ knowledge_id: 'k1', tool_name: 'explore' }, { agent: { session } }), calls }
   }
-  const call = make()
-  const childMsg = await call(CHILD)
-  assert.ok(childMsg.includes('子 agent 会话'), `子会话应给出可解释的拒绝，实际：${childMsg}`)
-  assert.ok(!childMsg.includes('subagentInjectionEnabled'), '不该把内部配置名丢给模型看')
-  assert.ok(childMsg.includes('子 agent 继承注入'), '应指向面板/文档里的开关名，便于用户找到怎么改')
-  const parentMsg = await call(PARENT)
-  assert.ok(parentMsg.includes('没有绑定团队知识资源'), `父会话走原有路径，实际：${parentMsg}`)
-  const inheritMsg = await make({ subagentInjectionEnabled: true })(CHILD)
-  assert.ok(inheritMsg.includes('没有绑定团队知识资源'), '开关打开后子会话走原有路径')
+  const resource = { knowledge_id: 'k1', type: 'code-graph', name: 'repo', service_url: 'http://kb' }
+
+  // (a) 子会话 + 已装资产：**直接执行**，不再被策略拒绝
+  {
+    const h = make({}, { asset: { knowledge: [resource] } })
+    assert.equal(await h.call(CHILD), '结果原文', '子会话应能直接调用知识工具')
+    assert.equal(h.calls.executed, 1, '子会话的调用应真的打到知识服务')
+  }
+  // (b) 子会话 + 缓存未就绪：按知识面补一次 ensure，再执行
+  {
+    let resolved = null
+    const h = make({}, { asset: undefined })
+    // 用具名 ensure 覆盖默认值，模拟"assemble 还没跑"的冷启动
+    h.calls.ensure = 0
+    const tools = []
+    const ctx = { tools: { register: (def) => tools.push(def) } }
+    const cfg = { ...BASE, knowledgeEnabled: true }
+    const runtime = {
+      readEnabled: () => true,
+      config: cfg,
+      readPolicyFor: (session) => subagentReadPolicy(cfg, session),
+      assets: {
+        peek: () => resolved,
+        ensure: async () => { h.calls.ensure += 1; resolved = { knowledge: [resource] }; return resolved },
+      },
+      client: { knowledgeToolsList: async () => [], knowledgeToolsCall: async () => ({ ok: true, text: '冷启动结果' }) },
+      log: () => {},
+    }
+    registerKnowledgeTools(ctx, runtime)
+    const tool = tools.find((t) => t.name === 'tdai_knowledge_call')
+    const out = await tool.execute({ knowledge_id: 'k1', tool_name: 'explore' }, { agent: { session: CHILD } })
+    assert.equal(out, '冷启动结果', '缓存未就绪时子会话应补加载后执行')
+    assert.equal(h.calls.ensure, 1, '且只补一次')
+  }
+  // (c) 仍没有绑定资源：给的是"未绑定"而不是"子 agent 被拒"
+  {
+    const h = make({}, { asset: { knowledge: [] } })
+    const childMsg = await h.call(CHILD)
+    assert.ok(childMsg.includes('没有绑定团队知识资源'), `子会话应走正常路径，实际：${childMsg}`)
+    assert.ok(!childMsg.includes('子 agent 会话'), '不该再出现"子会话已降级"的拒绝文案')
+    const parentMsg = await h.call(PARENT)
+    assert.ok(parentMsg.includes('没有绑定团队知识资源'), `父会话同上，实际：${parentMsg}`)
+  }
+  // (d) 防御路径：知识面被显式关掉时给可解释的文案
+  {
+    const off = { subagent: true, inherit: false, identity: false, memory: false, skills: false, knowledge: false }
+    const h = make({}, { asset: { knowledge: [resource] }, policy: off })
+    const msg = await h.call(CHILD)
+    assert.ok(msg.includes('知识侧已被策略关闭'), `知识面关闭时应可解释，实际：${msg}`)
+    assert.equal(h.calls.executed, 0, '知识面关闭时不该打知识服务')
+  }
 }
 
-// ── 6) 端到端：会话建立（agent/created）不给降级会话预热资产（stub 掉 fetch 计数）──
+// ── 6) 端到端：会话建立（agent/created）按能力面预热 ─────────────────────────
 {
   const realFetch = globalThis.fetch
   let fetchCalls = 0
   globalThis.fetch = async () => { fetchCalls += 1; return { ok: true, json: async () => ({ code: 0, data: {} }) } }
   try {
-    const registered = { listeners: {}, tools: [], sections: [] }
-    const ctx = {
-      logger: { warn() {} },
-      inject() {},
-      on(ev, cb) { (registered.listeners[ev] ||= []).push(cb) },
-      get() { return undefined },
-      tools: { register(def) { registered.tools.push(def) } },
-      systemPrompt: { section(s) { registered.sections.push(s) }, context() {} },
-      sessions: { list() { return [] } },
+    const boot = (overrides) => {
+      const registered = { listeners: {}, tools: [], sections: [] }
+      const ctx = {
+        logger: { warn() {} },
+        inject() {},
+        on(ev, cb) { (registered.listeners[ev] ||= []).push(cb) },
+        get() { return undefined },
+        tools: { register(def) { registered.tools.push(def) } },
+        systemPrompt: { section(s) { registered.sections.push(s) }, context() {} },
+        sessions: { list() { return [] } },
+      }
+      apply(ctx, {
+        enabled: true, captureEnabled: true, recallEnabled: true, injectionEnabled: true,
+        sessionContextEnabled: true, profileMemoryEnabled: true, skillsEnabled: true, knowledgeEnabled: false,
+        serviceId: 'svc', teamId: 't', agentId: 'a', userId: 'u',
+        ...overrides,
+      })
+      return registered
     }
-    apply(ctx, {
-      enabled: true, captureEnabled: true, recallEnabled: true, injectionEnabled: true,
-      sessionContextEnabled: true, profileMemoryEnabled: true, skillsEnabled: true, knowledgeEnabled: false,
-      serviceId: 'svc', teamId: 't', agentId: 'a', userId: 'u',
-    })
-    const start = async (session) => {
+    const start = async (registered, session) => {
       fetchCalls = 0
       for (const cb of registered.listeners['agent/created'] || []) cb({ agent: { session } })
       await new Promise((resolve) => setTimeout(resolve, 30))
       return fetchCalls
     }
-    assert.equal(await start(CHILD), 0, '子会话预热不该触发任何资产请求')
-    assert.ok(await start(PARENT) > 0, '父会话预热应照常打网关')
+
+    // (a) 知识总开关关（子会话无面可用）：预热不该触发任何资产请求
+    {
+      const registered = boot({ knowledgeEnabled: false })
+      assert.equal(await start(registered, CHILD), 0, '子会话没有可用面时预热不该触发任何资产请求')
+      assert.ok(await start(registered, PARENT) > 0, '父会话预热应照常打网关')
+    }
+    // (b) 知识总开关开：子会话**要**预热（它的知识面要用），父会话照旧
+    {
+      const registered = boot({ knowledgeEnabled: true })
+      assert.ok(await start(registered, CHILD) > 0, '开着知识面的子会话应预热知识资源')
+      assert.ok(await start(registered, PARENT) > 0, '父会话预热应照常打网关')
+    }
   } finally {
     globalThis.fetch = realFetch
   }
 }
 
-console.log('subagent tests passed: 判定 / system 不注入 / L1 不召回 / 不预热资产 / 不回流 / 工具可解释 / 父会话照旧')
+console.log('subagent tests passed: 判定 / 知识面保留 / 身份与记忆不注入 / L1 不召回 / 按面预热 / 不回流 / 知识工具可用 / 父会话照旧')

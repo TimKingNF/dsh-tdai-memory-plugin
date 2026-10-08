@@ -6,12 +6,13 @@
  *   - system 只留一行路由信息（`tdai:knowledge-tools`）；
  *   - 正文注册为 DSH 运行时 skill，进原生 skill 目录，模型用 `skill` 工具按需加载。
  *
- * 这个测试锁住五件事：
+ * 这个测试锁住六件事：
  *   1. 有知识资源 + 开关打开 → 注册 skill，名字/描述/正文都正确；
  *   2. 没有资源 / 开关关闭 → **不注册**（不要往目录里塞空 skill）；
  *   3. 同一 session 重复 assemble → **只注册一次**（幂等）；
  *   4. 宿主没有 skills 服务 → 静默跳过，不崩（fail-open）；
- *   5. **宿主有 skills 服务、但插件没把它写进 inject** → 也不能崩。
+ *   5. **宿主有 skills 服务、但插件没把它写进 inject** → 也不能崩；
+ *   6. system 里只剩一行路由（正文不进常驻 prompt，块 ≤600 B）。
  *
  * 第 5 条是线上事故的回归护栏：`skills` 由别的插件在自己的 fiber 里 provide，
  * cordis 的 ctx 是 Proxy，裸读一个没 inject 的服务名**取值本身就抛**
