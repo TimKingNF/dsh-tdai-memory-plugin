@@ -128,7 +128,6 @@ const FULL_FACETS = { identity: true, memory: true, skills: true, knowledge: tru
         { name: 'harness:identity', text: 'You are an AI agent.' },
         { name: 'tdai:session-context', text: '' },
         { name: 'tdai:profile-memory', text: '' },
-        { name: 'tdai:available-skills', text: '' },
         { name: 'tdai:knowledge-tools', text: '' },
       ],
       contexts: [], tools: [], variables: {},
@@ -138,9 +137,9 @@ const FULL_FACETS = { identity: true, memory: true, skills: true, knowledge: tru
   const text = (result, name) => result.sections.find((s) => s.name === name).text
   const stateText = (session) => listeners['context:tdai:state'].text({ agent: { session } })
 
-  // (a) 父会话：4 段都注入、知识 skill 注册、状态快照有内容、资产照常加载
+  // (a) 父会话：3 段都注入、知识 skill 注册、状态快照有内容、资产照常加载
   const parentResult = await assemble(PARENT)
-  for (const name of ['tdai:session-context', 'tdai:profile-memory', 'tdai:available-skills', 'tdai:knowledge-tools']) {
+  for (const name of ['tdai:session-context', 'tdai:profile-memory', 'tdai:knowledge-tools']) {
     assert.ok(text(parentResult, name).length > 0, `父会话应注入 ${name}`)
   }
   assert.equal(skills.length, 1, '父会话应注册知识 skill')
@@ -150,13 +149,13 @@ const FULL_FACETS = { identity: true, memory: true, skills: true, knowledge: tru
   assert.deepEqual(ensurePolicies.at(-1), { subagent: false, inherit: true, ...FULL_FACETS },
     '父会话按全量面加载资产')
 
-  // (b) 子会话（默认）：身份 / 记忆 / 云端 skill 目录三段为空（DSH 的 renderPrompt 会把
-  //     空段整个丢掉），状态快照为空；但**知识路由在、知识 skill 注册了、资产按知识面加载**
+  // (b) 子会话（默认）：身份 / 记忆两段为空（DSH 的 renderPrompt 会把空段整个丢掉），
+  //     状态快照为空；但**知识路由在、知识 skill 注册了、资产按知识面加载**
   //     —— 子 agent 要能自己查 wiki / code-graph。
   ensureCalls = 0
   ensurePolicies.length = 0
   const childResult = await assemble(CHILD)
-  for (const name of ['tdai:session-context', 'tdai:profile-memory', 'tdai:available-skills']) {
+  for (const name of ['tdai:session-context', 'tdai:profile-memory']) {
     assert.equal(text(childResult, name), '', `子会话不应注入 ${name}`)
   }
   assert.ok(text(childResult, 'tdai:knowledge-tools').includes('<knowledge_tools>'),
@@ -167,7 +166,7 @@ const FULL_FACETS = { identity: true, memory: true, skills: true, knowledge: tru
   assert.ok(ensureCalls > 0, '子会话应按知识面加载资产（知识库要能用）')
   assert.deepEqual(ensurePolicies.at(-1), {
     subagent: true, inherit: false, identity: false, memory: false, skills: false, knowledge: true,
-  }, '子会话的资产加载必须只带知识面（不为画像 / skill listing 打网关）')
+  }, '子会话的资产加载必须只带知识面（不为画像打网关）')
 
   // (c) fork 子会话同样降级（它带着父会话的 seed 历史，更容易被误当父会话）
   assert.equal(stateText(FORK_CHILD), '', 'fork 子会话同样降级')
@@ -186,11 +185,11 @@ const FULL_FACETS = { identity: true, memory: true, skills: true, knowledge: tru
   assert.ok(stateText(NO_HEADER).includes('TDAI memory 状态'), '缺 header 的会话应按父会话注入')
 }
 
-// ── 3) 读侧 · L1 召回：子会话不检索、不预热资产 ──────────────────────────────
+// ── 3) 读侧 · 每轮召回（L1 + 云端 skill）：子会话不检索、不预热资产 ───────────
 {
   const make = (cfgOverrides) => {
     const cfg = { ...BASE, ...cfgOverrides }
-    const calls = { search: 0, warm: 0, policy: null }
+    const calls = { search: 0, skillSearch: 0, warm: 0, policy: null }
     const events = []
     const runtime = {
       readEnabled: () => cfg.enabled,
@@ -199,7 +198,10 @@ const FULL_FACETS = { identity: true, memory: true, skills: true, knowledge: tru
         warm: (_sessionId, policy) => { calls.warm += 1; calls.policy = policy; return Promise.resolve(null) },
         peek: () => ({ ctxs: [] }),
       },
-      client: { searchL1: async () => { calls.search += 1; return [{ id: '1', type: 'rule', content: 'remember X', score: 0.9 }] } },
+      client: {
+        searchL1: async () => { calls.search += 1; return [{ id: '1', type: 'rule', content: 'remember X', score: 0.9 }] },
+        searchSkills: async () => { calls.skillSearch += 1; return { items: [] } },
+      },
       log: () => {},
     }
     wireRecall({ on: (ev, cb) => events.push([ev, cb]) }, runtime)
@@ -228,6 +230,7 @@ const FULL_FACETS = { identity: true, memory: true, skills: true, knowledge: tru
     const expected = await next()
     const decision = await handler(payload, () => Promise.resolve(expected))
     assert.equal(calls.search, 0, '子会话不应做 L1 检索')
+    assert.equal(calls.skillSearch, 0, '子会话不应做 skill 召回（skill 面默认关）')
     assert.equal(calls.warm, 0, '子会话不应在召回路径上预热资产')
     assert.deepEqual(decision, expected, '子会话的 decision 应原样透传（不加消息）')
   }

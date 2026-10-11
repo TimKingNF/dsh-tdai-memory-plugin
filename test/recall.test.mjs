@@ -329,4 +329,159 @@ function recalledMessage(messages) {
   assert.ok(Array.isArray(result.messages) && result.messages.length === 1, '缺 messages 时应补齐')
 }
 
-console.log('recall tests passed: 防御兜底 / 独立 inject 消息 / 真人消息零改动 / 不阻塞主链路')
+// ── D. 云端 skill 按需召回（2026-10 改版：替代常驻目录）─────────────────────
+//
+// 契约：每轮用"最近几条真人消息"检索一次；命中才注入；与 L1 共用一条 plugin 消息；
+// 与上一次注入完全相同的命中集跳过（不往历史里堆重复块）；两段都关时不做任何网络调用。
+
+const skillHit = (name, score = 5) => ({
+  skill_id: `skl-${name}`, name, description: `${name} 的用途`, score,
+})
+
+/** 造一个同时开 L1 与 skill 召回的 harness。 */
+function skillHarness(cfgOverrides = {}, runtimeOverrides = {}) {
+  return harness({
+    enabled: true, recallEnabled: false, injectionEnabled: false,
+    skillsEnabled: true, skillRecallLimit: 3, skillRecallMinScore: 0,
+    ...cfgOverrides,
+  }, {
+    client: {
+      searchL1: async () => [],
+      searchSkills: async () => ({ items: [skillHit('rrg-daily-review'), skillHit('dsh-plugin-settings-card', 4)] }),
+    },
+    ...runtimeOverrides,
+  })
+}
+
+const skillMessages = (text = '帮我看看 RRG 日评那个 skill') => {
+  const user = { id: 'm1', role: 'user', content: [{ type: 'text', text }], source: { kind: 'user' } }
+  return { user, payload: { agent: { session: { id: 's1' } }, messages: [user], turn: 1, step: 1 } }
+}
+
+// 11) 命中：注入 <tdai_recalled_skills>，且与 L1 共用同一条消息
+{
+  const { handler } = skillHarness({ recallEnabled: true }, {
+    client: {
+      searchL1: async () => [{ id: '1', type: 'rule', content: 'remember X', score: 0.9 }],
+      searchSkills: async () => ({ items: [skillHit('rrg-daily-review', 9.876)] }),
+    },
+  })
+  const { payload } = skillMessages()
+  const result = await handler(payload, async () => ({ kind: 'enter', messages: payload.messages }))
+  const injected = recalledMessage(result.messages)
+  assert.ok(injected, '应注入一条 plugin 消息')
+  const text = injected.content[0].text
+  assert.ok(text.includes('<tdai_recalled_l1_memories>'), 'L1 块在')
+  assert.ok(text.includes('<tdai_recalled_skills>'), 'skill 块在')
+  assert.ok(text.indexOf('<tdai_recalled_l1_memories>') < text.indexOf('<tdai_recalled_skills>'),
+    '两段块共处一条消息：L1 在前、skill 在后')
+  assert.ok(text.includes('rrg-daily-review') && text.includes('score=9.88'), '命中名字与分数要进块')
+  assert.ok(injected.source.summary.includes('L1 召回 1 条') && injected.source.summary.includes('skill 命中 1 条'),
+    '折叠行摘要要同时说清两段')
+}
+
+// 12) 零命中：只注入 L1（skill 块不出现）；两段都零命中：完全不注入
+{
+  const { handler } = skillHarness({ recallEnabled: true }, {
+    client: {
+      searchL1: async () => [{ id: '1', type: 'rule', content: 'remember X', score: 0.9 }],
+      searchSkills: async () => ({ items: [] }),
+    },
+  })
+  const { payload } = skillMessages()
+  const result = await handler(payload, async () => ({ kind: 'enter', messages: payload.messages }))
+  const text = recalledMessage(result.messages).content[0].text
+  assert.ok(text.includes('<tdai_recalled_l1_memories>') && !text.includes('<tdai_recalled_skills>'),
+    'skill 零命中时不该出现 skill 块')
+}
+
+{
+  const { handler } = skillHarness({}, {
+    client: { searchL1: async () => [], searchSkills: async () => ({ items: [] }) },
+  })
+  const { payload } = skillMessages()
+  const decision = { kind: 'enter', messages: payload.messages }
+  const result = await handler(payload, async () => decision)
+  assert.deepEqual(result, decision, '两段都零命中时不该注入任何消息')
+}
+
+// 13) 与上一次注入相同的命中集 → 跳过；命中集变了 → 立刻重新注入
+{
+  let hits = [skillHit('skill-a', 9)]
+  const { handler } = skillHarness({}, {
+    client: { searchL1: async () => [], searchSkills: async () => ({ items: hits }) },
+  })
+  const { payload } = skillMessages()
+  const step = () => handler(payload, async () => ({ kind: 'enter', messages: payload.messages }))
+
+  assert.ok(recalledMessage((await step()).messages), '命中集首次出现应注入')
+  assert.equal(recalledMessage((await step()).messages), undefined, '同一命中集连续第二次应跳过')
+  hits = [skillHit('skill-b', 9)]
+  assert.ok(recalledMessage((await step()).messages), '命中集变化后应立刻重新注入')
+  hits = []
+  assert.equal(recalledMessage((await step()).messages), undefined, '零命中不注入（去重记录保持不变）')
+  hits = [skillHit('skill-b', 9)]
+  assert.equal(recalledMessage((await step()).messages), undefined,
+    '回到上一次注入过的集合仍算重复 → 跳过（它与历史里已有的块相同）')
+}
+
+// 14) 开关：skillsEnabled=false 时不检索、不注入（连 HTTP 都不打）
+{
+  let searched = 0
+  const { handler } = skillHarness({ skillsEnabled: false }, {
+    client: { searchL1: async () => [], searchSkills: async () => { searched += 1; return { items: [skillHit('x')] } } },
+  })
+  const { payload } = skillMessages()
+  const decision = { kind: 'enter', messages: payload.messages }
+  const result = await handler(payload, async () => decision)
+  assert.equal(searched, 0, '开关关掉时不该检索')
+  assert.deepEqual(result, decision, '开关关掉时决策原样')
+}
+
+// 15) 分数闸门：低于 minScore 的命中被丢掉
+{
+  const { handler } = skillHarness({ skillRecallMinScore: 5 }, {
+    client: {
+      searchL1: async () => [],
+      searchSkills: async () => ({ items: [skillHit('weak-skill', 1), skillHit('strong-skill', 8)] }),
+    },
+  })
+  const { payload } = skillMessages()
+  const result = await handler(payload, async () => ({ kind: 'enter', messages: payload.messages }))
+  const text = recalledMessage(result.messages).content[0].text
+  assert.ok(text.includes('strong-skill') && !text.includes('weak-skill'), '闸门以下不注入')
+}
+
+// 16) skill 检索失败不影响 L1：两段并发、各自 fail-open
+{
+  const { handler } = skillHarness({ recallEnabled: true }, {
+    client: {
+      searchL1: async () => [{ id: '1', type: 'rule', content: 'remember X', score: 0.9 }],
+      searchSkills: async () => { throw new Error('skill search boom') },
+    },
+  })
+  const { payload } = skillMessages()
+  const result = await handler(payload, async () => ({ kind: 'enter', messages: payload.messages }))
+  const text = recalledMessage(result?.messages ?? [])?.content?.[0]?.text ?? ''
+  assert.ok(text.includes('<tdai_recalled_l1_memories>'), 'skill 检索抛错时 L1 块必须照常注入')
+}
+
+// 17) 窗口 query：宿主注入的 user 消息不进 query，最近 3 条真人消息拼窗口
+{
+  let seen = ''
+  const { handler } = skillHarness({}, {
+    client: { searchL1: async () => [], searchSkills: async (_id, q) => { seen = q; return { items: [] } } },
+  })
+  const messages = [
+    { role: 'user', content: [{ type: 'text', text: '第一轮：先看缓存' }], source: { kind: 'user' } },
+    { role: 'assistant', content: [{ type: 'text', text: '好的' }], source: { kind: 'model' } },
+    { role: 'user', content: [{ type: 'text', text: '<system-reminder>快照</system-reminder>' }], source: { kind: 'runtime-context' } },
+    { role: 'user', content: [{ type: 'text', text: '继续' }], source: { kind: 'user' } },
+  ]
+  await handler({ agent: { session: { id: 's1' } }, messages, turn: 1, step: 1 }, async () => ({ kind: 'enter', messages }))
+  assert.ok(seen.startsWith('继续'), `最新一条应在最前，实际 ${JSON.stringify(seen)}`)
+  assert.ok(seen.includes('第一轮'), '窗口要带上前面几轮')
+  assert.ok(!seen.includes('快照'), '宿主注入消息不进 query')
+}
+
+console.log('recall tests passed: 防御兜底 / 独立 inject 消息 / 真人消息零改动 / 不阻塞主链路 / skill 按需召回')

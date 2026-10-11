@@ -167,7 +167,7 @@ assert.equal(identitySourceOf(undefined), 'env', 'describe 不可用 → env')
 
 // systemPrompt sections
 const sectionNames = registered.sections.map((s) => s.name)
-for (const n of ['tdai:session-context', 'tdai:profile-memory', 'tdai:available-skills', 'tdai:knowledge-tools']) {
+for (const n of ['tdai:session-context', 'tdai:profile-memory', 'tdai:knowledge-tools']) {
   assert.ok(sectionNames.includes(n), `应注册 section ${n}`)
 }
 

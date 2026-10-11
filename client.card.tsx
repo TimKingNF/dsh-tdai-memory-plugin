@@ -28,10 +28,12 @@
  *
  *   读侧总开关 enabled
  *     ├─ L1 自动召回 recallEnabled（另有条数上限 recallLimit）
+ *     ├─ 云端 skill 召回 skillsEnabled（每轮按当前对话检索，另有条数上限 / 分数闸门）
  *     ├─ System prompt 注入 injectionEnabled
- *     │    ├─ sessionContextEnabled
+ *     │    ├─ sessionContextEnabled（<session_context> 信封）
+ *     │    │    └─ agentPromptEnabled（[Role] / [Rules] 正文 + persona 槽的英文指引句）
+ *     │    │         └─ agentPromptKeepBase（persona 槽要不要保留 DSH 原 persona 行）
  *     │    ├─ profileMemoryEnabled
- *     │    ├─ skillsEnabled
  *     │    └─ knowledgeEnabled
  *     └─ 只读工具（无独立开关）
  *
@@ -45,9 +47,11 @@
  *     subagentCaptureEnabled    默认**关**：子 agent 的执行过程不回流 L0
  *   两者都按 session.header.origin === 'subagent' 判定。
 
- * 三个容易搞错的点：
+ * 几个容易搞错的点：
+ *   0. 云端 skill 召回**也不**依赖 injectionEnabled：它与 L1 召回同样走 agent/pre-step、
+ *      注入到消息尾部（同一轮里两条块共用一条 plugin 消息），与 system 段无关；
  *   1. L1 召回**不**依赖 injectionEnabled（recall.mjs 只判 readEnabled + recallEnabled）；
- *      injectionEnabled 只管 system prompt 的那 4 个段。
+ *      injectionEnabled 只管 system prompt 里的那几个段 + persona 槽的指引句。
  *   2. 回流**不**依赖 enabled：读侧全关时回流照常写 L0（capture-only 模式）。
  *   3. 身份不全时读侧整体不生效（readEnabled = enabled && 身份齐全），回流不受影响。
  *      —— 这条最容易"看起来开关都开着但什么都没注入"，所以卡片里显式告警。
@@ -75,23 +79,55 @@ const RECALL_TOGGLE = {
   label: 'L1 自动召回',
   hint: '每轮按你的输入检索相关记忆，作为独立消息插入本轮',
 }
+const SKILL_RECALL_TOGGLE = {
+  key: 'skillsEnabled',
+  label: '云端 skill 召回',
+  hint: '每轮按当前对话检索这个 agent 名下的云端 skill，命中才注入（只给名字 + 一句描述，'
+    + '正文按需用 tdai_skill_view 取）；不再常驻目录',
+}
 const INJECT_MASTER = {
   key: 'injectionEnabled',
   label: 'System prompt 注入',
-  hint: '只管下面那 4 个注入段；不影响 L1 召回',
+  hint: '只管下面那几个注入段；不影响 L1 召回与 skill 召回',
 }
-const READ_TOGGLES = [READ_MASTER, RECALL_TOGGLE, INJECT_MASTER]
+const READ_TOGGLES = [READ_MASTER, RECALL_TOGGLE, SKILL_RECALL_TOGGLE, INJECT_MASTER]
 
 /** 置灰时的原因（tooltip）；文案与真实依赖关系一一对应，别写成"总开关"这种含糊说法。 */
 const READ_DIM_REASON = '「读侧总开关」已关闭，此项暂不生效'
 const RECALL_DIM_REASON = '「L1 自动召回」已关闭，此项暂不生效'
+const SKILL_RECALL_DIM_REASON = '「云端 skill 召回」已关闭，此项暂不生效'
 const INJECT_DIM_REASON = '「System prompt 注入」总闸已关闭，此项暂不生效'
+const AGENT_PROMPT_DIM_REASON = '「Agent 角色 / 规则 prompt」已关闭，此项暂不生效'
+const SESSION_CONTEXT_DIM_REASON = '「会话上下文（Agent / Task）」已关闭，此项暂不生效'
 
-/** 「System prompt 注入」总闸下的 4 个注入段。 */
+/** 二级从属的置灰原因：键 = 那个父开关的 key。 */
+const DEP_DIM_REASON: Record<string, string> = {
+  sessionContextEnabled: SESSION_CONTEXT_DIM_REASON,
+  agentPromptEnabled: AGENT_PROMPT_DIM_REASON,
+}
+
+/**
+ * `dimmedBy` = 这一项在 UI 上从属于哪些开关（置灰判定用；不影响真实注入判据）——
+ * 列表里**任何一个**关掉，本项就置灰。层级与 config.mjs 的开关树一致：
+ * sessionContextEnabled → agentPromptEnabled → agentPromptKeepBase。
+ */
 const INJECT_TOGGLES = [
   { key: 'sessionContextEnabled', label: '会话上下文（Agent / Task）' },
+  {
+    key: 'agentPromptEnabled',
+    label: 'Agent 角色 / 规则 prompt',
+    hint: '把「角色定位 prompt」+「规则固定 prompt」写进会话上下文的 [Role] / [Rules]，'
+      + '并在 persona 槽放一句英文指引；拿不到文本时两边都保持原样',
+    dimmedBy: ['sessionContextEnabled'],
+  },
+  {
+    key: 'agentPromptKeepBase',
+    label: '保留原 persona 行',
+    hint: '默认关：persona 槽只放那句英文指引。打开则先保留 DSH 原 persona 前缀，再接指引句',
+    defaultOff: true,
+    dimmedBy: ['sessionContextEnabled', 'agentPromptEnabled'],
+  },
   { key: 'profileMemoryEnabled', label: '长期记忆（L3 画像 + L2 索引）' },
-  { key: 'skillsEnabled', label: 'Skill 列表' },
   { key: 'knowledgeEnabled', label: '知识库（wiki / code-graph）', hint: '默认关', defaultOff: true },
 ]
 
@@ -101,12 +137,12 @@ const INJECT_TOGGLES = [
  * 默认关的理由：子 agent 的任务通常由父 agent 明确指定（"分析这段 diff"），
  * 父 agent 的身份与画像 / 召回是干扰；它的整段执行过程属于工作噪音，不该进长期记忆。
  * 但**知识库与工具是子 agent 干活要用的能力**，不随这两个开关关闭（见 lib/subagent.mjs
- * 的能力面表）—— 打开第一个开关只是把身份 / 记忆 / 云端 skill 目录也一并给子会话。
+ * 的能力面表）—— 打开第一个开关只是把身份 / 记忆 / 云端 skill 召回也一并给子会话。
  */
 const SUBAGENT_INJECT_TOGGLE = {
   key: 'subagentInjectionEnabled',
   label: '子 agent 全量继承读侧',
-  hint: '默认关：子会话不注入身份与记忆、不做 L1 召回（团队知识库与 10 个只读工具本就可用）',
+  hint: '默认关：子会话不注入身份与记忆、不做 L1 召回与 skill 召回（团队知识库与 10 个只读工具本就可用）',
   defaultOff: true,
 }
 const SUBAGENT_CAPTURE_TOGGLE = {
@@ -135,8 +171,12 @@ const WRITE_TOGGLES = [
  * —— 见 `lib/settings.mjs` 的 `numField` 与 `test/settings-card.test.mjs` 的两侧断言。
  * 越界按 [min, max] 收敛，并把收敛结果回填草稿 + 提示用户。
  */
-const NUMERIC_FIELDS: Record<string, { min: number; max: number; label: string }> = {
-  recallLimit: { min: 1, max: 20, label: '单轮召回条数上限' },
+const NUMERIC_FIELDS: Record<string, { min: number; max: number; label: string; dflt: number }> = {
+  recallLimit: { min: 1, max: 20, label: '单轮召回条数上限', dflt: 5 },
+  // 云端 skill 召回的两个旋钮：**实际注入条数 = 分数过闸门后的前 skillRecallLimit 条**，
+  // 所以"召回少了/多了"通常是这两个一起调（见 lib/recall.mjs 的 pickSkillHits）。
+  skillRecallLimit: { min: 1, max: 10, label: 'skill 召回条数上限', dflt: 3 },
+  skillRecallMinScore: { min: 0, max: 100, label: 'skill 召回分数下限', dflt: 4 },
 }
 
 /** readEnabled() 需要的身份字段（缺一读侧就整体不生效）。 */
@@ -318,6 +358,7 @@ function TdaiMemoryCard(props: { form: SettingsForm; describe?: SettingsDescribe
   // ── 依赖链的实时状态：用来置灰"当前不生效"的项 ────────────────────────────
   const readOn = value.enabled !== false
   const recallOn = value.recallEnabled !== false
+  const skillOn = value.skillsEnabled !== false
   const injectOn = value.injectionEnabled !== false
   // 身份不全 → 读侧整体不生效（readEnabled = enabled && identityComplete）。
   // 只在快照就绪后判断，否则首帧 current 为空会误报。
@@ -389,7 +430,7 @@ function TdaiMemoryCard(props: { form: SettingsForm; describe?: SettingsDescribe
    * 但**仍可点击**（允许先配好再开总闸，比强制顺序更省事）。
    */
   const toggleItem = (
-    t: { key: string; label: string; hint?: string; defaultOff?: boolean },
+    t: { key: string; label: string; hint?: string; defaultOff?: boolean; dimmedBy?: string[] },
     dim: boolean,
     dimReason: string,
   ) => {
@@ -408,35 +449,41 @@ function TdaiMemoryCard(props: { form: SettingsForm; describe?: SettingsDescribe
     )
   }
 
-  /** L1 召回条数上限：数字输入（草稿存字符串，保存时收敛成 number，见 buildSaveOps）。 */
-  const recallLimitRow = () => {
-    const raw = draft ? draft.recallLimit : current.recallLimit
+  /** 数字输入行（草稿存字符串，保存时收敛成 number 且收敛到 schema 区间，见 buildSaveOps）。 */
+  const numericRow = (key: string, hint: string, dim: boolean, dimReason: string) => {
+    const meta = NUMERIC_FIELDS[key]
+    const raw = draft ? draft[key] : current[key]
     const shown = raw === undefined || raw === null ? '' : String(raw)
-    const dim = !readOn || !recallOn
     return (
       <span
-        key="recallLimit"
-        title={dim ? (!readOn ? READ_DIM_REASON : RECALL_DIM_REASON) : undefined}
+        key={key}
+        title={dim ? dimReason : undefined}
         style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap', fontSize: 13, padding: '5px 0', opacity: dim ? 0.55 : 1 }}
       >
-        <span style={{ color: C.secondary }}>{NUMERIC_FIELDS.recallLimit.label}</span>
+        <span style={{ color: C.secondary }}>{meta.label}</span>
         <input
           type="number"
-          min={NUMERIC_FIELDS.recallLimit.min}
-          max={NUMERIC_FIELDS.recallLimit.max}
+          min={meta.min}
+          max={meta.max}
           step={1}
           value={shown}
-          placeholder="5"
+          placeholder={String(meta.dflt)}
           disabled={!writable || saving}
-          onChange={(e) => edit('recallLimit', e.target.value)}
+          onChange={(e) => edit(key, e.target.value)}
           style={{ appearance: 'textfield', width: 56, padding: '3px 6px', borderRadius: '6px', border: C.border, background: 'transparent', color: 'inherit', font: 'inherit', fontSize: 13, textAlign: 'center' }}
         />
-        <span style={{ color: C.tertiary, fontSize: 12 }}>
-          条（自有 + 借入合并后的上限，1–20；实际还受 4000 字符预算约束）
-        </span>
+        <span style={{ color: C.tertiary, fontSize: 12 }}>{hint}</span>
       </span>
     )
   }
+
+  /** L1 召回条数上限（挂在「L1 自动召回」下）。 */
+  const recallLimitRow = () => numericRow(
+    'recallLimit',
+    '条（自有 + 借入合并后的上限，1–20；实际还受 4000 字符预算约束）',
+    !readOn || !recallOn,
+    !readOn ? READ_DIM_REASON : RECALL_DIM_REASON,
+  )
 
   return (
     <div style={{ border: C.border, background: 'var(--dsw-alias-bg-layer-3, rgba(127,127,127,0.05))', borderRadius: '12px' }}>
@@ -452,16 +499,28 @@ function TdaiMemoryCard(props: { form: SettingsForm; describe?: SettingsDescribe
               {toggleItem(RECALL_TOGGLE, !readOn, READ_DIM_REASON)}
               {/* 条数上限紧跟「L1 自动召回」，读起来是同一件事 */}
               {recallLimitRow()}
+              {/* 云端 skill 召回同样是"每轮读进上下文"，但不走 system 段，
+                  所以放在注入总闸**之前**，不被它置灰 */}
+              {toggleItem(SKILL_RECALL_TOGGLE, !readOn, READ_DIM_REASON)}
+              {/* 两个旋钮紧跟它：实际注入条数 = 过分数闸门后的前 N 条 */}
+              {numericRow('skillRecallLimit', '条（每轮最多注入几条命中，1–10）',
+                !readOn || !skillOn, !readOn ? READ_DIM_REASON : SKILL_RECALL_DIM_REASON)}
+              {numericRow('skillRecallMinScore', '分以下不注入（默认 4；0 = 关掉闸门）',
+                !readOn || !skillOn, !readOn ? READ_DIM_REASON : SKILL_RECALL_DIM_REASON)}
               {toggleItem(INJECT_MASTER, !readOn, READ_DIM_REASON)}
             </div>
             {identityWarningNote(missingIdentityKeys, readOn)}
-            {/* 4 个注入段挂在「System prompt 注入」下：缩进 + 竖线表示从属关系 */}
+            {/* 注入段挂在「System prompt 注入」下：缩进 + 竖线表示从属关系 */}
             <div style={{ ...flowStyle, paddingLeft: 22, marginLeft: 2, marginTop: 2, borderLeft: C.guide }}>
-              {INJECT_TOGGLES.map((t) => toggleItem(
-                t,
-                !readOn || !injectOn,
-                !readOn ? READ_DIM_REASON : INJECT_DIM_REASON,
-              ))}
+              {INJECT_TOGGLES.map((t) => {
+                // 多级从属（agentPromptKeepBase ← agentPromptEnabled ← sessionContext）
+                // 也要算置灰原因，否则用户会以为"打开了但没生效"。
+                const offParent = (t.dimmedBy ?? []).find((k: string) => value[k] === false)
+                const dim = !readOn || !injectOn || offParent !== undefined
+                const reason = !readOn ? READ_DIM_REASON
+                  : (!injectOn ? INJECT_DIM_REASON : (DEP_DIM_REASON[offParent as string] ?? INJECT_DIM_REASON))
+                return toggleItem(t, dim, reason)
+              })}
             </div>
 
             {/* ── 写侧：把对话回流给 MemoryCore（与读侧完全独立）─────────────── */}

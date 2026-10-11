@@ -11,7 +11,7 @@
  *     /v3/conversation/search         L0 对话原文检索
  *     /v3/scenario/ls | /v3/scenario/read   L2 场景索引 / 全文
  *     /v3/core/read                   L3 persona
- *     /v3/skill/search | /v3/skill/listing | /v3/skill/get-by-name
+ *     /v3/skill/search | /v3/skill/get-by-name
  *     /v3/knowledge/list              团队知识资源
  *   meta 面（另需 x-tdai-user-key）：
  *     /v3/meta/agent/get | /v3/meta/task/get | /v3/meta/agent-fixed-asset/list-with-detail
@@ -230,20 +230,15 @@ export class GatewayClient {
 
   // ── Skill ────────────────────────────────────────────────────────────────
 
-  /** 团队 Skill 库检索（tdai_skill_search 工具用，跨 agent）。 */
+  /** 团队 Skill 库检索（tdai_skill_search 工具用，跨 agent；也用于每轮 skill 召回）。 */
   searchSkills(identity, query, topK, signal) {
     return this.safe('/v3/skill/search', {
       ...identityBody(identity),
+      // core 的 searchRequestSchema 限 query 1..2048 字符：**必须在客户端截断**，
+      // 否则粘贴长日志/长文时会被 core 以 40001 拒绝。历史事故：`/v3/skill/listing`
+      // 那条路径就是因为 query 没截断（7,162 字符）而永久失败、且静默。
       query: String(query ?? '').slice(0, 2048), top_k: topK,
     }, { identity, signal }, {})
-  }
-
-  /** agent 自有 skill 目录；返回含预渲染 <available_skills> 块。query 缺省时 core 走 mode=full。 */
-  async skillListing({ teamId, agentId, query }) {
-    const data = await this.safe('/v3/skill/listing',
-      { team_id: teamId, agent_id: agentId, query }, {}, null)
-    if (!data || typeof data.listing !== 'string') return null
-    return { mode: data.mode, listing: data.listing, hits: Array.isArray(data.hits) ? data.hits : [] }
   }
 
   /** 打开单个 skill：SKILL.md 全文 + manifest（tdai_skill_view 工具用）。 */

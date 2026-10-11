@@ -216,7 +216,6 @@ const renderPrompt = (assembly) => assembly.sections.map((s) => s.text).filter((
   const expected = [
     ['tdai:session-context', SECTION_ORDERS.sessionContext],
     ['tdai:profile-memory', SECTION_ORDERS.profileMemory],
-    ['tdai:available-skills', SECTION_ORDERS.availableSkills],
     ['tdai:knowledge-tools', SECTION_ORDERS.knowledgeTools],
   ]
   assert.deepEqual(actual, expected, '注册结果必须与 SECTION_ORDERS 表一致')
@@ -232,7 +231,7 @@ const renderPrompt = (assembly) => assembly.sections.map((s) => s.text).filter((
 // ── 3) 首次求值必须为空（动态 section 只是占位）───────────────────────────────
 {
   const { sections } = fakeHost({ asset: sampleAsset })
-  for (const name of ['tdai:session-context', 'tdai:profile-memory', 'tdai:available-skills', 'tdai:knowledge-tools']) {
+  for (const name of ['tdai:session-context', 'tdai:profile-memory', 'tdai:knowledge-tools']) {
     assert.equal(sections.get(name).text(ctxFor()), '', `${name} 的同步 text 必须是空串占位`)
   }
 }
@@ -285,7 +284,6 @@ const renderPrompt = (assembly) => assembly.sections.map((s) => s.text).filter((
   const byName = Object.fromEntries(result.sections.map((s) => [s.name, s.text]))
   assert.equal(byName['tdai:session-context'], '', 'injection 关闭时动态段应保持空')
   assert.equal(byName['tdai:profile-memory'], '', 'injection 关闭时动态段应保持空')
-  assert.equal(byName['tdai:available-skills'], '', 'injection 关闭时动态段应保持空')
 }
 
 // ── 6) readEnabled=false：连总述也不注入 ──────────────────────────────────────

@@ -51,9 +51,12 @@ try {
 
 const FULL = {
   enabled: true, captureEnabled: true, recallEnabled: true, injectionEnabled: true,
-  sessionContextEnabled: true, profileMemoryEnabled: true, skillsEnabled: true, knowledgeEnabled: false,
+  sessionContextEnabled: true, agentPromptEnabled: true, agentPromptKeepBase: false,
+  profileMemoryEnabled: true, skillsEnabled: true, knowledgeEnabled: false,
   endpoint: 'http://127.0.0.1:8420', serviceId: 'default', teamId: 'team-x', agentId: 'agt-x', userId: 'usr-x',
   userKey: '', knowledgeEndpoint: '', taskId: '', recallLimit: 7,
+  // 宿主 describe() 给的是**生效值**（含 schema 默认），所以面板能回显这两项
+  skillRecallLimit: 3, skillRecallMinScore: 4,
 }
 
 /**
@@ -110,12 +113,26 @@ function dimmed(html, label) {
   assert.ok(input.includes('value="7"'), '数字框应回显当前配置值')
 
   // checkbox 与标签同一个 <label> 且 nowrap：沿用"逐项不拆行"的既有偏好。
-  // 数量从 CARD_FIELDS 推导，避免每加一个开关就要来改这个魔数（原先就是它先红）。
+  // 数量从 CARD_FIELDS 推导，避免每加一个开关/数字框就要来改这个魔数（原先就是它先红）。
   assert.equal(
     (html.match(/white-space:nowrap/g) || []).length,
-    CARD_FIELDS.toggles.length + 1,
-    `${CARD_FIELDS.toggles.length} 个开关 + 1 个数字框都应是 nowrap 项`,
+    CARD_FIELDS.toggles.length + Object.keys(CARD_FIELDS.numeric).length,
+    `${CARD_FIELDS.toggles.length} 个开关 + ${Object.keys(CARD_FIELDS.numeric).length} 个数字框都应是 nowrap 项`,
   )
+
+  // skill 召回的两个旋钮：默认值 3 / 3 要回显，且闸门允许 0（= 关掉闸门）
+  for (const [key, label] of [['skillRecallLimit', 'skill 召回条数上限'], ['skillRecallMinScore', 'skill 召回分数下限']]) {
+    const at = html.indexOf(label)
+    assert.ok(at >= 0, `面板应渲染「${label}」`)
+    const row = html.slice(at, at + 700)
+    assert.ok(row.includes('type="number"'), `「${label}」应是 number 输入`)
+    const shown = key === 'skillRecallLimit' ? '3' : '4'
+    assert.ok(row.includes(`value="${shown}"`), `「${label}」应回显生效值 ${shown}（当前 ${key}）`)
+  }
+  {
+    const at = html.indexOf('skill 召回分数下限')
+    assert.ok(html.slice(at, at + 700).includes('min="0"'), '分数下限必须允许 0（0 = 关掉闸门）')
+  }
   // 子 agent 两个开关默认关：渲染出的 checkbox 必须是未勾选状态
   const subagentAt = html.indexOf('子 agent 全量继承读侧')
   const subagentBlock = html.slice(html.lastIndexOf('<label', subagentAt), html.indexOf('</label>', subagentAt))
@@ -129,7 +146,7 @@ function dimmed(html, label) {
 {
   const html = render()
   assert.ok(!html.includes('身份未填全'), '身份齐全时不应有告警')
-  for (const label of ['L1 自动召回', 'System prompt 注入', 'Skill 列表', '对话回流到 MemoryCore', '子 agent 全量继承读侧', '子 agent 对话回流']) {
+  for (const label of ['L1 自动召回', '云端 skill 召回', 'System prompt 注入', '对话回流到 MemoryCore', '子 agent 全量继承读侧', '子 agent 对话回流']) {
     assert.equal(dimmed(html, label), false, `身份齐全 + 开关全开时「${label}」不该置灰`)
   }
 }
@@ -146,14 +163,33 @@ function dimmed(html, label) {
   assert.ok(!html.includes('身份未填全'), '读侧总开关已关时不重复告警（告警只在"开关开着但无效"时才有意义）')
 }
 
-// ── 4) 只关注入总闸：只有那 4 段灰，L1 召回与回流都不灰 ──────────────────────
+// ── 4) 只关注入总闸：只有那几个注入段灰，L1 召回与回流都不灰 ──────────────────
 {
   const html = render({ injectionEnabled: false })
-  for (const label of ['会话上下文（Agent / Task）', '长期记忆（L3 画像 + L2 索引）', 'Skill 列表', '知识库（wiki / code-graph）']) {
+  for (const label of [
+    '会话上下文（Agent / Task）', 'Agent 角色 / 规则 prompt', '保留原 persona 行',
+    '长期记忆（L3 画像 + L2 索引）', '知识库（wiki / code-graph）',
+  ]) {
     assert.equal(dimmed(html, label), true, `注入总闸关闭时「${label}」应置灰`)
   }
   assert.equal(dimmed(html, 'L1 自动召回'), false, 'L1 召回不依赖注入总闸（recall.mjs 只判 readEnabled + recallEnabled）')
   assert.equal(dimmed(html, '对话回流到 MemoryCore'), false, '回流与注入总闸无关')
+}
+
+// ── 4b) 多级从属：agentPrompt ← sessionContext，keepBase ← agentPrompt + sessionContext ──
+{
+  // 会话上下文关掉：下面两级都灰（角色 / 规则住在那个块里）
+  const ctxOff = render({ sessionContextEnabled: false })
+  assert.equal(dimmed(ctxOff, 'Agent 角色 / 规则 prompt'), true, '父项（会话上下文）关闭时它必须灰')
+  assert.equal(dimmed(ctxOff, '保留原 persona 行'), true, '更下面一级也必须灰')
+  // 会话上下文开着、只关角色 / 规则：它自己不灰，子项灰
+  const promptOff = render({ agentPromptEnabled: false })
+  assert.equal(dimmed(promptOff, 'Agent 角色 / 规则 prompt'), false, '它自己是被父项约束的，不该被自己灰掉')
+  assert.equal(dimmed(promptOff, '保留原 persona 行'), true, '父项关闭时子项必须灰（否则用户以为开了会生效）')
+  // 全开：都不灰
+  const allOn = render()
+  assert.equal(dimmed(allOn, 'Agent 角色 / 规则 prompt'), false, '全开时不灰')
+  assert.equal(dimmed(allOn, '保留原 persona 行'), false, '全开时不灰')
 }
 
 // ── 5) 身份不全：读侧开着 → 告警点名缺失字段 ────────────────────────────────

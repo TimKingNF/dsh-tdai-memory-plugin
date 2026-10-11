@@ -63,16 +63,75 @@ Everything is injected through **native DSH interfaces**; the request body is ne
 
 | Block | Channel | DSH interface | order | Content |
 | --- | --- | --- | --- | --- |
-| `tdai:session-context` | system section | `systemPrompt.section` | 520 | agent / task identity (**no persona text** — the preset injects that) |
+| `deployment:persona-prefix` | system section (**owned by DSH**) | text overridden in `system-prompt/assemble` | 0 | **one English pointer**: identity / role / rules live in the `<session_context>` block below (see "Persona injection") |
+| `tdai:session-context` | system section | `systemPrompt.section` | 520 | the `<session_context>` envelope: `[Agent]` (id / name / description) + **`[Role]` (role prompt) + `[Rules]` (rules prompt)** + `[Task]` |
 | `tdai:profile-memory` | system section | same | 521 | plugin overview + L3 profile + L2 scene index + tool guide |
-| `tdai:available-skills` | system section | same | 522 | cloud skill **supplementary** catalog (DSH publishes its own natively) |
-| `tdai:knowledge-tools` | system section | same | 523 | one-line routing for team knowledge resources (off by default) |
+| `tdai:knowledge-tools` | system section | same | 522 | one-line routing for team knowledge resources (off by default) |
 | `tdai-team-knowledge` | DSH runtime skill | `skills.register` | — | full criteria + resource list + tool inventory, **loaded on demand** |
 | `tdai:state` | runtime context | `systemPrompt.context` | 560 | runtime status snapshot, delivered as a **user-role message**, never in system |
 | `<tdai_recalled_l1_memories>` | pre-step | `agent/pre-step` | — | L1 recall: a **separate** plugin message (`form: 'notice'`) right after this turn's human message; the human message is not modified by a single byte |
+| `<tdai_recalled_skills>` | pre-step | `agent/pre-step` (same message as L1) | — | cloud-skill **recall on demand**: searched from the last few human messages, injected only on a hit (name + **full description**, never truncated); bodies are fetched with `tdai_skill_view` (before 2026-10 this was a resident `tdai:available-skills` system catalog) |
 
 Data sources: `/v3/core/read` (L3), `/v3/scenario/ls` (L2), `/v3/skill/listing` (skills),
 `/v3/knowledge/list` (knowledge), `/v3/atomic/search` (L1 recall), `/v3/meta/*` (agent/task detail).
+
+#### Persona injection: role / rules live in `<session_context>`, the persona slot carries a pointer
+
+MemoryCore's agent meta stores the persona as **two separate fields** (the two text areas in the
+MemoryPanel agent editor):
+
+| Field | Label in MemoryPanel | Measured locally (`agt-ake7jmcanf`) |
+| --- | --- | --- |
+| `metadata_json.ui.role_prompt` | **role prompt** (角色定位 prompt) | 5784 chars / 15500 bytes |
+| `metadata_json.ui.rules_prompt` | **rules prompt** (规则固定 prompt) | 1376 chars / 3588 bytes |
+
+(On a deployment where rules is empty the `[Rules]` label is omitted entirely. Both fields configured
+here, joined length 7162 chars — exactly the `prompt` column.)
+
+The server also keeps a `prompt` column = `[role_prompt, rules_prompt].filter(Boolean).join('\n\n')`,
+matching how the panel joins the two on save. The plugin prefers the split fields and falls back to
+`prompt` (`resolveAgentPrompts` in `lib/prompts.mjs`). The rendered template (order = render order):
+
+```text
+You are an AI agent powered by DeepSeek Harness.        <- DSH harness:identity
+
+Your identity, role and rules are defined in the <session_context> block below;   <- plugin, persona slot
+follow it when replying to the user.
+
+<session_context>                                        <- tdai:session-context (order 520)
+[Agent]
+id: agt-ake7jmcanf
+name: ARK-ALPHA
+description: ...
+<blank line>
+[Role]
+(full role_prompt, verbatim)
+<blank line>
+[Rules]
+(full rules_prompt; the label is omitted entirely when empty)
+<blank line>
+[Task]                                                   <- only when taskId is configured
+id: ...
+</session_context>
+```
+
+Three implementation constraints:
+
+- the persona slot is **DSH's own section** (`deployment:persona-prefix`, order 0): the plugin only
+  rewrites its text inside `system-prompt/assemble` and never claims the section name — the same
+  same-name mechanism `dsh-persona` uses in agent presets, without the "already registered" collision;
+- **every injected section sets `interpolate: false`**: all of this text comes from MemoryCore (user
+  content) and a literal `{{...}}` would make DSH throw on an unknown prompt variable and fail every
+  request; a hand-written `</session_context>` inside role / rules is escaped to `<\/session_context>`
+  so the envelope cannot close early;
+- the pointer sentence is only written when the block is **non-empty**: if assets fail to load the
+  block is empty and DSH drops empty sections, so pointing at it would dangle — the persona then stays
+  exactly as DSH configured it.
+
+Switch chain: `sessionContextEnabled` → `agentPromptEnabled` (**on** by default) → `agentPromptKeepBase`
+(off by default = the persona slot carries only the pointer; on = keep DSH's original persona line and
+append the pointer). It belongs to the **identity** facet (child sessions do not get it); since role /
+rules live inside the session-context block, turning that block off removes them together with the pointer.
 
 Delegated **child** sessions keep only the knowledge-bearing parts of this by default (the
 `tdai:knowledge-tools` route, the `tdai-team-knowledge` skill and the tools); identity and memory
@@ -87,13 +146,41 @@ check would misclassify it. A separate message fixes all three at once — clean
 `source.kind === 'plugin:dsh-tdai-memory-plugin'` makes write-back drop it wholesale, and it renders
 as a collapsible "context injection" row instead of a user bubble.
 
-**Why the section orders are consecutive.** DSH sorts by `order` first and only compares `name` on
-ties. Consecutive numbers (520–523) mean other plugins can only insert *before or after* the whole
+**Why the section orders are consecutive.** DSH sorts by `order` first and only compares `name` on ties. Consecutive numbers (520–522) mean other plugins can only insert *before or after* the whole
 block, never in the middle of our content.
 
 **Why some blocks are sections and others use context/pre-step.** The criterion is *"do the bytes
 change within one session?"* Anything that changes (L1 recall) must never enter `system`: system is a
 prefix, and one change invalidates the whole upstream prefix cache. See §5.3 of the design doc.
+
+#### Cloud skills: recall on demand, no resident catalogue
+
+The earlier design kept a resident top-20 catalogue (`/v3/skill/listing`) inside the system prompt
+(`tdai:available-skills`). Measured on this machine it was **expensive** (20 owned skills with full
+descriptions = 15,300 bytes, sent on every step), **incomplete** (the agent actually owns 77 active
+skills, so top-20 covered a quarter of them) and **irrelevant** (ranking came from the agent's merged
+prompt — 7,162 chars — not from what the user just said; that un-truncated query also hit core's
+`query <= 2048` check and failed **permanently with 40001, degrading silently to an empty section**).
+
+Now each turn searches from the current conversation and injects only the hits
+(`<tdai_recalled_skills>`):
+
+| Step | How |
+| --- | --- |
+| query | last 3 **human** messages joined into a window, cut at 512 chars (host-injected runtime-context / tool messages do not count) |
+| search | `/v3/skill/search`: FTS5 over name + description + body (body truncated at 4,000 chars), Chinese through jieba segmentation |
+| floor | score must be >= `skillRecallMinScore` (default 4) |
+| cap | first `skillRecallLimit` hits (default 3) - **injected count = the first N above the floor** |
+| description | **returned in full, never truncated** (only newlines folded); bodies come from `tdai_skill_view` on demand |
+| placement | shares **one** plugin message with L1 recall, right after this turn's human message; an unchanged hit set is skipped |
+
+Both knobs live in the settings panel (the two number inputs under "cloud-skill recall") and can also
+be set through `TDAI_MEMORY_SKILL_RECALL_LIMIT` / `TDAI_MEMORY_SKILL_RECALL_MIN_SCORE` (the panel is
+live, env needs a restart). Size: 3 hits ~2.5 KB, 5 hits ~4.5 KB, zero hits 0 — **to save bytes lower
+the count, never shorten the description**: half a description forces the model to guess from the name.
+
+Child sessions do **not** recall skills by default (turn on "subagents fully inherit the read side");
+the `tdai_skill_search` / `tdai_skill_view` tools stay available in them either way.
 
 ### Why team knowledge is a skill
 
@@ -186,9 +273,9 @@ The read side is therefore split into four facets (`lib/subagent.mjs`). A child 
 
 | Facet | Child default | What it covers |
 | --- | --- | --- |
-| `identity` | off | `tdai:session-context` (agent / task identity) |
+| `identity` | off | `tdai:session-context` (`[Agent]` identity plus **`[Role]` / `[Rules]`**) and the English pointer in the persona slot |
 | `memory` | off | `tdai:profile-memory` (L3 profile + L2 index), L1 recall, `tdai:state` snapshot |
-| `skills` | off | `tdai:available-skills` (cloud skill catalogue, derived from the memory service) |
+| `skills` | off | cloud-skill **recall on demand** (per-turn `<tdai_recalled_skills>`) |
 | `knowledge` | **on** | knowledge assets, the `tdai:knowledge-tools` route, the `tdai-team-knowledge` skill and the knowledge tools |
 
 The all-or-nothing first cut broke real work: in one four-member research team every
@@ -198,7 +285,7 @@ stays on; the 10 read-only tools were never taken away.
 
 | Switch | Default | Effect inside a child session |
 | --- | --- | --- |
-| `subagentInjectionEnabled` | **off** | withhold identity + memory + the cloud skill catalogue, and skip prewarming those; **knowledge assets, the knowledge skill and all 10 read-only tools stay available** |
+| `subagentInjectionEnabled` | **off** | withhold identity + memory and skip L1 / skill recall, and skip prewarming those; **knowledge assets, the knowledge skill and all 10 read-only tools stay available** |
 | `subagentCaptureEnabled` | **off** | the child's conversation is not written back to MemoryCore |
 
 Setting `subagentInjectionEnabled` restores full inheritance (identity and memory included).
@@ -256,10 +343,13 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
 
 "Settings → TDAI Memory" page (a top-level entry in the settings navigation), switchable live:
 
-- **Read side**: read master switch, L1 auto recall (with a **per-turn recall cap**), system prompt
-  injection, and the 4 sections under it
+- **Read side**: read master switch, L1 auto recall (with a **per-turn recall cap**), **cloud-skill
+  recall** (with its own **hit cap** and **score floor** — injected count = the first N hits above
+  the floor; descriptions are returned in full, so the cost is count × description length),
+  system prompt injection, and the sections under it (session context, **Agent role /
+  rules prompt** — optionally keeping the original persona line — long-term memory, knowledge base)
 - **Write side**: conversation write-back (independent of the read side)
-- **Subagents**: whether child sessions fully inherit the read side (identity + memory) and whether
+- **Subagents**: whether child sessions fully inherit the read side (identity + memory + skill recall) and whether
   their conversations are written back (both off by default — knowledge and the 10 read-only tools
   are available in child sessions regardless)
 - **Identity & addresses**: MemoryCore endpoint, instance id, Team / Agent / User / Task id,
@@ -269,24 +359,27 @@ Switch dependencies (the card groups them and greys out anything that is current
 
 ```
 read master enabled ──┬─ L1 auto recall recallEnabled (cap recallLimit, 1–20)
+                      ├─ cloud-skill recall skillsEnabled (cap skillRecallLimit default 3
+                      │                  + score floor skillRecallMinScore default 4)
                       ├─ System prompt injection injectionEnabled
                       │    ├─ session context  sessionContextEnabled
+                      │    │    └─ Agent role / rules prompt agentPromptEnabled
+                      │    │         └─ keep the original persona line  agentPromptKeepBase
                       │    ├─ long-term memory profileMemoryEnabled
-                      │    ├─ skill list      skillsEnabled
                       │    └─ knowledge base  knowledgeEnabled
                       └─ read-only tools (no separate switch)
 
 write master captureEnabled —— independent of both enabled and injectionEnabled
 
 subagents (keyed on the child session, not on the switches above)
-  subagentInjectionEnabled —— child sessions fully inherit the read side (identity + memory)?  (default: no)
+  subagentInjectionEnabled —— child sessions fully inherit the read side (identity + memory + skill recall)?  (default: no)
                               knowledge + tools are available in child sessions either way
   subagentCaptureEnabled   —— child conversations written back?                                (default: no)
 ```
 
 Three easy traps:
 
-1. **`injectionEnabled` only governs the 4 system sections**; turning it off does **not** disable
+1. **`injectionEnabled` only governs the system sections listed above**; turning it off does **not** disable
    L1 recall.
 2. **Write-back does not depend on the read side**: with everything on the read side off, turns are
    still written back to MemoryCore (capture-only).
@@ -315,10 +408,12 @@ export TDAI_MEMORY_TASK_ID=task-xxx         # optional: session_context [Task] b
 export TDAI_MEMORY_ENABLED=true             # read master: recall + injection + tools
 export TDAI_MEMORY_CAPTURE_ENABLED=true     # write-back (write side), independent of every read switch
 export TDAI_MEMORY_RECALL_ENABLED=true      # L1 auto recall
-export TDAI_MEMORY_INJECTION_ENABLED=true   # system prompt injection master (only the 4 sections below)
+export TDAI_MEMORY_INJECTION_ENABLED=true   # system prompt injection master (only the sections below)
 export TDAI_MEMORY_SESSION_CONTEXT_ENABLED=true
+export TDAI_MEMORY_AGENT_PROMPT_ENABLED=true         # role/rules -> [Role]/[Rules] in session_context + persona pointer
+export TDAI_MEMORY_AGENT_PROMPT_KEEP_BASE=false     # true = keep the DSH persona line in the persona slot, then append the pointer
 export TDAI_MEMORY_PROFILE_MEMORY_ENABLED=true
-export TDAI_MEMORY_SKILLS_ENABLED=true
+export TDAI_MEMORY_SKILLS_ENABLED=true      # cloud-skill recall on demand (per-turn <tdai_recalled_skills>)
 export TDAI_MEMORY_KNOWLEDGE_ENABLED=false  # team knowledge injection, off by default
 
 # ── subagent (child) sessions ──
@@ -328,13 +423,15 @@ export TDAI_MEMORY_SUBAGENT_CAPTURE_ENABLED=false    # write child conversations
 # ── tuning ──
 export TDAI_MEMORY_ENDPOINT=http://127.0.0.1:8420
 export TDAI_MEMORY_RECALL_LIMIT=5           # merged top-K for L1 (1–20; also in the panel)
+export TDAI_MEMORY_SKILL_RECALL_LIMIT=3      # max skill hits injected per turn (1–10; also in the panel)
+export TDAI_MEMORY_SKILL_RECALL_MIN_SCORE=4  # score floor, below it nothing is injected; 0 disables it (also in the panel)
 export TDAI_MEMORY_L2_LIMIT=3               # number of L2 scene index entries
 export TDAI_MEMORY_TIMEOUT_MS=5000          # per-HTTP-request timeout
 export TDAI_MEMORY_KNOWLEDGE_ENDPOINT=http://127.0.0.1:8424  # rewrite the origin of knowledge service_url
 
 # ── main-loop protection (do not raise these to "the message hangs" levels) ──
 export TDAI_MEMORY_RECALL_TIMEOUT_MS=3000   # hard timeout for L1 retrieval: on timeout, skip recall for this turn
-export TDAI_MEMORY_ASSET_LOAD_BUDGET_MS=5000    # total budget for the whole asset bundle (meta+L3/L2+skill+knowledge)
+export TDAI_MEMORY_ASSET_LOAD_BUDGET_MS=5000    # total budget for the whole asset bundle (meta+L3/L2+knowledge)
 export TDAI_MEMORY_ASSET_RETRY_COOLDOWN_MS=15000 # cooldown after a failed load: no retry within it (0 = retry every step)
 ```
 

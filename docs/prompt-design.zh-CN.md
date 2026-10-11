@@ -26,6 +26,9 @@
 （`tdai_knowledge_tools` + `tdai_knowledge_call` 两个新工具 1497 B，
 另 8 个记忆工具的描述从"一句话"扩写成"何时用 / 何时不必用"，+2175 B——
 这是 §2.5 那条原则的代价：规则从 system 搬进了工具描述）。
+> **2026-10 更新**：下表是 0.5.0 当时的基线。此后 `tdai:available-skills` 常驻目录已退役
+> （改成每轮按需召回，见 §3.5），当前常驻合计为 **5,344 B**（`test/prompt-budget.test.mjs` 实测）。
+
 所以常驻总量只降了 4%，真正的收益是**结构**：
 
 - 4492 B「每轮付费、多数轮用不到」的知识配方，变成 307 B 路由 + 3587 B **按需加载**；
@@ -106,8 +109,9 @@ DSH 的 `systemPrompt.section({ name, order, text })` 注册"段"，每一步请
 **规则**：判据只有一句话——*同一会话内，这段字节会不会变？*
 
 - 不会变 → 进 system（`tdai:session-context` / `tdai:profile-memory` /
-  `tdai:available-skills` / `tdai:knowledge-tools`）。
-- 会变 → 走 runtime context（`tdai:state`）或 `agent/pre-step`（L1 召回）。
+  `tdai:knowledge-tools`）。
+- 会变 → 走 runtime context（`tdai:state`）或 `agent/pre-step`（L1 召回 + 云端 skill 召回，
+  两段共用同一条尾部消息，见 §3.5）。
 
 **为什么**：system 是前缀。把"本轮命中 3 条"这种每轮都变的量放进 system，等于**每一步都打穿
 整条前缀**；放进 `context` 通道则只在"内容真的变了"时替换一条消息，代价被限制在消息列表尾部。
@@ -118,7 +122,7 @@ DSH 的 `systemPrompt.section({ name, order, text })` 注册"段"，每一步请
 
 ### 2.2 段 order 连号 + 统一命名前缀
 
-**规则**：插件各段占 **520–523 连号**，名字统一 `tdai:` 前缀；
+**规则**：插件各段占 **520–522 连号**，名字统一 `tdai:` 前缀；
 运行时状态走 `context` 通道，用 560 与 section 明显区分。
 
 **为什么**：DSH 的排序是"先比 order，order 相同才比 name"。留间隔等于**主动邀请别人插进来**——
@@ -132,7 +136,8 @@ DSH 的 `systemPrompt.section({ name, order, text })` 注册"段"，每一步请
 ### 2.3 不重复注入宿主已经注入的内容
 
 **规则**：不再把 `agent.prompt`（persona 全文）塞进 `<session_context>`；
-skill 目录只发**补集**（云端 skill），不再复述 DSH 原生的"怎么用 skill"规则。
+云端 skill 只发**补集**（本 agent 自有的、与本轮相关的几条），不再复述 DSH 原生的"怎么用
+skill"规则 —— 而且 2026-10 起连"目录"都不常驻了，改成每轮按需召回（见 §3.5）。
 
 **为什么**：persona 已由 DSH 的 preset 作为 `deployment:persona` 段注入，再注一遍就是
 **同样几千字发两次**；skill 使用规则重复写，还会让模型在"该调 `skill` 还是 `tdai_skill_view`"
@@ -275,7 +280,7 @@ DSH 派子 agent 时，子会话是**独立的 session**，但本插件的 secti
 > | --- | --- | --- |
 > | `identity` | 关 | `tdai:session-context` |
 > | `memory` | 关 | `tdai:profile-memory`（L3/L2）、L1 召回、`tdai:state` 快照 |
-> | `skills` | 关 | `tdai:available-skills`（云端 skill 目录，由记忆服务派生） |
+> | `skills` | 关 | 云端 skill **按需召回**（每轮 `<tdai_recalled_skills>`，见 §3.5） |
 > | `knowledge` | **开** | 知识资产、`tdai:knowledge-tools` 路由、`tdai-team-knowledge` skill、知识工具 |
 >
 > 资产加载也随面收窄（`SessionAssets.ensure(sessionId, policy)`）：子会话只拉知识资源，
@@ -362,6 +367,33 @@ DSH 派子 agent 时，子会话是**独立的 session**，但本插件的 secti
 
 ---
 
+### 3.5 云端 skill：按需召回（2026-10 改版，替代常驻目录）
+
+**问题**：原来常驻 system 的 `tdai:available-skills` 目录（`/v3/skill/listing` 的 top-20 全描述）
+本机实测 15,300 B，却只覆盖 agent 名下 77 个 skill 里的 20 个，而且排序依据是 agent prompt、
+与当前这一轮无关；它依赖的 query 又没截断，撞上 core 的 `query ≤ 2048` 校验后**永久 40001、
+静默降级为空段**。贵、不全、不准，还带一个看不见的失效开关。
+
+**规则**：凡"每轮都变、且只对当前这一轮有意义"的内容，一律不进 system —— 走 `agent/pre-step`
+的尾部消息。skill 召回与 L1 召回共用同一条消息、同一个硬超时、同样 fail-open；两段各自
+fail-open（一段失败不影响另一段）。
+
+**落地**：`lib/recall.mjs`（`buildSkillQuery` / `pickSkillHits` / 注入）、
+`lib/prompts.mjs`（`renderRecalledSkills`）、`config.mjs`（`skillsEnabled` / `skillRecallLimit` /
+`skillRecallMinScore`）、`client.mjs`（`searchSkills`，query 截断到 2048）。
+**测试**：`test/recall.test.mjs`（命中 / 零命中 / 去重 / 开关 / 闸门 / 隔离失败 / query 窗口）、
+`test/prompt-budget.test.mjs`（召回块 ≤1000 B）、`test/capture-filter.test.mjs`（标记剥离）。
+
+**字节账**：常驻 skill 载荷 15,300 B → 0；命中时 **2.5–4.5 KB/轮**（描述不截断；实测 3 条
+2,541 B / 4 条 3,456 B / 5 条 4,486 B），零命中 0。**描述不截断**是用户决定：本机描述普遍
+100–900 字符，砍到 80 字符只剩半句、模型只能靠名字猜用途；要省字节请调小条数。
+
+**两个旋钮决定实际注入条数**：`skillRecallLimit`（条数上限，默认 3，1–10）与
+`skillRecallMinScore`（分数下限，默认 4，0 = 关掉）——**先过分数闸门、再取前 N 条**。
+默认 4 的依据是本机实测分带：无信息轮次（"继续"、"今天天气不错，随便聊聊"）top 分 1.9–3.6，
+真相关轮次（"RRG 日评 skill"、"这个报错怎么修"）top 分 4.1–15.4。两个旋钮都在设置面板上，
+也可用 `TDAI_MEMORY_SKILL_RECALL_LIMIT` / `TDAI_MEMORY_SKILL_RECALL_MIN_SCORE` 配置。
+
 ## 4. 潜在问题登记表
 
 > 状态口径：**已缓解** = 有闸门/测试兜住；**未解决** = 已知但不打算在本版处理；
@@ -379,7 +411,7 @@ DSH 派子 agent 时，子会话是**独立的 session**，但本插件的 secti
 | g2 | DSH 版本升级后无人复核 order 表 | 插件可能悄悄占到 DSH 保留位，或被别人的段夹在中间 | 未解决。建议把"升级 DSH 后跑一次 `node test/section-registry.test.mjs` 并比对 `SECTION_ORDERS`"写进升级流程 |
 | h | 文本哨兵兜底会切掉用户手写的同名标签 | 极少数情况下丢一句用户正文 | 已缓解（有意取舍），见 §2.8 |
 | i | 多用户共用同一 memory 实例时，注入内容天然不同 | 跨用户无法共享缓存 | 设计上如此。**能做的就是别把字面值写进 prompt**（§2.6） |
-| j | 云端 skill 目录与 DSH 原生目录并存 | 模型可能犹豫该用哪个工具取全文（`skill` vs `tdai_skill_view`） | 已缓解：本插件只发**补集**，并在文案里写明"原生 `skill` 工具读不到它们" |
+| j | 云端 skill 与 DSH 原生 skill 并存 | 模型可能犹豫该用哪个工具取全文（`skill` vs `tdai_skill_view`） | 已缓解：本插件只发**补集**（按需召回的几条），文案里写明"原生 `skill` 工具读不到它们" |
 | k | 静态身份：面板改身份后**老会话仍用旧注入缓存** | 改了没生效的错觉 | 已缓解：`/tdai-status` 显示身份来源与缺哪些字段；README 明确"新会话生效" |
 | m | **子 agent 会话继承父 agent 的记忆**（提示词噪音 + L0 污染） | 子任务被干扰；子 agent 的整段执行被后台抽取当成"关于用户的记忆"（实测 23 步子 agent → 37 条 L0） | **已缓解（默认）**：`subagentInjectionEnabled` / `subagentCaptureEnabled` 默认关；见 §3.4。实测子会话首请求的全价 token 反而从 2214 降到 797 |
 | n | 子 agent 降级**不含工具 schema** | 10 个 tdai_* 工具（≈6446 B）在子会话里仍注册 | 未解决（由 DSH 的 `dsh-tool-subagent.toolFilter` 决定，属部署级；插件单方面摘工具会让请求最前面的 tools 数组分叉，缓存代价最大） |

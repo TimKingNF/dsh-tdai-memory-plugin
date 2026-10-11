@@ -58,16 +58,72 @@ API**（host 侧 `settings.register()`，加上 client 侧 `settingsScope` 服�
 
 | 注入块 | 通道 | DSH 接口 | order | 内容 |
 | --- | --- | --- | --- | --- |
-| `tdai:session-context` | system section | 同上 | 520 | agent / task 身份（**不含 persona 全文**，那份由 preset 注入） |
+| `deployment:persona-prefix` | system section（**DSH 自己的段**） | `system-prompt/assemble` 覆盖文本 | 0 | **一句英文指引**：身份 / 角色 / 规则在下面的 `<session_context>` 里，回答时按它来（见「人格注入」） |
+| `tdai:session-context` | system section | 同上 | 520 | `<session_context>` 信封：`[Agent]`（id / name / description）+ **`[Role]`（角色定位 prompt）+ `[Rules]`（规则固定 prompt）** + `[Task]` |
 | `tdai:profile-memory` | system section | 同上 | 521 | 插件总述 + L3 画像 + L2 场景索引 + 记忆工具总纲 |
-| `tdai:available-skills` | system section | 同上 | 522 | 云端 skill **补充**目录（原生目录由 DSH 自己发） |
-| `tdai:knowledge-tools` | system section | 同上 | 523 | 团队知识资源的**一行路由**（默认关） |
+| `tdai:knowledge-tools` | system section | 同上 | 522 | 团队知识资源的**一行路由**（默认关） |
 | `tdai-team-knowledge` | DSH runtime skill | `skills.register` | — | 完整判据 + 资源清单 + 工具清单，**按需加载** |
 | `tdai:state` | runtime context | `systemPrompt.context` | 560 | 运行时状态快照，作为 **user 角色消息**进消息列表，不进 system |
 | `<tdai_recalled_l1_memories>` | pre-step | `agent/pre-step` | — | L1 召回：一条**独立**的 plugin 消息（`form: 'notice'`），紧跟本轮真人消息之后；真人消息正文一个字节都不动 |
+| `<tdai_recalled_skills>` | pre-step | `agent/pre-step`（与 L1 同一条消息） | — | 云端 skill **按需召回**：用最近几条真人消息检索，命中才注入名字 + **完整描述**（不截断）；正文用 `tdai_skill_view` 取（2026-10 前是常驻 system 的 `tdai:available-skills` 目录） |
 
-数据来源：`/v3/core/read`（L3）、`/v3/scenario/ls`（L2）、`/v3/skill/listing`（skill）、
-`/v3/knowledge/list`（knowledge）、`/v3/atomic/search`（L1 召回）、`/v3/meta/*`（agent/task 详情）。
+数据来源：`/v3/core/read`（L3）、`/v3/scenario/ls`（L2）、`/v3/knowledge/list`（knowledge）、
+`/v3/atomic/search`（L1 召回）、`/v3/skill/search`（skill 召回，含 agent 自有 skill）、
+`/v3/meta/*`（agent/task 详情）。
+
+#### 人格注入：角色 / 规则住进 `<session_context>`，persona 槽只放一句指引
+
+MemoryCore 的 agent meta 把"人格"拆成两个字段（MemoryPanel 的 Agent 编辑页里就是这两栏）：
+
+| 字段 | MemoryPanel 里的叫法 | 本机实测（`agt-ake7jmcanf`） |
+| --- | --- | --- |
+| `metadata_json.ui.role_prompt` | **角色定位 prompt** | 5784 字符 / 15500 字节 |
+| `metadata_json.ui.rules_prompt` | **规则固定 prompt** | 1376 字符 / 3588 字节 |
+
+（另一台部署上 rules 可能为空 —— 那时 `[Rules]` 标签连出现都不出现。两个字段都配了才拆成两块，
+合并长度 7162 字符，正是 `prompt` 列的长度。）
+
+服务端另有 `prompt` 列 = `[role_prompt, rules_prompt].filter(Boolean).join('\n\n')`，与
+"前端手动创建 agent"的拼接完全一致。插件以**拆分字段为准、`prompt` 兜底**（`lib/prompts.mjs`
+的 `resolveAgentPrompts`），注入后的模板（顺序即渲染顺序）：
+
+```text
+You are an AI agent powered by DeepSeek Harness.        ← DSH harness:identity
+
+Your identity, role and rules are defined in the <session_context> block below;   ← 本插件写进 persona 槽
+follow it when replying to the user.
+
+<session_context>                                        ← tdai:session-context（order 520）
+[Agent]
+id: agt-ake7jmcanf
+name: ARK-ALPHA
+description: 旧人类留下的最后一座人工智能核心
+
+[Role]
+（role_prompt 全文，逐字不截断）
+
+[Rules]
+（rules_prompt 全文；为空时连标签都不出现）
+
+[Task]                                                   ← 配了 taskId 才有
+id: …
+</session_context>
+```
+
+三条实现约束：
+
+- **persona 槽是 DSH 自己的段**（`deployment:persona-prefix`，order 0）：本插件只在
+  `system-prompt/assemble` 里改它的文本，**不注册段名** —— 与 `dsh-persona` 在 agent preset 里
+  覆盖同名段是同一个机制，但不会撞"同层重名抛错"；
+- **全段关插值**（`interpolate: false`）：这些正文都来自 MemoryCore（用户内容），出现字面
+  `{{...}}` 很正常，而 DSH 对未知变量是**抛错**、会让每一轮请求失败；关插值后按字面发出。
+  角色 / 规则正文里手写的 `</session_context>` 会被转义成 `<\/session_context>`，避免提前闭合信封；
+- **指引句只在块非空时写**：资产拉不出来（缺 userKey / meta 不可达 / 预算超时）时块是空的、
+  DSH 会把空段整个丢掉，这时写指引句等于指一个不存在的东西 —— 宁可不写，persona 回到 DSH 原样。
+
+开关链：`sessionContextEnabled` → `agentPromptEnabled`（**默认开**）→ `agentPromptKeepBase`
+（默认关 = persona 槽只放指引句；开 = 先保留 DSH 原 persona 行再接指引句）。归属**身份面**
+（子 agent 默认拿不到）；角色 / 规则住在会话上下文块里，所以**块关掉时它们与指引句一起消失**。
 
 **子 agent 会话（DSH 派出去的子会话）默认只保留其中的「知识库 + 工具」**（知识路由、
 `tdai-team-knowledge` skill 与 10 个只读工具），身份与会记忆相关的那几项不注入，见
@@ -80,7 +136,34 @@ API**（host 侧 `settings.register()`，加上 client 侧 `settingsScope` 服�
 所以召回块走独立消息：正文干净、`source.kind === 'plugin:dsh-tdai-memory-plugin'` 让回写整条丢弃、
 前端渲染成一行可折叠的"上下文注入"（不塞进用户气泡）。
 
-**段 order 为什么连号**：DSH 先比 order、order 相同才比 name。插件各段用连号（520–523），
+#### 云端 skill：按需召回，不再常驻目录
+
+早先的做法是在 system 里常驻一份 `/v3/skill/listing` 的 top-20 目录（`tdai:available-skills`）。
+它有三个毛病，实测如下：**贵** —— 20 条自有 skill 的完整描述 = 15,300 字节，每一步都随请求发送；
+**不全** —— agent 名下实际有 77 个 active skill，top-20 只覆盖四分之一；**不准** —— 排序依据是
+agent 的合并 prompt（7,162 字符），与用户这一轮说的话无关，而且这条 query 没截断，撞上 core 的
+`query ≤ 2048` 校验后**永久返回 40001、静默降级为空段**。
+
+现在改成每轮按当前对话检索、命中才注入（`<tdai_recalled_skills>`）：
+
+| 环节 | 做法 |
+| --- | --- |
+| query | 最近 3 条**真人**消息拼窗口、截 512 字符（宿主注入的 runtime-context / tool 消息不算） |
+| 检索 | `/v3/skill/search`：FTS5 索引 name + description + 正文（正文截 4000 字符），中文走 jieba 分词 |
+| 闸门 | 分数 ≥ `skillRecallMinScore`（默认 4）才进候选 |
+| 条数 | 取前 `skillRecallLimit` 条（默认 3）—— **实际注入条数 = 过闸门后的前 N 条** |
+| 描述 | **原样返回、不截断**（只把换行折叠成空格）；正文按需 `tdai_skill_view` 取 |
+| 位置 | 与 L1 召回**共用**一条 plugin 消息，插在本轮真人消息之后；命中集与上次注入相同则跳过 |
+
+两个旋钮都在设置面板上（「云端 skill 召回」下面那两个数字框），也可用 env
+`TDAI_MEMORY_SKILL_RECALL_LIMIT` / `TDAI_MEMORY_SKILL_RECALL_MIN_SCORE`（面板是实时的，
+env 要重启）。体量：命中 3 条 ≈ 2.5 KB、5 条 ≈ 4.5 KB，零命中 0 —— **想省字节就调小条数，
+不要砍描述**：描述被砍成半句之后，模型只能靠名字猜它是不是该用。
+
+子 agent 会话默认**不做** skill 召回（要给它得打开「子 agent 全量继承读侧」）；
+`tdai_skill_search` / `tdai_skill_view` 两个工具在子会话里照常可用。
+
+**段 order 为什么连号**：DSH 先比 order、order 相同才比 name。插件各段用连号（520–522），
 别人只能插在整块之前或之后，不会把 TDAI 内容切成两半。
 
 **为什么有的块进 section、有的走 context/pre-step**：判据是"同一会话内字节会不会变"。
@@ -166,7 +249,8 @@ schema 从 2774 → 6446 字节（新增 2 个知识工具 + 记忆工具描述�
 DSH 派子 agent（`subagent` / `subagent_fork` 工具）时，子会话会继承本插件注册在全局层的
 section，并且同样触发进程级的监听。不设策略时的实测后果：
 
-- 子会话的 system prompt 与父会话**逐字节相同**（13020 字节，其中我们的 4 个段占 6093 字节 = 47%），
+- 子会话的 system prompt 与父会话**逐字节相同**（当时实测 13020 字节，其中我们的 4 个段占 6093 字节 = 47%；
+  现在身份面还多带角色 / 规则（约 19KB）与 persona 槽的指引句，所以这条差值更大），
   并且会各自做一轮 L1 召回（实测 2 条、约 4.4KB）；
 - 由于 `captureEnabled` 是进程级开关，一个 23 步的调查子 agent 往 L0 写了 **37 条消息**
   （任务 prompt、整份 diff、测试原始输出、每条工具调用）——后台抽取会把这类工作噪音
@@ -177,9 +261,9 @@ section，并且同样触发进程级的监听。不设策略时的实测后果�
 
 | 能力面 | 子会话默认 | 它管什么 |
 | --- | --- | --- |
-| `identity` | 关 | `tdai:session-context`（agent / task 身份） |
+| `identity` | 关 | `tdai:session-context`（`[Agent]` 身份 + **`[Role]` / `[Rules]`**），以及 persona 槽里那句英文指引 |
 | `memory` | 关 | `tdai:profile-memory`（L3 画像 + L2 索引）、L1 召回、`tdai:state` 快照 |
-| `skills` | 关 | `tdai:available-skills`（云端 skill 目录，由记忆服务的 skill 库派生） |
+| `skills` | 关 | 云端 skill **按需召回**（每轮 `<tdai_recalled_skills>`） |
 | `knowledge` | **开** | 知识资产、`tdai:knowledge-tools` 路由、`tdai-team-knowledge` skill、知识工具 |
 
 初版是"读侧一刀切"，落地后撞了真实事故：一个四人调查团队的所有 `tdai_knowledge_call`
@@ -188,7 +272,7 @@ section，并且同样触发进程级的监听。不设策略时的实测后果�
 
 | 开关 | 默认 | 对子会话的效果 |
 | --- | --- | --- |
-| `subagentInjectionEnabled` | **关** | 不注入身份 + 记忆 + 云端 skill 目录，也不为这些面预热资产；**知识资产、知识 skill 与 10 个只读工具照常可用** |
+| `subagentInjectionEnabled` | **关** | 不注入身份 + 记忆、不做 L1 召回与 skill 召回，也不为这些面预热资产；**知识资产、知识 skill 与 10 个只读工具照常可用** |
 | `subagentCaptureEnabled` | **关** | 子会话的对话不回流 MemoryCore |
 
 打开 `subagentInjectionEnabled` = 恢复"与父会话完全一致"（含身份与记忆）。
@@ -242,9 +326,14 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
 
 「设置 → TDAI Memory」页（设置导航里的顶层一项），可即时切换：
 
-- **读侧**：读侧总开关、L1 自动召回（含**单轮召回条数上限**）、System prompt 注入，以及注入下的 4 个段
+- **读侧**：读侧总开关、L1 自动召回（含**单轮召回条数上限**）、**云端 skill 召回**
+  （含**条数上限**与**分数下限**两个数字框 —— 实际注入条数 = 过分数下限后的前 N 条；
+  描述完整返回，所以体量 = 条数 × 描述长度，想省就调小条数）、
+  System prompt 注入，以及注入下的各段（会话上下文、**Agent 角色 / 规则 prompt** ——
+  挂在会话上下文下面，可再选"保留原 persona 行"、长期记忆、知识库）；
+  上层关掉时下层在卡片上置灰并说明原因
 - **写侧**：对话回流（独立于读侧）
-- **子 agent**：子会话是否**全量继承**读侧（身份 + 记忆 + 云端 skill 目录）、是否回流（默认都关；
+- **子 agent**：子会话是否**全量继承**读侧（身份 + 记忆 + skill 召回）、是否回流（默认都关；
   知识库与 10 个只读工具在子会话里本就可用）
 - **身份与地址**：MemoryCore 地址、实例 ID、Team / Agent / User / Task ID、User Key、
   知识服务地址改写
@@ -253,10 +342,13 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
 
 ```
 读侧总开关 enabled ──┬─ L1 自动召回 recallEnabled（上限 recallLimit，1–20）
+                     ├─ 云端 skill 召回 skillsEnabled（上限 skillRecallLimit 默认 3
+                     │                  + 分数下限 skillRecallMinScore 默认 4）
                      ├─ System prompt 注入 injectionEnabled
                      │    ├─ 会话上下文 sessionContextEnabled
+                     │    │    └─ Agent 角色 / 规则 prompt agentPromptEnabled
+                     │    │         └─ 保留原 persona 行 agentPromptKeepBase
                      │    ├─ 长期记忆   profileMemoryEnabled
-                     │    ├─ Skill 列表 skillsEnabled
                      │    └─ 知识库     knowledgeEnabled
                      └─ 只读工具（无独立开关）
 
@@ -270,7 +362,7 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
 
 三个容易踩的点：
 
-1. **`injectionEnabled` 只管 system prompt 的那 4 个段**，关掉它**不影响** L1 召回；
+1. **`injectionEnabled` 只管 system prompt 里的那几个注入段**，关掉它**不影响** L1 召回；
 2. **回流不依赖读侧**：读侧全关时仍照常把对话写回 MemoryCore（capture-only）；
 3. **身份不全是读侧失效的头号原因**（`readEnabled = enabled && 身份齐全`）：卡片会在读侧那组下面点名缺哪些字段。
 
@@ -295,10 +387,12 @@ export TDAI_MEMORY_TASK_ID=task-xxx         # 可选：session_context [Task] �
 export TDAI_MEMORY_ENABLED=true             # 读侧总开关：召回 + 注入 + 工具
 export TDAI_MEMORY_CAPTURE_ENABLED=true     # 回流（写侧），独立于读侧全部开关
 export TDAI_MEMORY_RECALL_ENABLED=true      # L1 自动召回
-export TDAI_MEMORY_INJECTION_ENABLED=true   # system prompt 注入总闸（只管下面 4 个段）
+export TDAI_MEMORY_INJECTION_ENABLED=true   # system prompt 注入总闸（只管下面那几个段）
 export TDAI_MEMORY_SESSION_CONTEXT_ENABLED=true
+export TDAI_MEMORY_AGENT_PROMPT_ENABLED=true        # 角色/规则 → session_context 的 [Role]/[Rules] + persona 槽指引句
+export TDAI_MEMORY_AGENT_PROMPT_KEEP_BASE=false     # true = persona 槽先保留 DSH 原 persona 行，再接指引句
 export TDAI_MEMORY_PROFILE_MEMORY_ENABLED=true
-export TDAI_MEMORY_SKILLS_ENABLED=true
+export TDAI_MEMORY_SKILLS_ENABLED=true      # 云端 skill 按需召回（每轮 <tdai_recalled_skills>）
 export TDAI_MEMORY_KNOWLEDGE_ENABLED=false  # 团队知识资源注入，默认关
 
 # ── 子 agent（子会话）──
@@ -308,13 +402,15 @@ export TDAI_MEMORY_SUBAGENT_CAPTURE_ENABLED=false    # 子会话是否回流（�
 # ── 调参 ──
 export TDAI_MEMORY_ENDPOINT=http://127.0.0.1:8420
 export TDAI_MEMORY_RECALL_LIMIT=5           # L1 合并 top-K（1–20，面板里也可改）
+export TDAI_MEMORY_SKILL_RECALL_LIMIT=3      # 每轮最多注入几条 skill 命中（1–10；面板里也可改）
+export TDAI_MEMORY_SKILL_RECALL_MIN_SCORE=4  # 分数下限，低于它不注入；0 = 关掉闸门（面板里也可改）
 export TDAI_MEMORY_L2_LIMIT=3               # L2 场景索引条数
 export TDAI_MEMORY_TIMEOUT_MS=5000          # 单个 HTTP 请求超时
 export TDAI_MEMORY_KNOWLEDGE_ENDPOINT=http://127.0.0.1:8424  # 改写知识服务 service_url 的 origin
 
 # ── 主链路保护（别调大到"发消息会一直等"的程度）──
 export TDAI_MEMORY_RECALL_TIMEOUT_MS=3000   # L1 检索硬超时：超时即放弃本轮召回
-export TDAI_MEMORY_ASSET_LOAD_BUDGET_MS=5000  # 整包资产（meta+L3/L2+skill+knowledge）加载总预算
+export TDAI_MEMORY_ASSET_LOAD_BUDGET_MS=5000  # 整包资产（meta+L3/L2+knowledge）加载总预算
 export TDAI_MEMORY_ASSET_RETRY_COOLDOWN_MS=15000  # 加载失败后的冷却期：期内不重试（0=每次重试）
 ```
 

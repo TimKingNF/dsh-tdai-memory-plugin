@@ -70,7 +70,7 @@ export function apply(ctx, config = {}) {
    * 更新，**不会重新 apply 插件**），非 volatile 字段是部署期普通值。所以：
    *   - 每次都重新 `resolveConfig()` → 面板改完立刻生效（见 config.mjs 的 liveValue）；
    *   - `client` / `assets` 构造时抓的是**快照**，因此按配置签名比对，变了就整体重建
-   *     （顺带丢弃会话资产缓存 —— 资产内容本身就依赖 skillsEnabled / knowledgeEnabled 这些开关，
+   *     （顺带丢弃会话资产缓存 —— 资产内容本身就依赖 sessionContextEnabled / knowledgeEnabled 这些开关，
    *     改动后本来就该失效）。
    */
   let built
@@ -94,7 +94,7 @@ export function apply(ctx, config = {}) {
     get config() { return live().cfg },
     log,
     readEnabled() { const cfg = live().cfg; return cfg.enabled && identityComplete(cfg) },
-    /** 该会话的读侧能力面（身份 / 记忆 / 云端 skill 目录 / 知识，见 lib/subagent.mjs）。 */
+    /** 该会话的读侧能力面（身份 / 记忆 / 云端 skill 召回 / 知识，见 lib/subagent.mjs）。 */
     readPolicyFor(session) { return subagentReadPolicy(live().cfg, session) },
     /** 这个会话是不是 DSH 派出去的子 agent 会话（/tdai-status 用它解释"为什么没注入"）。 */
     isSubagent(session) { return isSubagentSession(session) },
@@ -154,13 +154,14 @@ export function apply(ctx, config = {}) {
     const sessionId = session?.id
     if (!sessionId || !runtime.readEnabled()) return
     // 子 agent 会话按策略降级时**只预热它真会用到的那几面**：子会话默认只有知识面，
-    // 就不再为一份用不到的画像 / skill listing 打网关（并发扇出 N 个子 agent 就是 N 份）。
+    // 就不再为一份用不到的画像打网关（并发扇出 N 个子 agent 就是 N 份）。
     // 见 lib/subagent.mjs 的能力面表。
+    //
+    // 云端 skill 召回**不在预热范围内**：它每轮直接查 core，不依赖会话资产（2026-10 改版）。
     const cfg = runtime.config
     const policy = subagentReadPolicy(cfg, session)
     const needsAssets = (policy.identity && cfg.injectionEnabled && cfg.sessionContextEnabled)
       || (policy.memory && ((cfg.injectionEnabled && cfg.profileMemoryEnabled) || cfg.recallEnabled))
-      || (policy.skills && cfg.injectionEnabled && cfg.skillsEnabled)
       || (policy.knowledge && cfg.knowledgeEnabled)
     if (!needsAssets) return
     // 后台预热，不 await：会话刚建立时把整包资产拉起来，

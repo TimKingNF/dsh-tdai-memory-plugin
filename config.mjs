@@ -7,18 +7,25 @@
  *                       false 时这三类全部关闭（还要叠加 identityComplete）
  *     ├─ recallEnabled  L1 自动召回（agent/pre-step 注入 <tdai_recalled_l1_memories>）
  *     │    └─ recallLimit  自有 + 借入合并后的条数上限
- *     └─ injectionEnabled  system prompt 注入总闸，只管下面 4 个注入段，
- *                          不影响 L1 召回
+ *     ├─ skillsEnabled  云端 skill **按需召回**（agent/pre-step 注入
+ *     │                 <tdai_recalled_skills>，与本轮问题一起检索、命中才注入）。
+ *     │                 2026-10 改版：不再在 system 里常驻 skill 目录（见 CHANGELOG）。
+ *     │    ├─ skillRecallLimit     每轮最多注入几条命中
+ *     │    └─ skillRecallMinScore  分数闸门，0 = 不设阈值（交给 core 的 BM25 判定）
+ *     └─ injectionEnabled  system prompt 注入总闸，只管下面的注入段，
+ *                          不影响 L1 召回与 skill 召回（两者都在消息尾部）
  *          ├─ sessionContextEnabled
+ *          │    └─ agentPromptEnabled     TDAI agent 的角色 / 规则 prompt（写进该块的
+ *          │         │                    [Role] / [Rules]）+ persona 槽的英文指引句
+ *          │         └─ agentPromptKeepBase  persona 槽要不要保留 DSH 原 persona 行
  *          ├─ profileMemoryEnabled
- *          ├─ skillsEnabled
  *          └─ knowledgeEnabled
  *
  *   captureEnabled     回流（写侧）**完全独立**：既不受 enabled 约束，也不受
  *                      injectionEnabled 约束（lib/capture.mjs 只判它自己），默认开
  *
  *   subagentInjectionEnabled  子 agent 会话是否**全量继承**读侧（身份 + 记忆 + 云端 skill
- *                             目录）。**默认关**：子会话不注入身份（session_context）与
+ *                             召回）。**默认关**：子会话不注入身份（session_context）与
  *                             记忆（画像 / L1 召回 / 状态快照），也不为这些面预热资产；
  *                             但**团队知识库与 10 个只读工具照常可用**（知识面另受全局
  *                             knowledgeEnabled 约束，能力面定义见 lib/subagent.mjs）。
@@ -82,13 +89,65 @@ export function resolveConfig(config = {}) {
     recallEnabled: boolOpt(config.recallEnabled, true),
     injectionEnabled: boolOpt(config.injectionEnabled, true),
     sessionContextEnabled: boolOpt(config.sessionContextEnabled, true),
+
+    /**
+     * TDAI agent 自己的「角色定位 prompt + 规则固定 prompt」（MemoryCore 的 agent meta）。
+     *
+     * 这两个 prompt 存在 `metadata_json.ui.role_prompt` / `ui.rules_prompt` 里，
+     * 服务端另把二者按 `[role, rules].filter(Boolean).join('\n\n')` 合并进 `prompt` 字段
+     * （拆分口径见 MemoryCore `src/metadata/service/metadata-service.ts` 与 MemoryPanel
+     * `AgentEditDialog.tsx`；合并后的 `prompt` 才是"运行时完整文本"）。
+     * 注入方式（2026-10 改版，模板经用户确认）：
+     *   - `[Role]` / `[Rules]` 两段正文写进 `<session_context>`（跟在 `[Agent]` 后面，
+     *     见 lib/prompts.mjs 的 renderSessionContext）；
+     *   - persona 槽（`deployment:persona-prefix`，order 0）只放**一句英文指引**
+     *     （`SESSION_CONTEXT_POINTER`），告诉模型身份 / 角色 / 规则在下面的块里、回答时按它来。
+     *
+     * 归属**身份面**（policy.identity）；因为两段正文本就住在会话上下文块里，
+     * 所以它**挂在 `sessionContextEnabled` 之下**（块关掉 → 标签与指引句一起消失）。
+     */
+    agentPromptEnabled: boolOpt(config.agentPromptEnabled, true),
+    /**
+     * persona 槽要不要保留 DSH 原来那句 persona（默认**关** = 替换）。
+     *
+     * 打开时：`<原 personaPrefix>\n\n<英文指引句>`；关闭时：槽里只有英文指引句。
+     * 保留时**不能**关该段的插值（原句里的 `{{model}}` / `{{cwd}}` 还要展开），见 lib/sections.mjs。
+     */
+    agentPromptKeepBase: boolOpt(config.agentPromptKeepBase, false),
+
     profileMemoryEnabled: boolOpt(config.profileMemoryEnabled, true),
+    /**
+     * 云端 skill **按需召回**（2026-10 改版）：每轮用"最近几条真人消息"检索一次
+     * agent 名下的云端 skill，命中才渲染成 `<tdai_recalled_skills>` 注入（消息尾部，
+     * 与 L1 召回同一条 plugin 消息）。
+     *
+     * 为什么不再常驻目录：`/v3/skill/listing` 的 top-20 全量目录在本机实测 15.3 KB，
+     * 却只覆盖 77 个自有 skill 里的 20 个，而且排序依据是 agent prompt、与当前这一轮
+     * 说的话无关 —— 贵、不全、不准。改按需召回后常驻字节为 0，命中时约 0.3–0.5 KB。
+     */
     skillsEnabled: boolOpt(config.skillsEnabled, true),
+    /** 每轮最多注入几条 skill 命中（1–10）。 */
+    skillRecallLimit: numOpt(config.skillRecallLimit, 3),
+    /**
+     * 分数闸门：低于它的命中丢弃。
+     *
+     * 默认 **4**，来自本机实测的分带（同一个 agent 的 77 条自有 skill）：
+     *   - 无信息轮次（"继续"、"今天天气不错，随便聊聊"）的 top 分落在 1.9–3.6；
+     *   - 真相关轮次（"帮我按 RRG 日评 skill 跑一遍今天的板块"、"这个报错怎么修"）
+     *     的 top 分落在 4.1–15.4（前者命中 rrg-*，后者命中 dsh-cordis-patch-config-reload 等）。
+     * 默认取 **4**：它拦得住"继续"（1.9–2.7）与"今天天气不错，随便聊聊"（3.4–3.6）这类
+     * 无信息轮次，同时保留真相关轮次（最低一条实测 4.14）。显式设 **0** 可关掉闸门
+     * （完全交给 core 的 BM25），设 3 则放宽一档（代价是闲聊轮次也会注入 3 条不相关候选）。
+     *
+     * 与 `skillRecallLimit` 的关系：**先过闸门、再取前 N 条**，两者共同决定真正的注入条数
+     * （见 lib/recall.mjs 的 pickSkillHits）。
+     */
+    skillRecallMinScore: numOptZero(config.skillRecallMinScore, 4),
     knowledgeEnabled: boolOpt(config.knowledgeEnabled, false),
 
     /**
      * 子 agent 会话的策略开关（见 lib/subagent.mjs 顶部的能力面表）。
-     * 默认都是 false：子会话只保留**知识面与工具**，不继承身份 / 记忆 / 云端 skill 目录，
+     * 默认都是 false：子会话只保留**知识面与工具**，不继承身份 / 记忆 / 云端 skill 召回，
      * 中间过程也不进长期记忆。要恢复"子会话与父会话完全一致"，把第一个打开即可。
      */
     subagentInjectionEnabled: boolOpt(config.subagentInjectionEnabled, false),

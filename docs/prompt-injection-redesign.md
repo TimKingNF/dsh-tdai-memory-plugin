@@ -321,9 +321,39 @@ agent/pre-step（dsh-agent-loop/lib/index.js:506）
 
 **占 500–599 这一段。** 理由：
 
-- `deployment:persona` 在 0，`plan:policy` 在 500，`team:policy` 在 600（`dsh-system-prompt/lib/index.js:10-40`）。
+- `deployment:persona-prefix` 在 0、`deployment:persona-suffix` 在 10200，
+  `plan:policy` 在 500，`team:policy` 在 600（`dsh-system-prompt/lib/index.js:10-40`）。
 - 500–599 这一段在 DSH 里**没有其他所有者**，语义上正好是"agent 的会话上下文"，放记忆资产合适。
 - 改造前插件用的是 610–640，落在 `team:policy(600)` 和 `tools:ptc-only(800)` 之间——那段是**策略类插件**（plan-mode、agent-teams 之类）的区，属于占错位。
+
+> **2026-10 更正（阶段 2 的一条假设被实测推翻；最终模板经用户确认）。** 阶段 2 把 `agent.prompt`
+> 从 `<session_context>` 里删掉，理由写的是"agent 的 persona 已由 preset 的 `deployment:persona`
+> 段注入（`dsh-agent-presets/presets/cordis/agent.cordis.yml:17-30`），全文再注一遍是同内容两遍"。
+> 实测（本机 web profile）这条对 **DSH preset 的 persona** 成立、对 **TDAI 的 agent prompt 不成立**：
+> preset 的 `personaPrefix` 只有一句 `You are a coding agent powered by the {{model}} model.`，
+> 而 MemoryCore 里那份 7162 字符的角色 / 规则 prompt（`metadata_json.ui.role_prompt` /
+> `ui.rules_prompt`）**没有任何通道进入模型上下文** —— 既没被 preset 注，也没被本插件注。
+>
+> 最终形态（不是"塞回 session_context"去跟 preset 的内容重复，而是分工）：
+>
+> 1. **角色 / 规则住进 `tdai:session-context`**，带 `[Role]` / `[Rules]` 标签跟在 `[Agent]` 之后，
+>    再往后是 `[Task]`；空字段连标签都不出现。正文逐字注入、不截断。
+> 2. **persona 槽（`deployment:persona-prefix`，order 0）只放一句英文指引**：
+>    `Your identity, role and rules are defined in the <session_context> block below; follow it when replying to the user.`
+>    —— 它负责把模型的注意力从"默认 coding agent"扭到块里的身份上，本身不承载人格内容。
+> 3. **改动仍在 `system-prompt/assemble` 之后发生**，不注册段名 —— `section()` 同层重名会抛
+>    （`dsh-system-prompt/lib/index.js:191-193`），覆盖现成段文本才是与 `dsh-persona` 对齐的姿势。
+>
+> 三条必须记住的约束：
+>
+> 1. **本插件注入的每一段都标 `interpolate: false`**：这些正文全部来自 MemoryCore（用户内容），
+>    出现字面 `{{...}}` 很正常，而 DSH 对未知变量是抛错（`:160-170`，"宁可直接失败也不要发出一份
+>    坏 prompt"）；关插值的段按字面发出（`:113-114`）。**例外**：保留 DSH 原 persona 行
+>    （`agentPromptKeepBase=true`）时不关该段插值，因为原行里的 `{{model}}` / `{{cwd}}` 还要展开。
+> 2. **指引句只在块非空时写**：资产拉不出来时块是空的、DSH 会把空段整个丢掉（`renderPrompt` 过滤
+>    空文本），写了就是指向一个不存在的东西 —— 这时宁可不写，persona 保持 DSH 原样。
+> 3. **角色 / 规则正文里的 `</session_context>` 会被转义**成 `<\/session_context>`，
+>    防止用户内容提前闭合信封（也会把下游按哨兵剥离的逻辑切错）。
 
 **order 必须连号（520/521/522/523），不要留大间隔。** 依据你第 2 条决定：
 
@@ -346,6 +376,16 @@ DSH 的排序是"先比 order，order 相同才比 name"（`dsh-system-prompt/li
 | `tdai:profile-memory` | 521 | L3 persona + L2 场景索引 + 工具用法总纲 + 插件总述 | 是 |
 | `tdai:available-skills` | 522 | 云端 skill 补充目录 | 是 |
 | `tdai:knowledge-tools` | 523 | wiki / code-graph 指引 | 是 |
+
+> **2026-10 更正：新增两个注入点，其中一个不是我们的段。**
+> （a）`tdai:session-context` 的内容扩了：除 `[Agent]` 身份小块外，现在**带标签**写入 MemoryCore
+> 里该 agent 的「角色定位 prompt（`metadata_json.ui.role_prompt`）」`[Role]` 与「规则固定 prompt
+> （`ui.rules_prompt`）」`[Rules]`；顺序是 `[Agent]` → `[Role]` → `[Rules]` → `[Task]`，空的字段
+> 连标签都不出现。
+> （b）**覆盖** DSH 自己的 `deployment:persona-prefix`（order 0）段文本：只放一句英文指引
+> （身份 / 角色 / 规则在下面的 `<session_context>` 里、回答时按它来），开关 `agentPromptEnabled`
+> 默认开。因为只改文本、不注册段名，上面这张"插件自己的段名表"与 520–523 连号的前提都不变
+> （理由、fail-open 细节与模板见 §5.1 的更正）。
 
 **`tdai:overview` 不再单独存在**（依据你第 4 条决定）。那段"TencentDB Agent Memory 已接入……"的静态说明并入 `tdai:profile-memory` 的开头——它和 profile-memory 讲的是同一件事（"你有哪些记忆能力、怎么用"），分成两段只是把一个话题拆开写。合并后：
 
@@ -389,6 +429,13 @@ DSH 的排序是"先比 order，order 相同才比 name"（`dsh-system-prompt/li
 - 无论哪种，给召回块加一个**字符预算上限**（现在只有条数上限 `recallLimit`）。
 
 ### 5.4 规则四：目录类内容只发一次
+
+> **2026-10 后记**：本节做出的"补集目录"结论后来又被推翻 —— 那份 `tdai:available-skills`
+> 目录本身从 system 里退场，改成**每轮按需召回**（`<tdai_recalled_skills>`）。
+> 依据：常驻目录本机实测 15,300 B 却只覆盖 77 个自有 skill 里的 20 个、排序与当前对话无关，
+> 且其 query 撞上 core 的 2048 上限后永久静默失败。现行设计见
+> [docs/prompt-design.zh-CN.md](prompt-design.zh-CN.md) §3.5 与 CHANGELOG「Unreleased」。
+> 本节以下内容保留为当时的决策记录。
 
 DSH 的 skill 目录由 `dsh-tool-skill` 独占发布（`dsh-tool-skill/lib/index.js:203-236`），带摘要去重。
 
@@ -531,7 +578,7 @@ print(c)   # 期望：不含 user/message
 
 | 文件 | 改动 | 依据 |
 | --- | --- | --- |
-| `PLUGIN/lib/prompts.mjs:9-35` | `renderSessionContext` 去掉 `prompt:` 段 | agent 的 persona 已由 preset 注入（`dsh-agent-presets/presets/cordis/agent.cordis.yml:17-30`），全文再注一遍是同内容两遍 |
+| `PLUGIN/lib/prompts.mjs:9-35` | `renderSessionContext` 去掉 `prompt:` 段 | agent 的 persona 已由 preset 注入（`dsh-agent-presets/presets/cordis/agent.cordis.yml:17-30`），全文再注一遍是同内容两遍 —— ⚠️ **2026-10 更正**：preset 只给一句通用 persona，TDAI 的角色 / 规则 prompt 当时实际断链；现改为 `[Role]` / `[Rules]` 带标签进 `<session_context>`、persona 槽只放英文指引句（见 §5.1 更正） |
 | `PLUGIN/lib/prompts.mjs:42-79` | `MEMORY_TOOLS_GUIDE` 瘦身到 3–5 行 | §5.5（你已确认可接受） |
 | `PLUGIN/lib/prompts.mjs:133-148` | `SKILL_LISTING_HEADER/FOOTER` 重写为补集语义 | §5.4 |
 | `PLUGIN/lib/tools.mjs:46-147` | 8 个工具的 `description` 补齐"何时必须调用 / 何时不必" | 承接上一条删掉的规则 |

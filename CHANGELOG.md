@@ -14,6 +14,126 @@
 
 ## [Unreleased]
 
+### 变更：云端 skill 从「常驻目录」改成「每轮按需召回」
+
+原来每轮请求的 system 里常驻一份 `/v3/skill/listing` 的 top-20 目录（`tdai:available-skills` 段）。
+它有三个毛病，实测数据如下：
+
+- **贵**：本机 20 条自有 skill 的完整描述 = **15,300 字节**（占当时常驻注入的绝大部分），
+  而且是每一步都随请求发送（缓存命中也要占上下文窗口）；
+- **不全**：本机 agent 名下实际有 **77 个** active skill（`/v3/skill/list` 实测 `total=77`），
+  top-20 只覆盖四分之一；
+- **不准**：它的检索 query 是 agent 的**合并 prompt**（本机 7,162 字符），跟用户这一轮说的话无关；
+  而且这条 query 没截断，撞上 core 的 `query ≤ 2048` 校验，**永久返回 `code=40001`、静默降级为空段**
+  （连状态快照都只是老老实实写着"云端 Skill（未加载）"，没人看）。
+
+替代方案：**每轮按当前对话检索、命中才注入**。
+
+- query：**最近 3 条真人消息**拼窗口、截 512 字符（只取最后一条会死在"继续"这类无信息轮次；
+  不掺 agent prompt，那是把 query 冲淡成宏观文本的老毛病）；
+- 检索：`/v3/skill/search`（FTS5 索引 `name` + `description` + 正文截断 4000 字符，中文走 jieba
+  `cutForSearch` 分词；实测"睡眠体检"这类连写也能命中）；
+- 注入：默认 top-3（面板可调，1–10），渲染成 `<tdai_recalled_skills>`，与 L1 召回**共用一条
+  plugin 消息**（同一条尾部消息、同一个硬超时、同样 fail-open）；**描述原样返回、不截断** ——
+  只折叠空白（换行→空格），因为本机描述普遍 100–900 字符，砍到 80 字符只剩半句、
+  模型只能靠名字猜用途；正文仍按需 `tdai_skill_view` 取；
+- 去重：同一会话内命中集与"上一次注入"完全相同则跳过，不往历史里堆重复块；
+- 两段召回**各自 fail-open**：skill 检索抛错不影响同一条消息里的 L1 块。
+
+**字节账**（`test/prompt-budget.test.mjs` 实测）：
+
+| | 改造前 | 改造后 |
+| --- | --- | --- |
+| system 常驻（示例规模） | 5,768 B（含 skill 目录段 424 B） | **5,344 B** |
+| skill 相关载荷 | 真实目录 **15,300 B**（本机全量描述，每步） | 命中时 2.5–4.5 KB（实测：3 条 2,541 B / 4 条 3,456 B / 5 条 4,486 B），零命中 0 |
+| 覆盖 | 20 / 77 | 按需检索全库（77 条自有 + 团队共享） |
+
+删除的部件（少一个部件就少一类静默失效）：
+
+- `tdai:available-skills` system 段（order 522 释放；`tdai:knowledge-tools` 从 523 收成 522 保持连号）；
+- `client.skillListing()`、`lib/assets.mjs` 的 skills 面（资产加载少一轮 HTTP）、
+  `lib/prompts.mjs` 的 `renderSkillsBlock` / `wrapAvailableSkillsBlock` / `buildListingQuery`；
+- 那条 `40001` 路径整体退役（**新路径复用已经截断到 2048 的 `searchSkills`**）。
+
+配套：
+
+- **开关与旋钮**：复用 `skillsEnabled`，语义收窄为「云端 skill 召回」，卡片上移到读侧（挂在读侧总开关
+  下，**不受「System prompt 注入」总闸约束** —— 它与 L1 召回一样走消息尾部）；紧跟两个数字输入
+  **`skillRecallLimit`（条数上限，默认 3，1–10）** 与 **`skillRecallMinScore`（分数下限，默认 4，
+  0 = 关掉闸门）**——**实际注入条数 = 过分数闸门后的前 N 条**，两个旋钮共同决定；
+  描述不截断后这块的体量就是"条数 × 描述长度"，**想省就调小条数，不要砍描述**；
+  同样可用 env 配置（`TDAI_MEMORY_SKILL_RECALL_LIMIT` / `TDAI_MEMORY_SKILL_RECALL_MIN_SCORE`）。
+  默认 4 的依据是本机实测分带：无信息轮次（"继续"、"今天天气不错，随便聊聊"）top 分 1.9–3.6，
+  真相关轮次（"RRG 日评 skill"、"这个报错怎么修"）4.1–15.4 —— 闸门落在 3.6 与 4.1 之间；
+- **工具描述改准**：`tdai_skill_search` 原来写"检索本会话目录**之外**的 skill" —— 目录没了以后这句话
+  会让模型以为自有 skill 已可见、反而不检索；`tdai_skill_view` 的 `skill_name` 来源同步改成
+  `<tdai_recalled_skills>` / 检索结果；
+- **状态快照 / `/tdai-status`**：`云端 Skill 未加载` 改为 `云端 skill 召回=开/关（上限 N 条）`；
+- **测试**：`test/recall.test.mjs` 新增 7 组用例（命中注入 / 零命中不注入 / 同集合去重 / 开关 /
+  分数闸门 / skill 失败不影响 L1 / query 窗口只收真人消息）；`test/subagent.test.mjs` 断言子会话
+  一次 skill 检索都不发；`test/prompt-budget.test.mjs` 给召回块加 1000 B 硬上界；
+  `test/capture-filter.test.mjs` 的标记清单纳入 `<tdai_recalled_skills>`。
+
+**待观测**（留给真实使用验证，不在这里下结论）：每轮命中率、命中后真的调 `tdai_skill_view` 的转化率、
+以及零命中轮次里"本该有 skill"的比例。
+
+### 新增：TDAI agent 的「角色定位 prompt + 规则固定 prompt」注入
+
+起因：更早一轮改造把 `agent.prompt` 从 `tdai:session-context` 里删掉，理由是"persona 已由 DSH preset
+的 `deployment:persona` 段注入"。实测这条假设对 TDAI 的 agent prompt **不成立** —— 本机 profile
+的 preset persona 只有一句 `You are a coding agent powered by the {{model}} model.`
+（`cordis.yml` 的 `personaPrefix`），MemoryCore 里那份 7162 字符的 ARK-ALPHA 角色 / 规则定义
+**没有任何通道进入模型上下文**。
+
+- **字段口径**（本插件自己确定，来源是 MemoryCore 本体）：人格拆在两个字段里 ——
+  `metadata_json.ui.role_prompt`（MemoryPanel 的「角色定位 prompt」）与
+  `metadata_json.ui.rules_prompt`（「规则固定 prompt」）；服务端另把二者按
+  `[role, rules].filter(Boolean).join('\n\n')` 合并进 `prompt` 列。
+  依据：`MemoryCore/src/metadata/service/metadata-service.ts:104-117`、
+  `MemoryPanel/web/src/components/team/AgentEditDialog.tsx:184-193`、
+  `MemoryPanel/web/src/i18n/zh-CN.ts:844,847`。本机实测：`role_prompt` 7162 字符 / 19090 字节，
+  `rules_prompt` 空，`prompt` == 合并结果（逐字节相同）。
+- `lib/prompts.mjs` 新增 `resolveAgentPrompts(agentRaw)`：**以拆分字段为准、`prompt` 兜底**
+  （兜底时整段算 role），坏 JSON / 空值不抛；`resolveAgentPrompt()` 保留为合并视图，
+  只给状态快照 / `/tdai-status` / 预算观测用。
+- **注入位置（prompt 模板先经用户确认）**：角色 / 规则**住进 `<session_context>`**，
+  按 `[Agent]`（id / name / description）→ `[Role]` → `[Rules]` → `[Task]` 的顺序带标签注入
+  （空的那个字段连标签都不出现）；persona 槽（`deployment:persona-prefix`，order 0）只放一句
+  英文指引：
+
+  > Your identity, role and rules are defined in the <session_context> block below; follow it when replying to the user.
+
+  实测渲染顺序：`harness:identity` → persona 槽（指引句）→ `tdai:session-context`（信封 + 三段）。
+- `lib/sections.mjs`：persona 槽文本改为指引句（**替换** DSH 部署 / preset 的 persona，与
+  `dsh-persona` 覆盖同一段名是同一个机制，区别是本插件改在 `system-prompt/assemble` 之后，
+  不在注册表里抢段名）；该段标 `interpolate: false`。指引句只在**块非空**且开关链全开时写 ——
+  资产拉不出来时块是空的、DSH 会把空段整个丢掉，这时写指引句等于指一个不存在的东西，
+  宁可不写（persona 保持 DSH 原样，fail-open）。
+- **⭐ 全段关插值**：`tdai:session-context` / `tdai:profile-memory` / `tdai:available-skills` /
+  `tdai:knowledge-tools` 注入时一律带 `interpolate: false`。这些段的正文全部来自 MemoryCore
+  （画像、场景索引、skill 目录、知识资源、agent 的 role / rules）即**用户内容**，出现字面
+  `{{...}}` 完全可能；DSH 对未知变量是抛错（`dsh-system-prompt/lib/index.js:160-170`），
+  一个手写的 `{{foo}}` 就能让每轮请求都失败。关插值后按字面发出（同 `:113-114`），
+  而这些文本本来也不使用 DSH 变量（`{{model}}` / `{{cwd}}` 只在 persona 段）。
+- `lib/prompts.mjs` 的角色 / 规则正文会**中和 `</session_context>`**（转义成 `<\/session_context>`）：
+  正文里手写闭合标签会提前闭合信封，也会把下游按哨兵剥离的逻辑切错。
+- `lib/assets.mjs`：`agentDetail` 增加 `rolePrompt` / `rulesPrompt`（正文）与 `agentPrompt`（合并视图）；
+  `needAgentDetail` 的判据改为 `policy.identity && cfg.sessionContextEnabled && cfg.agentPromptEnabled`。
+- 「人格没生效」看两处：`/tdai-status`（`lib/commands.mjs`）报角色 / 规则 prompt 各多少字符，
+  `tdai:state` 快照（`lib/sections.mjs`）只报**是否装载**；两者都不打印正文。
+- **开关**：`agentPromptEnabled`（默认**开**）、`agentPromptKeepBase`（默认关 = persona 槽只放指引句；
+  开 = 先保留 DSH 原 persona 行再接指引句）。归属**身份面**（子 agent 默认拿不到），并**挂在
+  `sessionContextEnabled` 之下**（角色 / 规则住在那个块里，块关掉 → 标签与指引句一起消失），
+  设置卡片上按同样层级置灰。两键进入 `Config` schema 与 `cordis.patch.yml` 的 env 透传
+  （`TDAI_MEMORY_AGENT_PROMPT_ENABLED` / `TDAI_MEMORY_AGENT_PROMPT_KEEP_BASE`）。
+- **测试**：`test/smoke.test.mjs` 覆盖 `resolveAgentPrompts` 拆分 / 兜底 / 空值与
+  `renderSessionContext` 的标签顺序、`includePrompts=false`、闭合标签转义；
+  `test/sections.test.mjs` 覆盖"指引句替换 / 保留原行 / 关开关不动 / 会话上下文关掉时一起消失 /
+  资产不可用时不写指引句 / 正文带 `{{}}` 与伪造闭合标签 / 子会话不继承"；
+  `test/settings-card-render.test.mjs` 覆盖新的多级依赖置灰矩阵。
+- **文档**：README / README_CN 的「人格注入」小节按确认后的模板重写，
+  `docs/prompt-injection-redesign.md` 就地更正阶段 2"persona 由 preset 注入"这条假设。
+
 **子 agent 策略从"读侧一刀切降级"改为"能力面拆分"；知识端点加 1 次重试。** 起因是一次真实事故：
 四人调查团队的子 agent 全部被策略闸门挡在知识库之外（`tdai_knowledge_call` 直接返回
 "本会话是子 agent 会话，读侧已按子 agent 策略降级"），wiki 原文只能由父会话逐页投喂。
@@ -249,7 +369,6 @@ system 段注入从 **9953 → 5768 字节（-42%）**，其中团队知识块�
 这一版还补上了**子 agent 会话的降级**（默认不继承注入、不回流，见
 [修复 10](#10-子-agent-会话把父-agent-的记忆整套继承并把执行过程写进长期记忆)）：
 子 agent 的任务通常范围明确，父 agent 的画像与召回是干扰，而它的执行过程更不该进长期记忆。
-这一项与其它修复一样做了真机验证，数据见 [现场验证](#现场验证真实环境2026-09-16)。
 
 ### 修复
 
@@ -280,7 +399,6 @@ system 段注入从 **9953 → 5768 字节（-42%）**，其中团队知识块�
   把第二个形参删掉。
 - **测试**：`test/knowledge-tools.test.mjs`（用例 7「会话解析」）、
   `test/load.test.mjs`。
-- **现场验证**：修好后重启 dsh 复跑 code-graph 召回，失败态命中 0 次。
 
 #### 3. "一开召回，发消息就一直阻塞等待"（网关卡死时整轮被拖住）
 
@@ -362,7 +480,6 @@ system 段注入从 **9953 → 5768 字节（-42%）**，其中团队知识块�
     `code=0`，只把错误放在 `isError` 里——不判就会把失败当成功结果喂给模型）。
 - **测试**：`test/assets-budget.test.mjs`（知识地址改写）、
   `test/knowledge-tools.test.mjs`（参数透传 / `isError` 语义 / fail-open）。
-- **现场验证**：修好后复跑 code-graph 召回，失败态命中 0 次。
 
 #### 8. 知识 skill 静默丢失（cordis 服务获取姿势错误）
 
@@ -515,57 +632,17 @@ system 段注入从 **9953 → 5768 字节（-42%）**，其中团队知识块�
 | `test/subagent.test.mjs` | 子会话判定、system 不注入、L1 不召回、不预热资产、不回流、知识工具可解释；**每个用例成对断言父会话照旧** | 回归护栏 |
 | `test/prompt-budget.test.mjs` | 各注入块字节数硬上界（`tdai:knowledge-tools` ≤ 600 等）+ 软基线不增长 | 契约 |
 
-**只有现场验证、没有自动化测试的部分**（如实记录）：
+**自动化测试覆盖不到的部分**（如实记录）：
 
 - 召回块在 Web 前端的"一行折叠上下文注入"渲染（`form: 'notice'` → `ContextInjectionRow`）
   由 DSH 客户端实现，本仓库无法覆盖；本仓库只断言消息形态与 `source` 字段。
-- 前缀缓存（prompt cache）的命中情况**不能靠自动化测试覆盖**，但它是**可观测**的：
-  宿主把上游缓存字段归一化进 usage（DeepSeek 走 `prompt_cache_hit_tokens`），挂在
-  `assistant/message` 事件的 `usage.cacheReadTokens` / `inputTokens` 上，会话日志里可读。
-  本版就是用它做了改前/改后的对比，见 [现场验证](#现场验证真实环境2026-09-16)。
-  （插件的**代码**目前不读它——那属于 §"潜在问题"里的待办。）
+- 前缀缓存（prompt cache）的实际命中由服务端决定，测试只能保证"同一会话内渲染出的字节稳定"
+  （`test/prompt-budget.test.mjs`）。命中数本身是可观测的：宿主把上游缓存字段归一化进 usage
+  （DeepSeek 走 `prompt_cache_hit_tokens`），挂在 `assistant/message` 事件的
+  `usage.cacheReadTokens` / `inputTokens` 上，会话日志里可读。插件的**代码**目前不读它——
+  那属于 §"潜在问题"里的待办。
 - 借入资产（`chat_memory-*` 绑定解析）与 meta 面依赖真实 MemoryCore 数据，
   测试里用夹具替代。
-
-### 现场验证（真实环境，2026-09-16）
-
-自动化测试证明不了"改动在真宿主里生效"。关键改动都在真机上复核过，方法是：
-重启 dsh 载入新代码 → 派真实子 agent → 读该会话的日志
-（`~/.dsh/sessions/<工作区>/<session-id>/session.jsonl.zstd` 里的 `request/header.system`
-与 `user/message` 事件）→ 再用 `tdai_conversation_query` 回查 L0 是否真的没写进去。
-
-#### 1. 子 agent 降级（改前子会话 23 步 ／ 改后子会话 3 步）
-
-| 检查项 | 改前 | 改后 |
-| --- | --- | --- |
-| 子会话 `system` | 13020 字节，与父会话**逐字节相同** | **6925 字节** |
-| `<session_context>` | 有 | **无** |
-| `<tdai_profile_memory>`（4811 字节） | 有 | **无** |
-| `<memory-tools-guide>` / `<knowledge_tools>` | 有 | **无** |
-| `TDAI memory 状态` 快照消息 | 863 → 1247 字节 | **无** |
-| `<tdai_recalled_l1_memories>` | 2 条 | **0 条** |
-| L0 回流 | **37 条** | **0 条**（`tdai_conversation_query` → `total: 0`） |
-| **父会话**（本会话） | 注入正常 | **注入正常**（13033 字节、四段齐全；L0 累计 178 条） |
-
-顺带拿到本版第一份真实的缓存账（子会话**第一步请求**的 usage）：
-
-| | 改前 | 改后 |
-| --- | --- | --- |
-| 总 token | 13748 | 10594（−23%） |
-| 缓存命中 `cacheRead` | 11264 | 9728 |
-| **全价 `inputTokens`** | 2214 | **797** |
-
-⚠️ **口径**：两个子会话自身的消息体量不同（任务 prompt 3463 字节 vs 634 字节，改前还多一条
-2.3KB 的召回块），所以"总 token −3154"是"不注入 + 不召回"的**整体**效果，不要逐项归因。
-另：本版初稿曾估算"关掉注入会让子会话首次请求多付 ≈3.3K 未命中 token"，**实测证伪** ——
-那个算法把被删掉的 6093 字节也算进了未命中项，而删掉的内容根本不会被发送、也就不会被收费。
-修正留痕见 [docs/prompt-design.zh-CN.md](docs/prompt-design.zh-CN.md) §3.4。
-
-#### 2. 代码图谱召回（09-15，对应修复 2 与 7）
-
-修完"工具取错会话"与"知识 `tools/list` 预取失败"后重启 dsh 复跑 code-graph 召回：
-**失败态命中 0 次**——改前是"注入显示已绑定 1 个知识资源，工具连续 4 次回未绑定"，
-现在注入与工具返回一致。
 
 ### 未发布 / 已知限制
 
