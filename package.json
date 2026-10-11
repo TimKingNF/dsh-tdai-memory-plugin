@@ -1,6 +1,6 @@
 {
   "name": "dsh-tdai-memory-plugin",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "DeepSeek Harness 的 TencentDB Agent Memory 插件：会话级上下文注入（L2/L3/Skill/Knowledge/session_context）、L1 自有+借入召回、对话旁路回流 MemoryCore，支持 Web 设置面板与 slash 命令。",
   "type": "module",
   "main": "./index.mjs",

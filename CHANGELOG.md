@@ -4,15 +4,18 @@
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-> **测试范围声明（0.5.0）**：本版本只在 **DeepSeek Harness `0.1.7-rc.1`** 与
-> **TencentDB-Agent-Memory `v2.0.1`** 上做过验证。其它 DSH / MemoryCore 组合未验证，
+> **测试范围声明（0.6.0）**：本版本在 **DeepSeek Harness `0.2.0-rc.2`**（本机当前运行版本）
+> 与 **TencentDB-Agent-Memory `v2.0.1`** 上实操验证过：system 段注入、`agent/pre-step` 两段召回
+> （L1 + skill）、10 个只读工具、设置面板均已实际使用。上一发布版（0.5.0）的验证基线是
+> `0.1.7-rc.1`，其迁移审计见 [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md)。
+> 其它 DSH / MemoryCore 组合未验证，
 > 尤其 DSH 的 `SECTION_ORDERS` / `CONTEXT_ORDERS` 两张表、`agent/pre-step`、
 > `system-prompt/assemble`、以及设置页的 `Config` + `configForms` 契约变化会影响本插件
 > （见 README「兼容性与测试范围」，以及 [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md)）。
 
 ---
 
-## [Unreleased]
+## [0.6.0] - 2026-10-11
 
 ### 变更：云端 skill 从「常驻目录」改成「每轮按需召回」
 
