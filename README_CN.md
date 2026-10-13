@@ -11,7 +11,7 @@ DeepSeek Harness 的 [TencentDB Agent Memory](https://github.com/TencentCloud/Te
 自有+借入 L1 召回、Skill/Knowledge 注入、session_context）以 **DSH 进程内原生方式**移植过来 ——
 不需要 MemoryProxy 转发层，凭据不出进程。
 
-> **当前版本 0.6.0** · 变更见 [CHANGELOG](CHANGELOG.md) · 文档：
+> **当前版本 0.6.1** · 变更见 [CHANGELOG](CHANGELOG.md) · 文档：
 > [DSH 0.1.7-rc.1 兼容性审计与迁移](docs/dsh-0.1.7-migration.md) ·
 > [提示词注入优化说明](docs/prompt-design.zh-CN.md) ·
 > [改造施工图](docs/prompt-injection-redesign.md)
@@ -471,7 +471,7 @@ npm run check:secrets  # 扫描已跟踪文件里的疑似凭据（也是 npm te
 
 | 文档 | 语言 | 内容 |
 | --- | --- | --- |
-| [CHANGELOG.md](CHANGELOG.md) | 中文 | 版本变更；0.6.0 记录云端 skill 改按需召回与角色/规则注入模板，0.5.0 记录 DSH 0.1.7-rc.1 迁移，0.4.0 逐条列出修复、根因与覆盖它的测试 |
+| [CHANGELOG.md](CHANGELOG.md) | 中文 | 版本变更；0.6.1 记录知识 skill 的热更新（进程级冻结）与知识工具 allowlist 对齐，0.6.0 记录云端 skill 改按需召回与角色/规则注入模板，0.5.0 记录 DSH 0.1.7-rc.1 迁移，0.4.0 逐条列出修复、根因与覆盖它的测试 |
 | [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md) | 中文 | DSH 0.1.7-rc.1 兼容性审计：每项契约的核对方式与现场证据、迁移记录与真机验证结果 |
 | [docs/prompt-design.zh-CN.md](docs/prompt-design.zh-CN.md) | 中文 | 提示词注入的优化思路、缓存视角下的风险（含"装别的插件会改提示词 → 前缀缓存失效"）与尚未解决的潜在问题 |
 | [docs/prompt-injection-redesign.md](docs/prompt-injection-redesign.md) | 中文 | 改造施工图：每一条决策、每一处对 DSH / 插件 / proxy 源码的引用 |

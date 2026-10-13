@@ -710,11 +710,40 @@ skill 机制比方案里设想的更合适：
 **实现落点**：
 - `lib/prompts.mjs`：`KNOWLEDGE_SKILL_NAME` / `KNOWLEDGE_SKILL_DESCRIPTION` / `KNOWLEDGE_SKILL_WHEN_TO_USE`、
   `renderKnowledgeSkillContent()`（正文）、`renderKnowledgeRouteBlock()`（system 侧路由行）
-- `lib/sections.mjs`：`registerKnowledgeSkill()`，在 assemble 里按 session 幂等注册
-- `test/knowledge-skill.test.mjs`：注册 / 描述路由 / 正文完整 / 幂等 / fail-open / 路由块瘦身
+- `lib/sections.mjs`：`registerKnowledgeSkill()`，在 assemble 里按**正文指纹**注册；正文变了
+  `dispose` 旧的再注册新的，并用资产 `loadedAt` 做单调闸门（见 §8.0.2）
+- `test/knowledge-skill.test.mjs`：注册 / 描述路由 / 正文完整 / 幂等 / 热更新 / 单调闸门 / 回滚 / fail-open / 路由块瘦身
 
 **遗留**：`renderKnowledgeToolsBlock()` 已下线但保留为对照参考（函数头有显式标注）。
 `knowledgeEnabled=false` 或当前 agent 未绑定资源时不注册。
+
+## 8.0.2 知识 skill 的热更新与单调闸门（2026-10-14）
+
+**事故**：新绑一个 wiki 后，system 路由行列出了它，但 `tdai-team-knowledge` 正文里没有 ——
+模型只有名字、拿不到 `knowledge_id`，于是把"找不到"归因成"知识库里没有"。换新会话、
+`/tdai-sync` 都无效，只有重启 dsh 才会变。
+
+**机制**：`ctx.skills.register` 是**进程级、按名 first-wins** 的（dsh-skill `lib/index.js:193-200`：
+重复注册只 warn、返回 no-op disposer）。插件原来的幂等判据是 `Set<sessionId>`，
+于是每个新 session 的那次注册都被静默丢弃，正文被冻结到进程结束。
+
+**改法**（三件事，缺一不可）：
+
+| 关注点 | 做法 | 不做的后果 |
+| --- | --- | --- |
+| 何时重注册 | 幂等判据 = **正文指纹**，内容变了就换 | 旧正文永远冻结 |
+| 怎么换得掉 | 保存**赢家那次**注册返回的 disposer，先 dispose 再 register | 同名注册被 first-wins 吞掉 |
+| 谁说了算 | `asset.loadedAt` **单调闸门**，只认严格更新的快照 | 老会话的快照把正文刷回去，会话间互相覆盖 |
+
+正文变了要能换、换了要能保持新、换失败要能回滚（旧正文挂回去，槽位不提交，下一轮重试）。
+回归护栏见 `test/knowledge-skill.test.mjs` 用例 7/8/9 —— 假宿主的注册表按 dsh-skill 语义实现
+（first-wins + no-op disposer），`body()` 就是"模型真正会读到的正文"。
+
+**allowlist 对齐（0.6.1 补上）**：正文是进程级最新，而知识工具的 allowlist 取的是**会话级**资产，
+两者之间有时间差 —— 旧会话会看到"正文列了 N 个 id、最新那个调不动"。修法在 `lib/tools.mjs`：
+目标 id 命中不到、且手上资产够老（> `ASSET_FRESH_MS = 10s`）时 `assets.refresh()` 刷一次再判；
+资产够新（刚查过）或压根没有资产（那条路已由 `ensure` 带失败冷却处理）时不刷。
+护栏见 `test/knowledge-tools.test.mjs` 用例 8–11。
 
 ## 8.0.1 知识调用改为原生工具（本轮完成，§8 后续课题 1 收尾）
 

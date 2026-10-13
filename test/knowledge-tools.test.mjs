@@ -7,13 +7,15 @@
  *   - **错误语义**：知识服务在 code-graph 工具执行失败时仍回 code=0，把错误放在
  *     `data.isError`（MemoryKnowledge/v3-api-memoryknowledge-doc.md:573）。
  *     客户端必须显式判，否则失败会被当成成功结果喂给模型。
+ *   - **allowlist 与 skill 正文对齐**：正文是进程级热更新的，allowlist 是会话级缓存；
+ *     目标 id 命中不到、且资产够老时强制刷新一次，见用例 8–10。
  *
  * 运行：node test/knowledge-tools.test.mjs
  */
 import assert from 'node:assert'
 import { registerKnowledgeTools } from '../lib/tools.mjs'
 
-function harness({ cfg = {}, asset = null, client = {} } = {}) {
+function harness({ cfg = {}, asset = null, client = {}, assets = {} } = {}) {
   const tools = new Map()
   const cfgAll = { enabled: true, knowledgeEnabled: true, ...cfg }
   const calls = []
@@ -25,7 +27,7 @@ function harness({ cfg = {}, asset = null, client = {} } = {}) {
   registerKnowledgeTools(ctx, {
     config: cfgAll,
     readEnabled: () => cfgAll.enabled,
-    assets: { peek: () => asset },
+    assets: { peek: () => asset, ...assets },
     log: () => {},
     client: {
       async knowledgeToolsList(url, id) { calls.push(['list', url, id]); return client.list ?? null },
@@ -196,4 +198,78 @@ const boundAsset = {
   assert.deepEqual(seen, ['live-session'], '无 exec 时应回落 ctx.agent.session')
 }
 
-console.log('knowledge tools tests passed: 越权拒绝 / 参数透传 / isError 语义 / 缺参 / fail-open / schema / 会话解析')
+// ── 8) 会话资产陈旧 + 正文里的新 id：强制刷新一次再判（allowlist 与正文对齐）──
+//
+// 事故形态（2026-10-14）：skill 正文是进程级热更新的，新绑的 wiki 立刻出现在里面；
+// 而这里的 allowlist 取的是会话级资产缓存 —— 旧会话拿着正文里的新 id 过来，
+// 只会被回一句"未绑定的知识资源"，模型只能得出"知识库里没有"的结论。
+{
+  const stale = { ...boundAsset, loadedAt: Date.now() - 60_000 }
+  const fresh = {
+    ...boundAsset,
+    loadedAt: Date.now(),
+    knowledge: [...boundAsset.knowledge, { knowledge_id: 'wiki-2', type: 'wiki', service_url: 'http://kb/v3', name: '自制力' }],
+  }
+  let refreshes = 0
+  const h = harness({
+    asset: stale,
+    assets: { refresh: async () => { refreshes += 1; return fresh } },
+    client: { call: { ok: true, text: 'SELF-CONTROL-RESULT' } },
+  })
+  const out = await h.run('tdai_knowledge_call', { knowledge_id: 'wiki-2', tool_name: 'search' })
+  assert.equal(out, 'SELF-CONTROL-RESULT', '刷新后应能用正文里的新 id 真调通')
+  assert.equal(refreshes, 1, '应恰好刷新一次')
+  assert.deepEqual(h.calls[0], ['call', 'http://kb/v3', 'wiki-2', 'search', {}])
+}
+{
+  // 同一个 wrapper：tdai_knowledge_tools 也要对齐
+  const stale = { ...boundAsset, loadedAt: Date.now() - 60_000 }
+  const fresh = {
+    ...boundAsset,
+    loadedAt: Date.now(),
+    knowledge: [...boundAsset.knowledge, { knowledge_id: 'wiki-2', type: 'wiki', service_url: 'http://kb/v3', name: '自制力' }],
+  }
+  const h = harness({
+    asset: stale,
+    assets: { refresh: async () => fresh },
+    client: { list: [{ name: 'search', description: 'BM25 全文搜索' }] },
+  })
+  const out = await h.run('tdai_knowledge_tools', { knowledge_id: 'wiki-2' })
+  assert.ok(out.includes('`search`'), `刷新后应能取到新资源的工具清单，实际：${out}`)
+}
+
+// ── 9) 资产是新的：不刷新，直接按未绑定拒绝（别把网关打穿）────────────────────
+{
+  const fresh = { ...boundAsset, loadedAt: Date.now() }
+  let refreshes = 0
+  const h = harness({ asset: fresh, assets: { refresh: async () => { refreshes += 1; return fresh } } })
+  const out = await h.run('tdai_knowledge_call', { knowledge_id: 'wiki-evil', tool_name: 'search' })
+  assert.ok(out.includes('未绑定的知识资源'))
+  assert.equal(refreshes, 0, '资产够新 → 刚查过，不必再打一遍网关')
+  assert.equal(h.calls.length, 0, '仍不得拿未绑定的 id 请求服务端')
+}
+
+// ── 10) 刷新后仍然没有 → 如实回未绑定（只刷一次，不循环）──────────────────────
+{
+  const stale = { ...boundAsset, loadedAt: Date.now() - 60_000 }
+  let refreshes = 0
+  const h = harness({ asset: stale, assets: { refresh: async () => { refreshes += 1; return stale } } })
+  const out = await h.run('tdai_knowledge_call', { knowledge_id: 'wiki-evil', tool_name: 'search' })
+  assert.ok(out.includes('未绑定的知识资源') && out.includes('wiki-1'), '拒绝时要列出刷新后的可用资源')
+  assert.equal(refreshes, 1, '只刷新一次')
+  assert.equal(h.calls.length, 0)
+}
+
+// ── 11) 兜底边界：压根没有资产时走 ensure 那条路，不在工具里再强制刷新 ────────
+{
+  let refreshes = 0
+  const h = harness({
+    asset: null,
+    assets: { ensure: async () => null, refresh: async () => { refreshes += 1; return boundAsset } },
+  })
+  const out = await h.run('tdai_knowledge_call', { knowledge_id: 'cg-1', tool_name: 'search' })
+  assert.ok(out.includes('没有绑定团队知识资源'))
+  assert.equal(refreshes, 0, '没有资产的分支已由 ensure 处理（带失败冷却），这里不该再打网关')
+}
+
+console.log('knowledge tools tests passed: 越权拒绝 / 参数透传 / isError 语义 / 缺参 / fail-open / schema / 会话解析 / 陈旧资产刷新对齐')

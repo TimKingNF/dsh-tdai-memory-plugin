@@ -12,7 +12,7 @@ MemoryProxy's core memory capabilities — L2/L3 injection, self + borrowed L1 r
 injection, `session_context` — **natively into the DSH process**. No MemoryProxy forwarding layer is
 involved and credentials never leave the process.
 
-> **Version 0.6.0** · read the [CHANGELOG](CHANGELOG.md) · docs: [DSH 0.1.7-rc.1 compatibility audit & migration](docs/dsh-0.1.7-migration.md) ·
+> **Version 0.6.1** · read the [CHANGELOG](CHANGELOG.md) · docs: [DSH 0.1.7-rc.1 compatibility audit & migration](docs/dsh-0.1.7-migration.md) ·
 > [prompt-injection design notes (中文)](docs/prompt-design.zh-CN.md) ·
 > [construction blueprint (中文)](docs/prompt-injection-redesign.md)
 
@@ -504,7 +504,7 @@ content:
 
 | Document | Language | Content |
 | --- | --- | --- |
-| [CHANGELOG.md](CHANGELOG.md) | 中文 | release history; 0.6.0 records cloud-skill recall on demand and the role/rules injection template, 0.5.0 the DSH 0.1.7-rc.1 migration, 0.4.0 every fix with its root cause and covering test |
+| [CHANGELOG.md](CHANGELOG.md) | 中文 | release history; 0.6.1 records the knowledge-skill hot update (process-level freeze) and the knowledge-tool allowlist alignment, 0.6.0 cloud-skill recall on demand and the role/rules injection template, 0.5.0 the DSH 0.1.7-rc.1 migration, 0.4.0 every fix with its root cause and covering test |
 | [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md) | 中文 | compatibility audit against DSH 0.1.7-rc.1: every contract checked, with live evidence, plus the migration record and verification results |
 | [docs/prompt-design.zh-CN.md](docs/prompt-design.zh-CN.md) | 中文 | the prompt-injection optimisation rationale, prompt-cache risks (including "installing other plugins invalidates the prefix cache") and known open issues |
 | [docs/prompt-injection-redesign.md](docs/prompt-injection-redesign.md) | 中文 | the construction blueprint: every decision, every citation into DSH / plugin / proxy source |

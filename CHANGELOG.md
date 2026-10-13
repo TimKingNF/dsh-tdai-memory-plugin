@@ -4,7 +4,7 @@
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-> **测试范围声明（0.6.0）**：本版本在 **DeepSeek Harness `0.2.0-rc.2`**（本机当前运行版本）
+> **测试范围声明（0.6.1）**：本版本在 **DeepSeek Harness `0.2.0-rc.2`**（本机当前运行版本，与 0.6.0 同一基线）
 > 与 **TencentDB-Agent-Memory `v2.0.1`** 上实操验证过：system 段注入、`agent/pre-step` 两段召回
 > （L1 + skill）、10 个只读工具、设置面板均已实际使用。上一发布版（0.5.0）的验证基线是
 > `0.1.7-rc.1`，其迁移审计见 [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md)。
@@ -12,6 +12,86 @@
 > 尤其 DSH 的 `SECTION_ORDERS` / `CONTEXT_ORDERS` 两张表、`agent/pre-step`、
 > `system-prompt/assemble`、以及设置页的 `Config` + `configForms` 契约变化会影响本插件
 > （见 README「兼容性与测试范围」，以及 [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md)）。
+
+---
+
+## [0.6.1] - 2026-10-14
+
+### 修复：知识 skill 正文被进程级冻结 —— 新绑定/新同步的知识资源拿不到 `knowledge_id`
+
+#### 现象（2026-10-14 实测）
+
+- 用户新建了一个知识资源（自建 wiki《自制力》，40 页，含 `wiki/sources/链式启动协议.md`，即 RSIP）
+  并绑到 agent。system 里的 `tdai:knowledge-tools` 路由行**已经**列出它（"自制力（wiki）"），
+  但模型加载 `tdai-team-knowledge` 拿到的正文里**只有另外两个资源**：
+  它只有名字、没有 `knowledge_id`，`tdai_knowledge_call` 无从下手，
+  最后对用户宣称"记忆和技能里都没有…我把手上这三个知识资源和你的 vault 都扫过了"（实际只扫了两个）。
+- **换新会话没用、`/tdai-sync` 也没用**：路由行会更新（它每轮从实时资产渲染），
+  正文不会——只有重启 dsh 才会变。
+- 铁证：同一个会话、同一分钟里，路由行写"已绑定 3 个资源"，skill 正文写 2 个
+  （`session-a7e6a413` 01:47:44 的 system 与 01:47:52 的 `skill` 工具返回）。
+
+#### 根因
+
+1. `ctx.skills.register` 登记的是**进程级、按名 first-wins** 的 runtime skill
+   （dsh-skill `lib/index.js:193-200`）：同名重复注册只 `logger.warn` 一句，然后返回一个
+   **no-op disposer**，既不覆盖也不报错。宿主里只有一份正文，**第一个注册的会话赢了**，
+   之后所有会话（含新会话）读到的都是它。
+2. 插件的幂等判据原本是 `Set<sessionId>`（"每个 session 注册一次"），前提假设是
+   "正文在注册时冻结、同一 session 内资产不变"。这个前提漏掉了"注册本身是进程级的"：
+   每个新 session 的那次注册都只是撞在 first-wins 上被静默丢弃，**连一条日志都没有**。
+3. 正文里含每个资源的 `knowledge_id`，而模型只能从这里拿到 id（路由行只有名字）。
+   于是"后来新增/新同步的资源"永远拿不到 id —— 资产绑好了、路由可见了、正文里没有。
+
+#### 修复（`lib/sections.mjs` · `registerKnowledgeSkill`）
+
+- 幂等判据从 **session** 改成**正文指纹**；正文变了就 `dispose` 旧的、再注册新的
+  （同一个同步块内完成，别的会话看不到中间态）。
+- 进程级槽位保存**赢家那次**注册返回的 disposer（重复注册拿到的是 no-op，必须留住第一次的，
+  否则摘不掉旧条目）；同时记住正文与它来自哪次资产加载。
+- **单调闸门**：正文来自各会话**自己的**资产快照，旧会话在整个生命周期里都不会重新拉资产。
+  用 `SessionAssets.loadedAt` 做闸门，只允许**严格更新**的快照替换（首次注册不受约束；
+  没有时间戳的资产不许覆盖有时间戳的）——否则一个还开着的老会话下一轮 assemble
+  就会把正文刷回旧的，两个会话互相覆盖。
+- 换新失败时尽量把旧正文挂回去（宁可暂时陈旧，也不要整段消失），槽位不提交，下一轮 assemble 重试。
+- 顺带：成功换新会记一条日志（这个 bug 之前是完全静默的），并删掉 `session/disposed`
+  里那个只服务于旧幂等 Set 的清理分支。
+
+#### 测试
+
+- `test/knowledge-skill.test.mjs`：假宿主的注册表按 dsh-skill 语义重写
+  （**first-wins + no-op disposer + warning**），新增 `body()` 返回"模型真正会读到的正文"。
+  新增用例 7/8/9：资产变化 → 正文热更新（旧实现在这里被 first-wins 吞掉）、
+  旧快照不得回滚新正文、无时间戳不许覆盖、换新失败要回滚并可重试。
+  两处变异验证：去掉 dispose → 用例 7 挂；去掉 `loadedAt` 闸门 → "旧快照不得覆盖新正文"挂。
+- `test/subagent.test.mjs`：断言口径从"子会话也注册一次"改成"子会话拿到刷新后的知识资产时，
+  正文跟着更新"（正文级幂等之后，同内容不再重复注册才是正确行为）。
+
+### 修复：知识工具的 allowlist 与会话资产对齐（skill 正文 / 会话快照之间的时间差）
+
+#### 现象
+
+上一条修好之后，正文是**进程级最新**的，而 `tdai_knowledge_call` 的 allowlist 取的是
+**会话级资产缓存**，于是又多出一种失败：正文里列着新资源的 id，模型照着调，
+被回一句"未绑定的知识资源"——明明正文里就有。它和上一条同源，也会把模型推到
+"知识库里没有"这个结论上。
+
+#### 修复（`lib/tools.mjs` · `registerKnowledgeTools`）
+
+- 目标 id 不在当前清单里、且手上这份资产**够老**（超过 `ASSET_FRESH_MS = 10s`）时，
+  先 `assets.refresh(sessionId, policy)` 强制刷一次再判；刷完仍然没有，才回
+  "未绑定 + 当前可用清单"。命中就直接走原路径（零额外开销）。
+- 两个刻意留的边界：**没有资产**时不在工具里强制刷新——那条路已由上面的 `ensure` 处理
+  （带失败冷却），不该再打一遍网关；**资产够新**时直接拒绝——刚查过，没必要再查。
+  刷新成功后 `loadedAt` 变新 → 10s 内不会重复刷新，模型连喂几个不存在的 id 也打不穿网关。
+
+#### 测试
+
+`test/knowledge-tools.test.mjs` 新增用例 8–11：陈旧资产 + 正文新 id → 刷新后真调通
+（`tdai_knowledge_call` / `tdai_knowledge_tools` 都覆盖）、资产够新 → 零刷新直接拒绝、
+刷新后仍没有 → 只刷一次不循环、无资产 → 走既有提示且不刷新。
+两处变异验证：删掉刷新块 → 用例 8 挂；去掉"够老"闸门 → 用例 9 挂。
+
 
 ---
 
