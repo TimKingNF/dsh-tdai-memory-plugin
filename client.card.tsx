@@ -153,12 +153,19 @@ const SUBAGENT_CAPTURE_TOGGLE = {
 }
 const SUBAGENT_TOGGLES = [SUBAGENT_INJECT_TOGGLE, SUBAGENT_CAPTURE_TOGGLE]
 
-/** 写侧：唯一的开关，且与读侧完全独立。 */
+/** 写侧：两个开关，都与读侧完全独立。 */
 const WRITE_TOGGLES = [
   {
     key: 'captureEnabled',
     label: '对话回流到 MemoryCore',
     hint: '独立开关：读侧全关也照常回流；每轮写回 L0 并触发 Skill 归档',
+  },
+  {
+    key: 'taskWriteEnabled',
+    label: '待办写入 task',
+    hint: '默认关：打开后你在对话里明确说「记一下」的待办直接写进 MemoryCore 的 task'
+      + '（另需 User Key），不再落到本地文件；写错可撤销',
+    defaultOff: true,
   },
 ]
 

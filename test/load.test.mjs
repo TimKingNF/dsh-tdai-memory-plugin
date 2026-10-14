@@ -86,7 +86,7 @@ const ctx = {
 // 用完整身份跑 apply（否则读侧被跳过、工具不注册）
 apply(ctx, {})
 
-assert.equal(registered.tools.length, 10, '应注册 10 个工具（8 个记忆工具 + 2 个团队知识工具）')
+assert.equal(registered.tools.length, 14, '应注册 14 个工具（8 个记忆工具 + 2 个团队知识工具 + 4 个待办写侧工具）')
 for (const t of registered.tools) {
   assert.ok(t.name.startsWith('tdai_'), `工具名 ${t.name} 应以 tdai_ 开头`)
   assert.equal(t.parameters.type, 'object', `工具 ${t.name} 的 parameters 必须是 object 根`)
@@ -111,6 +111,22 @@ for (const n of ['tdai_knowledge_tools', 'tdai_knowledge_call']) {
 const kCall = registered.tools.find((t) => t.name === 'tdai_knowledge_call')
 assert.deepEqual(kCall.parameters.required, ['knowledge_id', 'tool_name'], '知识执行工具的必填参数')
 assert.equal(kCall.parameters.properties.params.type, 'object', 'params 应是 JSON 对象')
+
+// ── 待办写侧工具（taskWriteEnabled）─────────────────────────────────────────
+//
+// 注意这里断言的是**无条件注册**：开关是 volatile 字段（面板可改），改它**不会**
+// 重新 apply 插件，所以注册期拿不到新值 —— 条件注册会让"面板里打开了但工具没出现"
+// 直到重启才生效。开关判据一律在 execute 里（见 lib/tools.mjs 的 registerTaskTools）。
+for (const n of ['tdai_task_add', 'tdai_task_list', 'tdai_task_update', 'tdai_task_delete']) {
+  assert.ok(registered.tools.some((t) => t.name === n), `应注册待办工具 ${n}（开关关闭也应注册）`)
+}
+{
+  const add = registered.tools.find((t) => t.name === 'tdai_task_add')
+  assert.deepEqual(add.parameters.required, ['title'], 'tdai_task_add 只强制 title')
+  assert.equal(add.parameters.properties.dedupe.type, 'boolean', 'dedupe 应是 boolean')
+  const del = registered.tools.find((t) => t.name === 'tdai_task_delete')
+  assert.deepEqual(del.parameters.required, ['task_id'], 'tdai_task_delete 需要 task_id')
+}
 
 // ── settings（0.1.7-rc.1 模型）───────────────────────────────────────────────
 // 插件只做两件事：导出 Config（schema），并关掉宿主的自动生成页。

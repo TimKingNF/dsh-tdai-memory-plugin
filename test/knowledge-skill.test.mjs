@@ -6,13 +6,15 @@
  *   - system 只留一行路由信息（`tdai:knowledge-tools`）；
  *   - 正文注册为 DSH 运行时 skill，进原生 skill 目录，模型用 `skill` 工具按需加载。
  *
- * 这个测试锁住六件事：
+ * 这个测试锁住八件事：
  *   1. 有知识资源 + 开关打开 → 注册 skill，名字/描述/正文都正确；
  *   2. 没有资源 / 开关关闭 → **不注册**（不要往目录里塞空 skill）；
- *   3. 同一 session 重复 assemble → **只注册一次**（幂等）；
+ *   3. 正文没变 → **不重复注册**（幂等判据是正文指纹，不是 session）；
  *   4. 宿主没有 skills 服务 → 静默跳过，不崩（fail-open）；
  *   5. **宿主有 skills 服务、但插件没把它写进 inject** → 也不能崩；
- *   6. system 里只剩一行路由（正文不进常驻 prompt，块 ≤600 B）。
+ *   6. system 里只剩一行路由（正文不进常驻 prompt，块 ≤600 B）；
+ *   7. **资产变了 → 正文热更新**（新绑定/新同步的知识资源，模型必须立刻拿得到 id）；
+ *   8. **旧会话的旧快照不许把新正文刷回去**（loadedAt 单调闸门），且换新失败要能回滚。
  *
  * 第 5 条是线上事故的回归护栏：`skills` 由别的插件在自己的 fiber 里 provide，
  * cordis 的 ctx 是 Proxy，裸读一个没 inject 的服务名**取值本身就抛**
@@ -20,6 +22,13 @@
  * 做成了 Proxy —— 见 `cordisLike()`。**不要把它改回普通对象**：普通对象读缺失属性
  * 只得到 undefined，会让 `ctx.skills?.register` 这种写法在单测里永远"通过"，
  * 而线上总开关一开就整轮报错（事故现场）。
+ *
+ * 第 7/8 条是**第二起**线上事故的回归护栏：同名 runtime skill 是**进程级 first-wins**
+ * （dsh-skill/lib/index.js:193-200），重复注册被静默忽略 + 返回 no-op disposer。
+ * 所以 `skillRegistry()` 必须忠实复刻这个语义（含 no-op disposer）。
+ * **不要把它改回"每次 register 都生效"**：那样就复现不出事故，测试会退回"假通过"。
+ * 事故现场（2026-10-14）：新绑的 wiki 进了 system 路由行，却没进 skill 正文，
+ * 模型只能拿到名字、拿不到 knowledge_id，于是宣称"我把这三个知识资源都扫过了"。
  *
  * 运行：node test/knowledge-skill.test.mjs
  */
@@ -43,9 +52,39 @@ function cordisLike(base) {
   })
 }
 
+/**
+ * 假宿主里的 runtime skill 注册表，按 dsh-skill 的语义实现：
+ * 同名 **first-wins**，重复注册只记一条 warning 并返回 **no-op disposer**
+ * （dsh-skill/lib/index.js:193-200）。`body()` = 模型加载 skill 时真正会读到的正文。
+ */
+function skillRegistry() {
+  const layer = new Map()
+  const attempts = []
+  const warnings = []
+  let shouldFail = false
+  return {
+    layer,
+    attempts,
+    warnings,
+    /** 让下一次 register 抛错（测"换新失败要回滚"）。 */
+    failNext(value = true) { shouldFail = value },
+    register(skill) {
+      if (shouldFail) { shouldFail = false; throw new Error('register failed (test)') }
+      attempts.push(skill)
+      if (layer.has(skill.name)) {
+        warnings.push(`runtime skill "${skill.name}" ignored because it is already registered`)
+        return () => {}
+      }
+      layer.set(skill.name, skill)
+      return () => { layer.delete(skill.name) }
+    },
+    body() { return layer.get(KNOWLEDGE_SKILL_NAME)?.content },
+  }
+}
+
 /** 极简假宿主：只需要 systemPrompt / on / inject 三个能力（与 index.mjs 的 inject 一致）。 */
-function harness({ cfg = {}, asset = null, withSkills = true } = {}) {
-  const registered = []
+function harness({ cfg = {}, asset = null, assets = {}, withSkills = true } = {}) {
+  const registry = skillRegistry()
   const sections = new Map()
   let listener = null
   const runtimeCfg = {
@@ -56,7 +95,7 @@ function harness({ cfg = {}, asset = null, withSkills = true } = {}) {
   }
   // 宿主（兄弟 fiber）提供的服务：插件不 inject 就读不到 —— 这正是线上场景。
   const rootServices = {}
-  if (withSkills) rootServices.skills = { register: (skill) => { registered.push(skill); return () => {} } }
+  if (withSkills) rootServices.skills = { register: (skill) => registry.register(skill) }
 
   const base = {
     systemPrompt: {
@@ -82,7 +121,8 @@ function harness({ cfg = {}, asset = null, withSkills = true } = {}) {
   registerSections(ctx, {
     readEnabled: () => runtimeCfg.enabled,
     config: runtimeCfg,
-    assets: { ensure: async () => null, peek: () => asset },
+    // 会话资产：每个 session 一份（`asset` 是所有会话的兜底），与 assets.mjs 的 peek 同形
+    assets: { ensure: async () => null, peek: (sessionId) => assets[sessionId] ?? asset },
     log: () => {},
   })
 
@@ -96,12 +136,14 @@ function harness({ cfg = {}, asset = null, withSkills = true } = {}) {
     }
     return listener(assembly, context, async () => assembly)
   }
-  return { assemble, registered, ctx }
+  return { assemble, registry, ctx }
 }
 
 const knowledgeAsset = {
   identity: { session_id: 's1' },
   agentDetail: null, taskDetail: null, profiles: [], skills: null,
+  // SessionAssets 每次成功加载都会盖这个戳；单调闸门用它（见 lib/sections.mjs）
+  loadedAt: 100,
   knowledge: [
     {
       knowledge_id: 'k-code', type: 'code-graph', service_url: 'http://kb.internal',
@@ -115,13 +157,18 @@ const knowledgeAsset = {
   ],
 }
 
+const extraWiki = {
+  knowledge_id: 'k-self', type: 'wiki', service_url: 'http://kb.internal',
+  name: '自制力', summary: '行为干预框架',
+}
+
 // ── 1) 有资源 + 开关开：注册 skill，内容正确 ─────────────────────────────────
 {
-  const { assemble, registered } = harness({ asset: knowledgeAsset })
+  const { assemble, registry } = harness({ asset: knowledgeAsset })
   await assemble('s1')
 
-  assert.equal(registered.length, 1, `应注册且只注册 1 个 skill，实际 ${registered.length}`)
-  const skill = registered[0]
+  assert.equal(registry.attempts.length, 1, `应注册且只注册 1 个 skill，实际 ${registry.attempts.length}`)
+  const skill = registry.attempts[0]
 
   // 名字必须符合 DSH 的校验规则 ^[a-z0-9]+(?:-[a-z0-9]+)*$（dsh-skill/lib/index.js:17）
   assert.equal(skill.name, KNOWLEDGE_SKILL_NAME)
@@ -134,7 +181,8 @@ const knowledgeAsset = {
   assert.ok(skill.whenToUse && skill.whenToUse.length > 0, '应给出 whenToUse 路由提示')
 
   // 正文：判据 + 资源清单 + **工具清单** + 原生工具用法
-  const body = skill.content
+  const body = registry.body()
+  assert.equal(body, skill.content, '宿主里生效的正文应与注册内容一致')
   assert.ok(body.includes('已绑定资源'), '正文应含资源清单小节')
   assert.ok(body.includes('payments 索引') && body.includes('acme/payments'), '正文应含 code-graph 资源及其 match')
   assert.ok(body.includes('团队 wiki') && body.includes('架构决策与踩坑记录'), '正文应含 wiki 资源及其 about')
@@ -161,9 +209,9 @@ const knowledgeAsset = {
       ] },
     ],
   }
-  const { assemble, registered } = harness({ asset: enriched })
+  const { assemble, registry } = harness({ asset: enriched })
   await assemble('s1')
-  const body = registered[0].content
+  const body = registry.body()
   assert.ok(body.includes('`explore`') && body.includes('参数：query, maxFiles'), '正文应列出工具名与参数名')
   assert.ok(body.includes('`status`') && body.includes('无参数'), '无参数工具应标注"无参数"')
   assert.ok(body.includes('`search`'), 'wiki 资源的工具也应列出')
@@ -172,45 +220,46 @@ const knowledgeAsset = {
 
 // ── 1c) 没取到工具清单：退回"先自发现"的指引 ────────────────────────────────
 {
-  const { assemble, registered } = harness({ asset: knowledgeAsset })   // 无 tools 字段
+  const { assemble, registry } = harness({ asset: knowledgeAsset })   // 无 tools 字段
   await assemble('s1')
-  const body = registered[0].content
+  const body = registry.body()
   assert.ok(body.includes('未取到') && body.includes('tdai_knowledge_tools'),
     '预取失败时应提示先用 tdai_knowledge_tools 查一次')
 }
 
 // ── 2) 没有知识资源：不注册（不要往目录里塞空 skill）──────────────────────────
 {
-  const { assemble, registered } = harness({ asset: { ...knowledgeAsset, knowledge: [] } })
+  const { assemble, registry } = harness({ asset: { ...knowledgeAsset, knowledge: [] } })
   await assemble('s1')
-  assert.equal(registered.length, 0, '无资源时不应注册 skill')
+  assert.equal(registry.attempts.length, 0, '无资源时不应注册 skill')
 }
 
 // ── 3) 开关关闭：不注册 ──────────────────────────────────────────────────────
 {
-  const { assemble, registered } = harness({ asset: knowledgeAsset, cfg: { knowledgeEnabled: false } })
+  const { assemble, registry } = harness({ asset: knowledgeAsset, cfg: { knowledgeEnabled: false } })
   await assemble('s1')
-  assert.equal(registered.length, 0, 'knowledgeEnabled=false 时不应注册 skill')
+  assert.equal(registry.attempts.length, 0, 'knowledgeEnabled=false 时不应注册 skill')
 }
 
-// ── 4) 幂等：同一 session 多次 assemble 只注册一次 ───────────────────────────
+// ── 4) 幂等：正文没变就不重复注册（判据是正文指纹，不是 session）─────────────
 {
-  const { assemble, registered } = harness({ asset: knowledgeAsset })
+  const { assemble, registry } = harness({ asset: knowledgeAsset })
   await assemble('s1')
   await assemble('s1')
   await assemble('s1')
-  assert.equal(registered.length, 1, '同一 session 重复 assemble 只能注册一次')
+  assert.equal(registry.attempts.length, 1, '同一 session 重复 assemble 只能注册一次')
 
-  // 不同 session 各自注册（宿主按层合并，同名 runtime skill 是 first-wins + warn）
+  // 另一个 session、同样的资产：宿主里已经挂着同一份正文，不必再注册
   await assemble('s2')
-  assert.equal(registered.length, 2, '不同 session 应各注册一次（内容相同，由宿主按名去重）')
+  assert.equal(registry.attempts.length, 1, '不同 session 但正文相同 → 不该重复注册')
+  assert.equal(registry.warnings.length, 0, '不该出现 first-wins 静默忽略的 warning')
 }
 
 // ── 5) 宿主没有 skills 服务：静默跳过，不崩 ──────────────────────────────────
 {
-  const { assemble, registered } = harness({ asset: knowledgeAsset, withSkills: false })
+  const { assemble, registry } = harness({ asset: knowledgeAsset, withSkills: false })
   const result = await assemble('s1')
-  assert.equal(registered.length, 0)
+  assert.equal(registry.attempts.length, 0)
   // 注入本身不受影响
   const knowledgeSection = result.sections.find((s) => s.name === 'tdai:knowledge-tools')
   assert.ok(knowledgeSection.text.includes('<knowledge_tools>'), 'skills 服务缺失时，路由块仍应注入')
@@ -231,10 +280,10 @@ const knowledgeAsset = {
 
 // ── 5c) 宿主提供 skills（经 inject 声明后才可达）：照常注册，不崩 ────────────
 {
-  const { assemble, registered } = harness({ asset: knowledgeAsset, withSkills: true })
+  const { assemble, registry } = harness({ asset: knowledgeAsset, withSkills: true })
   await assemble('s1')
-  assert.equal(registered.length, 1, '经 ctx.inject 拿到 skills 后应正常注册')
-  assert.equal(registered[0].name, KNOWLEDGE_SKILL_NAME)
+  assert.equal(registry.attempts.length, 1, '经 ctx.inject 拿到 skills 后应正常注册')
+  assert.equal(registry.attempts[0].name, KNOWLEDGE_SKILL_NAME)
 }
 
 // ── 6) system 侧只剩极短路由块（这是本次改造的收益所在）──────────────────────
@@ -249,4 +298,66 @@ const knowledgeAsset = {
     `路由块必须保持极短，实际 ${Buffer.byteLength(route, 'utf8')} 字节`)
 }
 
-console.log('knowledge skill tests passed: 注册 / 描述路由 / 正文完整 / 幂等 / fail-open / inject 语义 / 路由块瘦身')
+// ── 7) 资产变了 → 正文热更新；旧会话不许刷回去（2026-10-14 事故回归护栏）──────
+//
+// 事故形态：会话 A 先注册了一份 2 资源的正文；之后用户新绑了一个 wiki，
+// 会话 B（新资产）注册时被 first-wins 静默忽略 → 正文永远停在 2 个资源，
+// 模型只有路由行里的名字、没有 knowledge_id，于是"找不到"那个概念。
+{
+  const before = { ...knowledgeAsset, loadedAt: 100 }
+  const after = { ...knowledgeAsset, loadedAt: 200, knowledge: [...knowledgeAsset.knowledge, extraWiki] }
+  const assets = { s1: before, s2: after }
+  const { assemble, registry } = harness({ assets })
+
+  await assemble('s1')
+  assert.ok(!registry.body().includes('k-self'), '前置：旧正文里不含新资源')
+
+  await assemble('s2')
+  assert.equal(registry.layer.size, 1, '宿主里任何时刻都只应有一条同名 runtime skill')
+  assert.ok(registry.body().includes('k-self') && registry.body().includes('自制力'),
+    '资产变化后正文必须含新资源（旧实现这里被 first-wins 忽略 → 事故现场）')
+  assert.equal(registry.warnings.length, 0, '换新应走 dispose + register，不该撞上 first-wins')
+
+  // 旧会话（快照更旧）再 assemble：不许把正文刷回旧内容
+  await assemble('s1')
+  assert.ok(registry.body().includes('k-self'), '旧快照不得覆盖新正文（loadedAt 单调闸门）')
+  assert.equal(registry.attempts.length, 2, '被闸门挡下时不应再发起注册（实际 2 次：旧、新）')
+
+  // 同一个 session 自己刷新资产（/tdai-sync 的语义）：更新的快照照样能替换，内容变少也算
+  assets.s1 = { ...knowledgeAsset, loadedAt: 300, knowledge: [knowledgeAsset.knowledge[0]] }
+  await assemble('s1')
+  assert.ok(!registry.body().includes('团队 wiki'), '更新的快照（含解绑）应成为新的正文')
+  assert.ok(registry.body().includes('payments 索引'), '解绑后剩下的资源仍要在正文里')
+  assert.equal(registry.attempts.length, 3, '刷新后的资产应正常触发一次更新')
+}
+
+// ── 8) 没有 loadedAt 的资产不许覆盖已有正文（保守：未知时间戳 ≠ 更新）────────
+{
+  const stamped = { ...knowledgeAsset, loadedAt: 200 }
+  const unstamped = { ...knowledgeAsset, loadedAt: 0, knowledge: [...knowledgeAsset.knowledge, extraWiki] }
+  const { assemble, registry } = harness({ assets: { s1: stamped, s2: unstamped } })
+  await assemble('s1')
+  await assemble('s2')
+  assert.ok(!registry.body().includes('k-self'), '未知时间戳的资产不许覆盖已注册正文')
+  assert.equal(registry.attempts.length, 1, '被闸门挡下时不应发起注册')
+}
+
+// ── 9) 换新失败：旧正文必须还在，下一轮要能重试（fail-open 的边界）───────────
+{
+  const first = { ...knowledgeAsset, loadedAt: 100 }
+  const next = { ...knowledgeAsset, loadedAt: 300, knowledge: [...knowledgeAsset.knowledge, extraWiki] }
+  const { assemble, registry } = harness({ assets: { s1: first, s2: next } })
+
+  await assemble('s1')
+  const good = registry.body()
+  assert.ok(good, '前置：第一份正文已注册')
+
+  registry.failNext(true)
+  await assemble('s2')
+  assert.equal(registry.body(), good, '注册失败时必须把旧正文挂回去，不能整段消失')
+
+  await assemble('s2')
+  assert.ok(registry.body().includes('k-self'), '故障恢复后下一轮 assemble 应换成新正文')
+}
+
+console.log('knowledge skill tests passed: 注册 / 描述路由 / 正文完整 / 幂等 / 热更新 / 单调闸门 / 回滚 / fail-open / inject 语义 / 路由块瘦身')

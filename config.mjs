@@ -24,6 +24,14 @@
  *   captureEnabled     回流（写侧）**完全独立**：既不受 enabled 约束，也不受
  *                      injectionEnabled 约束（lib/capture.mjs 只判它自己），默认开
  *
+ *   taskWriteEnabled   对话内待办写入 TDAI task（**独立写侧**，默认**关**）：
+ *                      注册 tdai_task_add / tdai_task_list / tdai_task_update /
+ *                      tdai_task_delete 四个工具，全部走 meta 面（另需 userKey）。
+ *                      默认关的理由：写的是用户的**真实任务库**，先只读彩排、E2E
+ *                      跑通再打开；且它同样不受 enabled（读侧总开关）约束
+ *                      —— 对齐 captureEnabled 的"读写侧各自开门"先例。
+ *                      设计与口径见 docs/task-capture-design.zh-CN.md。
+ *
  *   subagentInjectionEnabled  子 agent 会话是否**全量继承**读侧（身份 + 记忆 + 云端 skill
  *                             召回）。**默认关**：子会话不注入身份（session_context）与
  *                             记忆（画像 / L1 召回 / 状态快照），也不为这些面预热资产；
@@ -86,6 +94,8 @@ export function resolveConfig(config = {}) {
   return {
     enabled: boolOpt(config.enabled, true),
     captureEnabled: boolOpt(config.captureEnabled, true),
+    /** 对话内待办写入 task（独立写侧开关，默认关；见文件头开关树）。 */
+    taskWriteEnabled: boolOpt(config.taskWriteEnabled, false),
     recallEnabled: boolOpt(config.recallEnabled, true),
     injectionEnabled: boolOpt(config.injectionEnabled, true),
     sessionContextEnabled: boolOpt(config.sessionContextEnabled, true),

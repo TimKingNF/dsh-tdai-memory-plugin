@@ -15,9 +15,11 @@
  *     /v3/knowledge/list              团队知识资源
  *   meta 面（另需 x-tdai-user-key）：
  *     /v3/meta/agent/get | /v3/meta/task/get | /v3/meta/agent-fixed-asset/list-with-detail
+ *     /v3/meta/task/create | update | list | delete          ← 对话内待办写入（读用 safe，写用 post）
  *
- * 所有方法 fail-open：网络/HTTP/envelope 错误返回 fallback 并经 logger 记录，
- * 绝不把异常抛进 DSH 主链路。
+ * 读侧方法一律 fail-open：网络/HTTP/envelope 错误返回 fallback 并经 logger 记录，
+ * 绝不把异常抛进 DSH 主链路。**例外是 meta 面的 task 写侧**（create/update/list/delete）：
+ * 它们把异常原样抛给调用方，由工具层转成模型可见的失败信息（见下方方法上的说明）。
  */
 const TAG = '[tdai-memory]'
 const META_PAGE_SIZE = 100
@@ -40,6 +42,23 @@ function describeError(error) {
     : (typeof cause?.message === 'string' ? cause.message : '')
   const message = String(error?.message ?? error)
   return causeText ? `${message}（cause: ${causeText}）` : message
+}
+
+/**
+ * wiki 的 `read_page` 成功时返回 `{ items: [{ ref, content }] }`：
+ * **引用取不到内容时服务端照样回 `code=0` + 空 `content`**（实测 2026-10-14：
+ * `wiki/concepts/不存在的页.md` → 空串，200 OK）。对模型来说，"页面不存在 / 路径写错 /
+ * 空页"与"这页就是空的"长得一模一样，于是它会拿一个空结果当结论用。
+ * 这里补一句显式说明（只在 JSON 分支上追加，不改服务端返回的结构）。
+ */
+function annotateEmptyRefs(data) {
+  const items = data?.items
+  if (!Array.isArray(items) || items.length === 0) return ''
+  const empty = items
+    .filter((it) => !String(it?.content ?? '').trim())
+    .map((it) => String(it?.ref ?? '?'))
+  if (empty.length === 0) return ''
+  return `\n\n[tdai] ${empty.length} 个引用没取到内容（页面不存在、路径写错或本来就是空页）：${empty.join('、')}`
 }
 
 function toCtxIds(ctx) {
@@ -92,7 +111,15 @@ export class GatewayClient {
       signal: opts.signal ?? AbortSignal.timeout(opts.timeoutMs ?? this.timeoutMs),
     })
     const payload = await resp.json().catch(() => ({}))
-    if (!resp.ok) throw new Error(`${TAG} ${path} HTTP ${resp.status}`)
+    if (!resp.ok) {
+      // 非 2xx 时内核把原因放在**响应体**里（实测 401 `missing_user_key`、
+      // 403 `permission_denied: caller is not resource owner`）。只抛一句 `HTTP 403`
+      // 等于把唯一能修的线索丢掉 —— 而写侧（meta task）的错误是要回给模型看的，
+      // 它必须能分清"没配 user key" / "没权限" / "服务不可达"。
+      const detail = [payload?.code !== undefined ? `code=${payload.code}` : '', payload?.message ?? '']
+        .filter(Boolean).join(' ')
+      throw new Error(`${TAG} ${path} HTTP ${resp.status}${detail ? ` ${detail}` : ''}`)
+    }
     if (typeof payload?.code === 'number' && payload.code !== 0) {
       throw new Error(`${TAG} ${path} code=${payload.code} ${payload.message ?? ''}`.trim())
     }
@@ -271,14 +298,17 @@ export class GatewayClient {
   // 两者都要求 `x-tdai-service-id`（租户标识），无需密钥。
 
   /**
-   * 对任意 base 发一次 POST（**带 1 次重试**），错误语义与主客户端一致
-   * （fail-open → fallback，绝不外抛）。
+   * 对任意 base 发一次 POST（**带 1 次重试**），**永不外抛**。
    *
-   * ── 为什么重试 ──────────────────────────────────────────────────────────────
-   * 知识这条链路实测出现过"同一 host:port，直连 curl 每次成功、插件进程偶发失败"
-   * 的形态（2026-10-05 排查，根因未坐实）。原先是单次尝试 + 立刻 fail-open，模型
-   * 拿到的只有一句"知识服务不可达"就放弃整条取证链路。只读查询重试一次的成本极低，
-   * 能吸收掉偶发的连接层抖动。
+   * 返回 `{ ok: true, data }` 或 `{ ok: false, error }`：`error` 是**给模型看的一句话**，
+   * 含 HTTP 状态 / 业务 code / 服务端 message（纯网络层失败才说"请求失败"，并带 cause）。
+   *
+   * ── 为什么不再是"失败返回 null"──────────────────────────────────────────────
+   * 早先这里失败一律 `return fallback`（null），调用方只能回一句"知识服务不可达"。
+   * 实测后果（2026-10-14）：模型把 `read_page` 的 `refs` 写成了 `path`，服务端明确回
+   * `code=400 · refs is required (non-empty array)`，而模型收到的是"知识服务不可达" ——
+   * 一个"对方挂了"的假诊断。它据此连试四种参数写法后放弃知识库、改用本地文件拼文档。
+   * 诊断信息本来就有（服务端给了、日志里也打了），只是没转达给唯一能修它的那一方。
    *
    * ── 重试判据（别把确定性失败也重试一遍）─────────────────────────────────────
    *   - 网络错误 / 超时：重试（`error.retryable` 缺省为真）；
@@ -289,9 +319,9 @@ export class GatewayClient {
    * 日志把每次尝试分开打，并带上失败原因（含 cause 的 code）与耗时：
    * 重试成功留痕（"第 2 次尝试成功"），最终失败写明是第几次、是否重试过。
    */
-  async #postTo(baseUrl, path, body, fallback = null) {
+  async #postTo(baseUrl, path, body) {
     const base = String(baseUrl || '').replace(/\/$/, '')
-    if (!base) return fallback
+    if (!base) return { ok: false, error: '知识服务的 service_url 为空。' }
     const maxAttempts = 2
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const startedAt = Date.now()
@@ -309,17 +339,20 @@ export class GatewayClient {
         if (!resp.ok) {
           const error = new Error(`${TAG} ${base}${path} HTTP ${resp.status}`)
           error.retryable = resp.status >= 500 || resp.status === 429
+          // 服务端在 4xx 里通常也带了 message，一并转达
+          error.brief = `HTTP ${resp.status}${payload?.message ? ` · ${payload.message}` : ''}`
           throw error
         }
         if (typeof payload?.code === 'number' && payload.code !== 0) {
           const error = new Error(`${TAG} ${base}${path} code=${payload.code} ${payload.message ?? ''}`.trim())
           error.retryable = false // 业务拒绝：重试无意义
+          error.brief = `code=${payload.code}${payload.message ? ` · ${payload.message}` : ''}`
           throw error
         }
         if (attempt > 1) {
           this.log(`knowledge ${path} 第 ${attempt} 次尝试成功（${Date.now() - startedAt}ms）`)
         }
-        return payload?.data ?? {}
+        return { ok: true, data: payload?.data ?? {} }
       } catch (error) {
         const detail = describeError(error)
         const elapsed = Date.now() - startedAt
@@ -329,20 +362,23 @@ export class GatewayClient {
         }
         const why = error?.retryable === false ? '确定性失败，不重试' : `重试后仍失败（共 ${attempt} 次）`
         this.log(`knowledge ${path} ${why}（${elapsed}ms）：${detail}`)
-        return fallback
+        return { ok: false, error: error?.brief ?? `请求失败（${detail}）` }
       }
     }
-    return fallback
+    return { ok: false, error: '知识服务请求失败。' }
   }
 
   /**
    * 列出某个知识资源可用的工具（tools/list）。
-   * 失败返回 `null` —— 与"资源确实没有工具"（返回 `[]`）区分开，便于调用方决定要不要缓存。
+   * 返回 `{ ok: true, tools }` / `{ ok: false, error }` —— 失败与"资源确实没有工具"
+   * （`tools: []`）必须分得开，否则调用方只能把两者都说成"不可达"。
    */
   async knowledgeToolsList(serviceUrl, knowledgeId) {
-    const data = await this.#postTo(serviceUrl, '/tools/list', { knowledge_id: knowledgeId })
-    if (!data || !Array.isArray(data.tools)) return null
-    return data.tools
+    const result = await this.#postTo(serviceUrl, '/tools/list', { knowledge_id: knowledgeId })
+    if (!result.ok) return result
+    const tools = result.data?.tools
+    if (!Array.isArray(tools)) return { ok: false, error: '服务未返回 tools 字段。' }
+    return { ok: true, tools }
   }
 
   /**
@@ -350,17 +386,20 @@ export class GatewayClient {
    *
    * 返回 `{ ok, text }` 而不是裸数据：知识服务在 code-graph 工具执行失败时仍回 code=0，
    * 把错误放在 `data.isError` 里（doc:573）。必须显式判一次，否则失败会被当成成功结果喂给模型。
+   * 请求层失败（4xx / 业务码 / 网络）则把 `#postTo` 的 `error` 原样当 `text` 回给模型。
    */
   async knowledgeToolsCall(serviceUrl, knowledgeId, toolName, params) {
-    const data = await this.#postTo(serviceUrl, '/tools/call', {
+    const result = await this.#postTo(serviceUrl, '/tools/call', {
       knowledge_id: knowledgeId,
       tool_name: toolName,
       params: params ?? {},
     })
-    if (data === null || data === undefined) return { ok: false, text: '知识服务不可达。' }
+    if (!result.ok) return { ok: false, text: result.error }
+    const data = result.data
+    if (data === null || data === undefined) return { ok: false, text: '知识服务返回了空结果。' }
     if (data.isError === true) return { ok: false, text: String(data.text ?? '知识工具执行失败。') }
     if (typeof data.text === 'string') return { ok: true, text: data.text }
-    return { ok: true, text: JSON.stringify(data) }
+    return { ok: true, text: `${JSON.stringify(data)}${annotateEmptyRefs(data)}` }
   }
 
   // ── meta 面（需 userKey；缺省时调用方应跳过并降级）─────────────────────────
@@ -373,6 +412,39 @@ export class GatewayClient {
   metaGetTask(taskId) {
     if (!taskId) return Promise.resolve(null)
     return this.safe('/v3/meta/task/get', { task_id: taskId }, { userKey: true }, null)
+  }
+
+  // ── meta 面 · task 写侧 ────────────────────────────────────────────────────
+  //
+  // 与上面读方法的关键差异：**这四个用 post() 而不是 safe()**。
+  // safe() 的 fail-open 是读侧优点（失败返回 null、不阻断 DSH），但写侧静默失败
+  // 等于"以为记上了其实没记上"—— 正是"对话里的待办要能可靠落库"要消灭的失败模式。
+  // 错误必须原样抛给调用方（lib/tools.mjs 把它转成模型可见的工具输出）。
+  //
+  // header 不带 session/task：meta 面不吃这两个维度（内核按 x-tdai-user-key 解析 caller，
+  // 再校验 creator_user_id == caller），带上只是语义噪音。
+
+  /**
+   * 建 task。`creator_user_id` 必须 == caller（内核 `assertCallerIsResourceOwner` 强制），
+   * 由调用方从当前身份取，不能由模型指定。
+   */
+  metaCreateTask(body) {
+    return this.post('/v3/meta/task/create', body, { userKey: true, session: false, task: false })
+  }
+
+  /** 列 task（查重用）。内核要求 team_id 或 creator_user_id / creator_user_key 至少给一个。 */
+  metaListTasks(body) {
+    return this.post('/v3/meta/task/list', body, { userKey: true, session: false, task: false })
+  }
+
+  /** 改 description / status。内核只允许 task creator 调。 */
+  metaUpdateTask(body) {
+    return this.post('/v3/meta/task/update', body, { userKey: true, session: false, task: false })
+  }
+
+  /** 撤销：物理删除（`{ task_ids: [...] }`）。同样只允许 creator。 */
+  metaDeleteTasks(taskIds) {
+    return this.post('/v3/meta/task/delete', { task_ids: taskIds }, { userKey: true, session: false, task: false })
   }
 
   /**

@@ -16,6 +16,7 @@
         recallEnabled: !!js process.env.TDAI_MEMORY_RECALL_ENABLED ?? ''
         injectionEnabled: !!js process.env.TDAI_MEMORY_INJECTION_ENABLED ?? ''
         captureEnabled: !!js process.env.TDAI_MEMORY_CAPTURE_ENABLED ?? ''
+        taskWriteEnabled: !!js process.env.TDAI_MEMORY_TASK_WRITE_ENABLED ?? ''
         sessionContextEnabled: !!js process.env.TDAI_MEMORY_SESSION_CONTEXT_ENABLED ?? ''
         agentPromptEnabled: !!js process.env.TDAI_MEMORY_AGENT_PROMPT_ENABLED ?? ''
         agentPromptKeepBase: !!js process.env.TDAI_MEMORY_AGENT_PROMPT_KEEP_BASE ?? ''

@@ -94,12 +94,14 @@ const FULL_FACETS = { identity: true, memory: true, skills: true, knowledge: tru
   const skills = []
   const ensurePolicies = []
   let ensureCalls = 0
-  const asset = {
+  let asset = {
     identity: {},
     agentDetail: { id: 'a', name: 'Coder', description: 'd', prompt: 'p' },
     taskDetail: null,
     profiles: [{ ctx: { agentId: 'a', agentName: 'Coder', isSelf: true }, l3: { content: 'persona' }, l2Entries: [{ path: 'p.md', summary: 's' }] }],
     skills: { listing: '- sk1: one' },
+    // SessionAssets 每次成功加载盖的戳；知识 skill 的换新闸门用它
+    loadedAt: 100,
     knowledge: [{ knowledge_id: 'k1', type: 'code-graph', name: 'repo', service_url: 'http://kb' }],
   }
   const ctx = {
@@ -150,8 +152,17 @@ const FULL_FACETS = { identity: true, memory: true, skills: true, knowledge: tru
     '父会话按全量面加载资产')
 
   // (b) 子会话（默认）：身份 / 记忆两段为空（DSH 的 renderPrompt 会把空段整个丢掉），
-  //     状态快照为空；但**知识路由在、知识 skill 注册了、资产按知识面加载**
+  //     状态快照为空；但**知识路由在、知识 skill 会更新、资产按知识面加载**
   //     —— 子 agent 要能自己查 wiki / code-graph。
+  //
+  //     这里给子会话一份"刷新过"的知识资产（新绑了一个 wiki）：正文必须跟着变。
+  //     这一条同时证明子会话确实走在知识注册路径上——旧版断言"子会话也注册一次"，
+  //     但正文级幂等之后，同内容不再重复注册才是正确行为（宿主里已经挂着一份）。
+  asset = {
+    ...asset,
+    loadedAt: 200,
+    knowledge: [...asset.knowledge, { knowledge_id: 'k2', type: 'wiki', name: '团队 wiki', service_url: 'http://kb' }],
+  }
   ensureCalls = 0
   ensurePolicies.length = 0
   const childResult = await assemble(CHILD)
@@ -161,7 +172,8 @@ const FULL_FACETS = { identity: true, memory: true, skills: true, knowledge: tru
   assert.ok(text(childResult, 'tdai:knowledge-tools').includes('<knowledge_tools>'),
     '子会话应注入知识路由（知识库与工具对子 agent 可用）')
   assert.equal(text(childResult, 'harness:identity'), 'You are an AI agent.', '别人的段不许动')
-  assert.equal(skills.length, 2, '子会话应注册知识 skill')
+  assert.equal(skills.length, 2, '子会话的知识资产刷新后，知识 skill 正文应更新')
+  assert.ok(skills.at(-1).content.includes('k2'), '更新后的正文应含子会话新拿到的资源')
   assert.equal(stateText(CHILD), '', '子会话不应有状态快照')
   assert.ok(ensureCalls > 0, '子会话应按知识面加载资产（知识库要能用）')
   assert.deepEqual(ensurePolicies.at(-1), {
@@ -176,7 +188,7 @@ const FULL_FACETS = { identity: true, memory: true, skills: true, knowledge: tru
   ensureCalls = 0
   const inherited = await assemble(CHILD)
   assert.ok(text(inherited, 'tdai:profile-memory').includes('<tdai_profile_memory>'), '开关打开后子会话应注入')
-  assert.equal(skills.length, 2, '知识 skill 按 session 幂等：这个子会话在 (b) 已注册过，不再重复')
+  assert.equal(skills.length, 2, '知识 skill 按正文幂等：资产没变就不再重复注册')
   assert.ok(stateText(CHILD).includes('TDAI memory 状态'), '开关打开后子会话应有状态快照')
   assert.ok(ensureCalls > 0, '开关打开后子会话照常加载资产')
 
@@ -342,7 +354,7 @@ const FULL_FACETS = { identity: true, memory: true, skills: true, knowledge: tru
         ensure: async () => { calls.ensure += 1; return asset },
       },
       client: {
-        knowledgeToolsList: async () => [],
+        knowledgeToolsList: async () => ({ ok: true, tools: [] }),
         knowledgeToolsCall: async () => { calls.executed += 1; return { ok: true, text: '结果原文' } },
       },
       log: () => {},
@@ -376,7 +388,7 @@ const FULL_FACETS = { identity: true, memory: true, skills: true, knowledge: tru
         peek: () => resolved,
         ensure: async () => { h.calls.ensure += 1; resolved = { knowledge: [resource] }; return resolved },
       },
-      client: { knowledgeToolsList: async () => [], knowledgeToolsCall: async () => ({ ok: true, text: '冷启动结果' }) },
+      client: { knowledgeToolsList: async () => ({ ok: true, tools: [] }), knowledgeToolsCall: async () => ({ ok: true, text: '冷启动结果' }) },
       log: () => {},
     }
     registerKnowledgeTools(ctx, runtime)

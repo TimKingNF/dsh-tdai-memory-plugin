@@ -12,7 +12,7 @@ MemoryProxy's core memory capabilities — L2/L3 injection, self + borrowed L1 r
 injection, `session_context` — **natively into the DSH process**. No MemoryProxy forwarding layer is
 involved and credentials never leave the process.
 
-> **Version 0.6.0** · read the [CHANGELOG](CHANGELOG.md) · docs: [DSH 0.1.7-rc.1 compatibility audit & migration](docs/dsh-0.1.7-migration.md) ·
+> **Version 0.6.1** · read the [CHANGELOG](CHANGELOG.md) · docs: [DSH 0.1.7-rc.1 compatibility audit & migration](docs/dsh-0.1.7-migration.md) ·
 > [prompt-injection design notes (中文)](docs/prompt-design.zh-CN.md) ·
 > [construction blueprint (中文)](docs/prompt-injection-redesign.md)
 
@@ -80,7 +80,7 @@ Data sources: `/v3/core/read` (L3), `/v3/scenario/ls` (L2), `/v3/skill/listing` 
 MemoryCore's agent meta stores the persona as **two separate fields** (the two text areas in the
 MemoryPanel agent editor):
 
-| Field | Label in MemoryPanel | Measured locally (`agt-ake7jmcanf`) |
+| Field | Label in MemoryPanel | Measured locally (this deployment's agent) |
 | --- | --- | --- |
 | `metadata_json.ui.role_prompt` | **role prompt** (角色定位 prompt) | 5784 chars / 15500 bytes |
 | `metadata_json.ui.rules_prompt` | **rules prompt** (规则固定 prompt) | 1376 chars / 3588 bytes |
@@ -100,7 +100,7 @@ follow it when replying to the user.
 
 <session_context>                                        <- tdai:session-context (order 520)
 [Agent]
-id: agt-ake7jmcanf
+id: agt-xxxxxxxx
 name: ARK-ALPHA
 description: ...
 <blank line>
@@ -221,13 +221,37 @@ discovery round-trip saved.
 `tdai_knowledge_call` accepts **only resource ids bound to the current session**. If the model invents
 an id, the tool refuses it instead of sending it to the server.
 
-### Slash commands ×4
+### Write-side tools ×4 (`taskWriteEnabled`, **off by default**)
+
+Say "记一下…" in a conversation and the todo is written straight into a MemoryCore task
+(server-side, visible in the Memory panel and to other agents) instead of a local file.
+This goes through the meta plane and **additionally needs a User Key**.
+
+- `tdai_task_add` — the write. **Only called when the user explicitly asks to record something**
+  ("记一下" / "帮我记下来" / "加到 task 里"); inferred todos are not written, at most you get one
+  question. `title` = the user's words compacted into an actionable phrase (≤40 chars), `note` =
+  the original sentence plus context. Dedupes by **exact title**: a running task with the same
+  title gets its description appended instead of a duplicate being created.
+- `tdai_task_list` — list this team's tasks (default `running`); used for dedupe and "what are my
+  open todos".
+- `tdai_task_update` — replace the description (**replace, not append**) or set the status
+  (`running` / `completed`).
+- `tdai_task_delete` — undo (hard delete); only tasks you created can be deleted.
+
+The reply carries the `task_id` — the only handle for undoing it — and `/tdai-task-undo` removes
+whatever this session wrote last, so undo never depends on the model remembering an id.
+The write side is **not fail-open**: 401 (missing/expired user key), 403 (someone else's task) and
+404 (already deleted) are handed to the model verbatim, never turned into a "looks successful"
+message. Design and live evidence: [docs/task-capture-design.zh-CN.md](docs/task-capture-design.zh-CN.md).
+
+### Slash commands ×5
 
 | Command | Purpose |
 | --- | --- |
 | `/tdai-sync` | refresh this session's memory asset cache (session_context / L2L3 / Skill / Knowledge) |
 | `/tdai-status` | show plugin status (identity, switches, loaded assets, knowledge tool prefetch) |
 | `/tdai-archive` | archive the current session now and trigger background Skill extraction (`mem:create-skill` in proxy terms) |
+| `/tdai-task-undo [task_id]` | delete the todo this session wrote last (hard delete; id optional) |
 | `/tdai-help` | quick reference for commands and tools |
 
 ### Write path (`captureEnabled`, an independent switch)
@@ -281,11 +305,11 @@ The read side is therefore split into four facets (`lib/subagent.mjs`). A child 
 The all-or-nothing first cut broke real work: in one four-member research team every
 `tdai_knowledge_call` was refused by the policy gate, so no child could read the team wiki at all —
 the parent had to paste pages in by hand. Knowledge is exactly what a scoped child task needs, so it
-stays on; the 10 read-only tools were never taken away.
+stays on; the read-only tools were never taken away (and the four write-side todo tools came later).
 
 | Switch | Default | Effect inside a child session |
 | --- | --- | --- |
-| `subagentInjectionEnabled` | **off** | withhold identity + memory and skip L1 / skill recall, and skip prewarming those; **knowledge assets, the knowledge skill and all 10 read-only tools stay available** |
+| `subagentInjectionEnabled` | **off** | withhold identity + memory and skip L1 / skill recall, and skip prewarming those; **knowledge assets, the knowledge skill and all 14 tools stay available** |
 | `subagentCaptureEnabled` | **off** | the child's conversation is not written back to MemoryCore |
 
 Setting `subagentInjectionEnabled` restores full inheritance (identity and memory included).
@@ -348,9 +372,10 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
   the floor; descriptions are returned in full, so the cost is count × description length),
   system prompt injection, and the sections under it (session context, **Agent role /
   rules prompt** — optionally keeping the original persona line — long-term memory, knowledge base)
-- **Write side**: conversation write-back (independent of the read side)
+- **Write side**: conversation write-back (independent of the read side), todo capture into tasks
+  (independent, off by default, needs a User Key)
 - **Subagents**: whether child sessions fully inherit the read side (identity + memory + skill recall) and whether
-  their conversations are written back (both off by default — knowledge and the 10 read-only tools
+  their conversations are written back (both off by default — knowledge and the 14 tools
   are available in child sessions regardless)
 - **Identity & addresses**: MemoryCore endpoint, instance id, Team / Agent / User / Task id,
   User Key, knowledge-service origin override
@@ -370,6 +395,12 @@ read master enabled ──┬─ L1 auto recall recallEnabled (cap recallLimit, 
                       └─ read-only tools (no separate switch)
 
 write master captureEnabled —— independent of both enabled and injectionEnabled
+
+write switch taskWriteEnabled —— equally independent (off by default, needs a User Key): gates the
+                                four todo tools (add / list / update / delete). The tools are
+                                **always registered** (it is a volatile field, so flipping it in the
+                                panel does not re-apply the plugin) and the switch is checked at call
+                                time — so while it is off, a call gets an explicit "not enabled".
 
 subagents (keyed on the child session, not on the switches above)
   subagentInjectionEnabled —— child sessions fully inherit the read side (identity + memory + skill recall)?  (default: no)
@@ -407,6 +438,7 @@ export TDAI_MEMORY_TASK_ID=task-xxx         # optional: session_context [Task] b
 # ── switches ──
 export TDAI_MEMORY_ENABLED=true             # read master: recall + injection + tools
 export TDAI_MEMORY_CAPTURE_ENABLED=true     # write-back (write side), independent of every read switch
+export TDAI_MEMORY_TASK_WRITE_ENABLED=false # todo capture into tasks (write side), independent; also needs USER_KEY
 export TDAI_MEMORY_RECALL_ENABLED=true      # L1 auto recall
 export TDAI_MEMORY_INJECTION_ENABLED=true   # system prompt injection master (only the sections below)
 export TDAI_MEMORY_SESSION_CONTEXT_ENABLED=true
@@ -504,7 +536,7 @@ content:
 
 | Document | Language | Content |
 | --- | --- | --- |
-| [CHANGELOG.md](CHANGELOG.md) | 中文 | release history; 0.6.0 records cloud-skill recall on demand and the role/rules injection template, 0.5.0 the DSH 0.1.7-rc.1 migration, 0.4.0 every fix with its root cause and covering test |
+| [CHANGELOG.md](CHANGELOG.md) | 中文 | release history; 0.6.1 records the knowledge-skill hot update (process-level freeze) and the knowledge-tool allowlist alignment, 0.6.0 cloud-skill recall on demand and the role/rules injection template, 0.5.0 the DSH 0.1.7-rc.1 migration, 0.4.0 every fix with its root cause and covering test |
 | [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md) | 中文 | compatibility audit against DSH 0.1.7-rc.1: every contract checked, with live evidence, plus the migration record and verification results |
 | [docs/prompt-design.zh-CN.md](docs/prompt-design.zh-CN.md) | 中文 | the prompt-injection optimisation rationale, prompt-cache risks (including "installing other plugins invalidates the prefix cache") and known open issues |
 | [docs/prompt-injection-redesign.md](docs/prompt-injection-redesign.md) | 中文 | the construction blueprint: every decision, every citation into DSH / plugin / proxy source |

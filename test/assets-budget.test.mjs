@@ -130,7 +130,7 @@ const ctxCfg = (over = {}) => ({ ...baseCfg, sessionContextEnabled: true, ...ove
     skillListing: async () => null,
     metaAgentKnowledgeIds: async () => ['cg-1'],
     knowledgeList: async () => items,
-    knowledgeToolsList: async (url) => { calls.push(url); return [{ name: 'explore' }] },
+    knowledgeToolsList: async (url) => { calls.push(url); return { ok: true, tools: [{ name: 'explore' }] } },
   }
   const calls = []
   const assets = new SessionAssets(client, ctxCfg({ knowledgeEnabled: true, userKey: 'uk', knowledgeEndpoint: 'http://127.0.0.1:8424' }))
@@ -147,7 +147,7 @@ const ctxCfg = (over = {}) => ({ ...baseCfg, sessionContextEnabled: true, ...ove
     skillListing: async () => null,
     metaAgentKnowledgeIds: async () => ['cg-1'],
     knowledgeList: async () => [{ knowledge_id: 'cg-1', type: 'code-graph', name: 'r', service_url: 'http://kb.internal:9000/v3' }],
-    knowledgeToolsList: async () => [],
+    knowledgeToolsList: async () => ({ ok: true, tools: [] }),
   }
   const assets = new SessionAssets(client, ctxCfg({ knowledgeEnabled: true, userKey: 'uk' }))
   const asset = await assets.ensure('s1')
