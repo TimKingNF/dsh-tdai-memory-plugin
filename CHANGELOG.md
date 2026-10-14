@@ -4,14 +4,117 @@
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-> **测试范围声明（0.6.1）**：本版本在 **DeepSeek Harness `0.2.0-rc.2`**（本机当前运行版本，与 0.6.0 同一基线）
+> **测试范围声明（0.7.0）**：本版本在 **DeepSeek Harness `0.2.0-rc.2`**（本机当前运行版本）
 > 与 **TencentDB-Agent-Memory `v2.0.1`** 上实操验证过：system 段注入、`agent/pre-step` 两段召回
-> （L1 + skill）、10 个只读工具、设置面板均已实际使用。上一发布版（0.5.0）的验证基线是
-> `0.1.7-rc.1`，其迁移审计见 [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md)。
+> （L1 + skill）、14 个工具（10 只读 + 4 写侧待办，后者需另开开关与 User Key）、设置面板均已实际使用；
+> 0.7.0 新增的 task 写侧另有真连内核的 E2E（`scripts/task-write-e2e.mjs`，跑完自清理）。
+> 上一发布版（0.6.1）的验证基线是 DSH `0.2.0-rc.2` + MemoryCore `v2.0.1`；更早的 `0.1.7-rc.1`
+> 迁移审计见 [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md)。
 > 其它 DSH / MemoryCore 组合未验证，
 > 尤其 DSH 的 `SECTION_ORDERS` / `CONTEXT_ORDERS` 两张表、`agent/pre-step`、
 > `system-prompt/assemble`、以及设置页的 `Config` + `configForms` 契约变化会影响本插件
 > （见 README「兼容性与测试范围」，以及 [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md)）。
+
+---
+
+## [Unreleased]
+
+## [0.7.0] - 2026-10-15
+
+### 新增：对话里说"记一下" → 待办直接写进 TDAI task（`taskWriteEnabled`，默认关）
+
+#### 为什么
+
+待办此前只活在三种地方，都不是长期档案：DSH 原生 `todo_write`（会话一关就没）、
+团队任务板（随团队生命周期）、本地待办 md（**很容易跟踪丢失**）。目标载体是 MemoryCore
+的 task —— 服务端持久、MemoryPanel 可见、其他 agent 可见、且带 `task_id` 归属。
+
+#### 设计（**工具是手、模型是脑、skill 是口径**，不是三选一）
+
+- 判定留给**模型**：待办判定是语义问题（"下周三前交报告" vs "最近在琢磨换电脑"），
+  正则做不到；再起一路 LLM 抽取则是每轮重复付费。
+- **插件出工具**：只有插件进程拿得到 `x-tdai-user-key`，凭据不进模型可见的 prompt。
+- **口径写进工具 description**（工具 schema 本来每轮都在上下文里，不额外占注入预算），
+  详细 SOP 留给云端 skill。
+- 被否掉的：插件正则拦截自动写（无判定力）、每轮旁路 LLM 抽取（成本）、
+  上游 `mem:create-task` 命令族（DSH 直连内核，不经过 MemoryProxy 的 LLM 转发）。
+
+#### 触发口径：只在用户明确要求时写（保底档）
+
+"记一下" / "帮我记下来" / "加到 task 里" 才算；推测出的待办不写（最多问一句要不要记），
+自己提议的事、用户的提问都不写。同一轮里用户说过一次之后，他点出的多条待办都记。
+
+#### 实现
+
+| 文件 | 改动 |
+| --- | --- |
+| `client.mjs` | meta 面新增 `metaCreateTask` / `metaListTasks` / `metaUpdateTask` / `metaDeleteTasks`；**用 `post()` 不用 `safe()`** —— 写侧静默失败 = 假成功 |
+| `client.mjs` | `post()` 的非 2xx 分支补上**响应体里的 `code`/`message`**（原先只抛 `HTTP 403`，把唯一能修的线索丢掉） |
+| `lib/tools.mjs` | 新增 `registerTaskTools`：4 个工具 + 会话级「最近写入的 task_id」记录（供撤销） |
+| `config.mjs` / `lib/settings.mjs` / `client.card.tsx` / `cordis.patch.yml` | 新开关 `taskWriteEnabled`（默认关，volatile，面板可见，env `TDAI_MEMORY_TASK_WRITE_ENABLED`） |
+| `lib/commands.mjs` | `/tdai-task-undo [task_id]`（删本会话最近写入的那条，不依赖模型记住 id）；`/tdai-status` 与 `/tdai-help` 同步 |
+| `test/task-write.test.mjs` | 新增：payload 形状 / 精确去重 / 开关与 userKey 缺失时零网络拒绝 / **失败必须 fail-loud** / 撤销 |
+| `test/load.test.mjs` | 工具数 10 → 14，并断言 4 个写工具**无条件注册**（开关是 volatile，条件注册会延迟到重启才生效） |
+| `scripts/task-write-e2e.mjs` | 可重复的真连 E2E（create → get → update → list → delete → 复核 404），跑完自清理 |
+
+#### 验证（2026-10-14 实测，本机内核 `127.0.0.1:8420`）
+
+- E2E 全绿：伪造 `creator_user_id` 被 403 拒绝；create/get/update/精确 title 查重/delete 全通过；
+  删除后裸 post 得 `404 task_not_found`、`list` 回到 0 条、库中无残留。
+- 单测：`npm test` 全绿（新增 15 组断言，含"写侧失败文案里不得出现读侧那句『暂时不可用』"）。
+- 实现期踩到并修掉的两个坑：① `/tdai-task-undo` 的 rawInput 里命令名本身就含 `task-undo`，
+  按 `task-[0-9a-z]+` 匹配会把它当成显式 id → "最近一条"兜底永不生效（已加"先摘命令名 + id ≥6 位"双保险）；
+  ② E2E 脚本一开始拿 `metaGetTask` 等 404 异常 —— 它是读侧 fail-open（吞掉 404 返回 null），
+  等不到异常，改裸 `post` 观察服务端真实响应。
+
+#### 代价（明确记一笔）
+
+4 个工具的 schema 是**常驻上下文**：实测 2872 B（`tdai_task_add` 一条就 1308 B），
+工具 schema 总量 6543 B → **9415 B**。默认关也照付这笔钱 —— 因为不改注册机制就无法
+"关着时注册、打开时生效"（volatile 字段变更不重新 apply 插件）。
+`docs/prompt-design.zh-CN.md` 里"工具 schema 未纳入预算测试"那条缺口因此更值钱了。
+
+### 修复：知识服务的失败被一律说成"不可达" —— 参数写错也看不出原因
+
+#### 现象（2026-10-14 实测）
+
+- 模型把 `read_page` 的 `refs` 写成了 `path`。服务端回得很清楚：
+  `{"code":400,"message":"refs is required (non-empty array)"}`，
+  但模型收到的是 **`知识工具调用失败：知识服务不可达。`**
+- 拿到这个"对方挂了"的假诊断之后，它连试四种参数写法（`path` / 裸路径 / `id` / 另一个字段），
+  五次全败，于是断定"知识库里没有"，改用本地文件自己拼了一份文档。
+- 直连实测：`POST 127.0.0.1:8424/v3/tools/call` **200 / 3.8ms**，服务全程是好的；
+  同一条 4xx 响应里那句 `refs is required` 一直都在，只是没人转达。
+
+#### 根因
+
+`GatewayClient.#postTo()` 把**所有**失败（网络错误 / HTTP 4xx / 5xx / 信封 `code != 0`）都归成
+同一个 `null` 返回值，调用方（`knowledgeToolsCall` / `knowledgeToolsList`）只能回一句
+"知识服务不可达"。真实原因（HTTP 状态、业务码、服务端 message）只写进插件日志，
+而插件的 `log()` 走 `ctx.logger.warn`、**不落盘** —— 等于唯一能修它的那一方看不到。
+
+#### 修复
+
+- `#postTo` 改为返回 `{ ok: true, data }` / `{ ok: false, error }`：`error` 是**给模型看的一句话**，
+  含 HTTP 状态 / 业务码 / 服务端 message；只有纯网络层失败才说"请求失败（… cause: …）"。
+  重试判据不变（网络 / 5xx / 429 重试一次；4xx 与业务码不重试）。
+- `knowledgeToolsList` 同步改成 `{ ok, tools }` / `{ ok: false, error }`，与"资源确实没有工具"
+  （`tools: []`）分得开；`tdai_knowledge_tools` 的文案从"无法获取 X 的工具清单（知识服务不可达）"
+  改成带上真实原因；`assets.mjs` 的工具清单预取与三处测试桩同步适配。
+- 顺带补一个**静默失败点**：wiki 的 `read_page` 对取不到的引用回 `code=0` +
+  `{ref, not_found:true}`（没有 `content`），模型分不清"页面不存在"和"这页是空的"。
+  现在会在 JSON 之后追加一句
+  `[tdai] N 个引用没取到内容（页面不存在、路径写错或本来就是空页）：…`。
+
+#### 测试
+
+- `test/knowledge-retry.test.mjs`：新增 4xx / 5xx / 业务码的错误转达断言（含事故现场那条
+  `HTTP 400 · refs is required (non-empty array)`）、"只有纯网络失败才说请求失败"、
+  `tools/list` 的三态（成功 / 失败 / 空清单）、空引用注解；原先断言"一律 知识服务不可达"的
+  用例全部改成新语义。
+- 变异验证：把 `error.brief` 退回写死的"知识服务不可达。" → 用例 2 立刻挂。
+- **用真实服务跑了一遍**（不打桩、不改运行中的 dsh）：错参数 → 服务端原话；
+  正确 `refs` → 正文正常返回；不存在的页 → 空引用注解；`tools/list` → 7 个工具。
 
 ---
 
