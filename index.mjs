@@ -13,6 +13,12 @@
  * 写侧（captureEnabled，独立开关）：
  *   - 每轮结束旁路回流 /v3/conversation/add（L0）+ /v3/skill/conversation/add（Skill 归档）
  *
+ * 写侧（taskWriteEnabled，独立开关，**默认关**）：
+ *   - 对话内待办写入 TDAI task（4 个工具）：tdai_task_add / tdai_task_list /
+ *     tdai_task_update / tdai_task_delete；走 meta 面，另需 userKey。
+ *     只在用户明确说"记一下"时写，失败原样回给模型（不 fail-open）。
+ *     口径与设计见 docs/task-capture-design.zh-CN.md。
+ *
  * 子 agent 会话（DSH 派出去的子会话，session.header.origin === 'subagent'）默认
  * **只保留知识库与工具**：不注入身份（`tdai:session-context`）与记忆（`tdai:profile-memory`
  * / L1 召回 / `tdai:state` 快照）、不预热这些资产、不回流；但知识资产、`tdai:knowledge-tools`
@@ -42,7 +48,7 @@ import { SessionAssets } from './lib/assets.mjs'
 import { registerSections } from './lib/sections.mjs'
 import { wireRecall } from './lib/recall.mjs'
 import { wireCapture } from './lib/capture.mjs'
-import { registerTools, registerKnowledgeTools } from './lib/tools.mjs'
+import { registerTools, registerKnowledgeTools, registerTaskTools } from './lib/tools.mjs'
 import { registerCommands } from './lib/commands.mjs'
 import { buildSettingsSchema, applySettings, identitySourceOf, SETTINGS_NAMESPACE } from './lib/settings.mjs'
 import { subagentReadPolicy, isSubagentSession } from './lib/subagent.mjs'
@@ -94,6 +100,16 @@ export function apply(ctx, config = {}) {
     get config() { return live().cfg },
     log,
     readEnabled() { const cfg = live().cfg; return cfg.enabled && identityComplete(cfg) },
+    /**
+     * 有没有配 user key（meta 面鉴权）。
+     *
+     * 为什么单独暴露：`identityComplete` 只覆盖四元组，user key 是**另一个维度**——
+     * 缺它时读侧（召回 / 注入）照常工作，只有 meta 面（agent/task 详情、借入资产、
+     * task 写入）会 401。写侧工具必须先判它，否则模型会拿到一句"HTTP 401"去猜。
+     */
+    hasUserKey() { return Boolean(str(live().cfg.userKey)) },
+    /** 待办写入开关（独立写侧；不在 readEnabled 之下）。 */
+    taskWriteEnabled() { return Boolean(live().cfg.taskWriteEnabled) },
     /** 该会话的读侧能力面（身份 / 记忆 / 云端 skill 召回 / 知识，见 lib/subagent.mjs）。 */
     readPolicyFor(session) { return subagentReadPolicy(live().cfg, session) },
     /** 这个会话是不是 DSH 派出去的子 agent 会话（/tdai-status 用它解释"为什么没注入"）。 */
@@ -142,6 +158,7 @@ export function apply(ctx, config = {}) {
   wireRecall(ctx, runtime)
   registerTools(ctx, runtime)
   registerKnowledgeTools(ctx, runtime)
+  registerTaskTools(ctx, runtime)
   // commands 服务可选（缺省时优雅降级，不影响其它能力）；用注入后的 ctx 而非外层 ctx
   ctx.inject(['commands'], (commandsCtx) => registerCommands(commandsCtx, runtime))
 
@@ -182,7 +199,7 @@ export function apply(ctx, config = {}) {
     }
   }
   const boot = live().cfg
-  log(`enabled: endpoint=${boot.endpoint} instance=${boot.serviceId} team=${boot.teamId} agent=${boot.agentId} recall=${boot.recallEnabled} inject=${boot.injectionEnabled} capture=${boot.captureEnabled}`)
+  log(`enabled: endpoint=${boot.endpoint} instance=${boot.serviceId} team=${boot.teamId} agent=${boot.agentId} recall=${boot.recallEnabled} inject=${boot.injectionEnabled} capture=${boot.captureEnabled} taskWrite=${boot.taskWriteEnabled}`)
 }
 
 function buildClient(cfg, log) {
