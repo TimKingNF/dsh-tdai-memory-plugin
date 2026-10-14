@@ -75,7 +75,7 @@ API**（host 侧 `settings.register()`，加上 client 侧 `settingsScope` 服�
 
 MemoryCore 的 agent meta 把"人格"拆成两个字段（MemoryPanel 的 Agent 编辑页里就是这两栏）：
 
-| 字段 | MemoryPanel 里的叫法 | 本机实测（`agt-ake7jmcanf`） |
+| 字段 | MemoryPanel 里的叫法 | 本机实测（本机 agent） |
 | --- | --- | --- |
 | `metadata_json.ui.role_prompt` | **角色定位 prompt** | 5784 字符 / 15500 字节 |
 | `metadata_json.ui.rules_prompt` | **规则固定 prompt** | 1376 字符 / 3588 字节 |
@@ -95,7 +95,7 @@ follow it when replying to the user.
 
 <session_context>                                        ← tdai:session-context（order 520）
 [Agent]
-id: agt-ake7jmcanf
+id: agt-xxxxxxxx
 name: ARK-ALPHA
 description: 旧人类留下的最后一座人工智能核心
 
@@ -126,7 +126,7 @@ id: …
 （子 agent 默认拿不到）；角色 / 规则住在会话上下文块里，所以**块关掉时它们与指引句一起消失**。
 
 **子 agent 会话（DSH 派出去的子会话）默认只保留其中的「知识库 + 工具」**（知识路由、
-`tdai-team-knowledge` skill 与 10 个只读工具），身份与会记忆相关的那几项不注入，见
+`tdai-team-knowledge` skill 与 14 个工具），身份与会记忆相关的那几项不注入，见
 [子 agent 会话](#子-agent-会话默认保留知识库与工具不注入身份与记忆)。
 
 **L1 召回为什么不写进用户那条消息**：宿主要在 `agent/pre-step` 之后把
@@ -212,13 +212,32 @@ schema 从 2774 → 6446 字节（新增 2 个知识工具 + 记忆工具描述�
 `tdai_knowledge_call` 只接受**当前会话已绑定**的知识资源 id：模型若凭空编一个 id，
 工具直接拒绝，不会拿它去请求服务端。
 
-### Slash 命令 ×4
+### 写侧工具 ×4（`taskWriteEnabled`，**默认关**）
+
+对话里说"记一下…"，待办直接写进 MemoryCore 的 task（服务端持久、MemoryPanel 可见、
+其他 agent 可见），不再落到本地文件。走 meta 面，**另需 User Key**。
+
+- `tdai_task_add` —— 写入。**只在用户明确要求记录时调用**（"记一下" / "帮我记下来" /
+  "加到 task 里"）；推测出的待办不写，最多问一句要不要记。
+  `title` 用用户原话压成 ≤40 字的可执行短句，`note` 存原话与上下文；
+  默认按**精确同名**去重：命中同名 running 待办就追加描述，不新建。
+- `tdai_task_list` —— 列本团队 task（默认 `running`），用于查重与"我现在有哪些待办"。
+- `tdai_task_update` —— 改描述（**替换**，非追加）或状态（`running` / `completed`）。
+- `tdai_task_delete` —— 撤销（物理删除），只允许删自己创建的。
+
+回执里带 `task_id`，那是对外唯一的撤销把手；`/tdai-task-undo` 则删本会话最近一次写入的
+那条（不依赖模型记住 id）。写侧**不用 fail-open**：401（user key 缺失/失效）、
+403（改别人的 task）、404（task 已被删）都原样回给模型，绝不返回"看起来成功"的文案。
+设计与实测见 [docs/task-capture-design.zh-CN.md](docs/task-capture-design.zh-CN.md)。
+
+### Slash 命令 ×5
 
 | 命令 | 作用 |
 | --- | --- |
 | `/tdai-sync` | 刷新当前会话的记忆资产缓存（session_context / L2L3 / Skill / Knowledge） |
 | `/tdai-status` | 查看插件状态（身份来源、开关、已加载资产、知识工具清单是否预取成功） |
 | `/tdai-archive` | 立即归档当前会话，触发后台 Skill 提取（对应 proxy 的 `mem:create-skill`） |
+| `/tdai-task-undo [task_id]` | 撤销本会话最近写入的待办 task（物理删除；可带 id 指定） |
 | `/tdai-help` | 命令与工具速查 |
 
 ### 写侧（`captureEnabled`，独立开关）
@@ -268,11 +287,11 @@ section，并且同样触发进程级的监听。不设策略时的实测后果�
 
 初版是"读侧一刀切"，落地后撞了真实事故：一个四人调查团队的所有 `tdai_knowledge_call`
 都被策略闸门拒绝，谁都读不到 wiki，只能由父会话逐页投喂原文。**知识库恰恰是范围明确的
-子任务干活要用的能力**，所以它留在子会话里；而 10 个只读工具本来就没被摘掉。
+子任务干活要用的能力**，所以它留在子会话里；而只读工具本来就没被摘掉（写侧的 4 个待办工具是后加的）。
 
 | 开关 | 默认 | 对子会话的效果 |
 | --- | --- | --- |
-| `subagentInjectionEnabled` | **关** | 不注入身份 + 记忆、不做 L1 召回与 skill 召回，也不为这些面预热资产；**知识资产、知识 skill 与 10 个只读工具照常可用** |
+| `subagentInjectionEnabled` | **关** | 不注入身份 + 记忆、不做 L1 召回与 skill 召回，也不为这些面预热资产；**知识资产、知识 skill 与 14 个工具照常可用** |
 | `subagentCaptureEnabled` | **关** | 子会话的对话不回流 MemoryCore |
 
 打开 `subagentInjectionEnabled` = 恢复"与父会话完全一致"（含身份与记忆）。
@@ -332,9 +351,9 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
   System prompt 注入，以及注入下的各段（会话上下文、**Agent 角色 / 规则 prompt** ——
   挂在会话上下文下面，可再选"保留原 persona 行"、长期记忆、知识库）；
   上层关掉时下层在卡片上置灰并说明原因
-- **写侧**：对话回流（独立于读侧）
+- **写侧**：对话回流（独立于读侧）、待办写入 task（独立，默认关；另需 User Key）
 - **子 agent**：子会话是否**全量继承**读侧（身份 + 记忆 + skill 召回）、是否回流（默认都关；
-  知识库与 10 个只读工具在子会话里本就可用）
+  知识库与 14 个工具在子会话里本就可用）
 - **身份与地址**：MemoryCore 地址、实例 ID、Team / Agent / User / Task ID、User Key、
   知识服务地址改写
 
@@ -353,6 +372,11 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
                      └─ 只读工具（无独立开关）
 
 写侧总开关 captureEnabled —— 独立，既不受 enabled 也不受 injectionEnabled 约束
+
+写侧开关 taskWriteEnabled —— 同样独立（默认关，另需 User Key）：管 4 个待办工具
+                             （add / list / update / delete）。工具**始终注册**
+                             （它是 volatile 字段，改面板不会重新 apply 插件），
+                             开关判据在调用时——所以关着时调用会得到明确的"未启用"。
 
 子 agent 会话（按会话判定，不受上面开关影响；能力面见 lib/subagent.mjs）
   subagentInjectionEnabled —— 子会话是否全量继承读侧（身份 + 记忆）  默认关
@@ -386,6 +410,7 @@ export TDAI_MEMORY_TASK_ID=task-xxx         # 可选：session_context [Task] �
 # ── 开关 ──
 export TDAI_MEMORY_ENABLED=true             # 读侧总开关：召回 + 注入 + 工具
 export TDAI_MEMORY_CAPTURE_ENABLED=true     # 回流（写侧），独立于读侧全部开关
+export TDAI_MEMORY_TASK_WRITE_ENABLED=false # 对话内待办写入 task（写侧），独立；另需 USER_KEY
 export TDAI_MEMORY_RECALL_ENABLED=true      # L1 自动召回
 export TDAI_MEMORY_INJECTION_ENABLED=true   # system prompt 注入总闸（只管下面那几个段）
 export TDAI_MEMORY_SESSION_CONTEXT_ENABLED=true
