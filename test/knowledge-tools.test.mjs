@@ -30,7 +30,11 @@ function harness({ cfg = {}, asset = null, client = {}, assets = {} } = {}) {
     assets: { peek: () => asset, ...assets },
     log: () => {},
     client: {
-      async knowledgeToolsList(url, id) { calls.push(['list', url, id]); return client.list ?? null },
+      // 与 client.mjs 的新契约一致：{ ok, tools } / { ok: false, error }
+      async knowledgeToolsList(url, id) {
+        calls.push(['list', url, id])
+        return Array.isArray(client.list) ? { ok: true, tools: client.list } : { ok: false, error: client.listError ?? '知识服务请求失败。' }
+      },
       async knowledgeToolsCall(url, id, name, params) {
         calls.push(['call', url, id, name, params])
         return client.call ?? { ok: true, text: 'ok' }
@@ -119,9 +123,9 @@ const boundAsset = {
   assert.ok(out.includes('`search`'))
 }
 {
-  const h = harness({ asset: boundAsset, client: { list: null } })
+  const h = harness({ asset: boundAsset, client: { listError: 'HTTP 500 · kb down' } })
   const out = await h.run('tdai_knowledge_tools', { knowledge_id: 'cg-1' })
-  assert.ok(out.includes('不可达'), '取不到清单时应如实说明')
+  assert.ok(out.includes('kb down'), `取不到清单时应把服务端原因转达出去，实际：${out}`)
 }
 
 // ── 6) 两个工具都注册了，且 schema 是合法的 JSON Schema 对象 ─────────────────
@@ -167,7 +171,7 @@ const boundAsset = {
     } },
     log: () => {},
     client: {
-      async knowledgeToolsList() { return [] },
+      async knowledgeToolsList() { return { ok: true, tools: [] } },
       async knowledgeToolsCall() { return { ok: true, text: 'CALLED' } },
     },
   })
@@ -192,7 +196,7 @@ const boundAsset = {
     readEnabled: () => true,
     assets: { peek: (sessionId) => { seen.push(sessionId); return boundAsset } },
     log: () => {},
-    client: { async knowledgeToolsList() { return [] }, async knowledgeToolsCall() { return { ok: true, text: 'OK' } } },
+    client: { async knowledgeToolsList() { return { ok: true, tools: [] } }, async knowledgeToolsCall() { return { ok: true, text: 'OK' } } },
   })
   await tools.get('tdai_knowledge_tools').execute({ knowledge_id: 'cg-1' })
   assert.deepEqual(seen, ['live-session'], '无 exec 时应回落 ctx.agent.session')

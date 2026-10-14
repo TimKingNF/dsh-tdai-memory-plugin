@@ -354,7 +354,7 @@ const FULL_FACETS = { identity: true, memory: true, skills: true, knowledge: tru
         ensure: async () => { calls.ensure += 1; return asset },
       },
       client: {
-        knowledgeToolsList: async () => [],
+        knowledgeToolsList: async () => ({ ok: true, tools: [] }),
         knowledgeToolsCall: async () => { calls.executed += 1; return { ok: true, text: '结果原文' } },
       },
       log: () => {},
@@ -388,7 +388,7 @@ const FULL_FACETS = { identity: true, memory: true, skills: true, knowledge: tru
         peek: () => resolved,
         ensure: async () => { h.calls.ensure += 1; resolved = { knowledge: [resource] }; return resolved },
       },
-      client: { knowledgeToolsList: async () => [], knowledgeToolsCall: async () => ({ ok: true, text: '冷启动结果' }) },
+      client: { knowledgeToolsList: async () => ({ ok: true, tools: [] }), knowledgeToolsCall: async () => ({ ok: true, text: '冷启动结果' }) },
       log: () => {},
     }
     registerKnowledgeTools(ctx, runtime)
