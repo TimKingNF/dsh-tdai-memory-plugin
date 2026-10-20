@@ -19,6 +19,59 @@
 
 ## [Unreleased]
 
+### 修复：读侧工具失败不再伪装成「（无结果）」（候选 1，P0）
+
+#### 为什么
+
+读侧工具此前有两个叠加的吞口，模型看到的失败全变成"记忆里没有"：
+
+1. `client.mjs` 的 `safe()` 把 4xx / 超时 / 网络错误的原因吞进日志，回落 `{}` / `[]` / `null`；
+2. `lib/tools.mjs` 把 `null` / `[]` / `{}` 一律说成「（无结果）」。
+
+于是网关 403、请求超时、反代 200 错误页三种情况下，模型都对用户说"我不记得"。
+0.6.1 已经在知识链路上修过同类事故（把 4xx 说成"不可达"→ 模型连试 4 种参数后
+自己拼文档，见 [0.6.1] 一节）；本版把这套 `{ok, data|error}` 范式推广到普通读侧工具。
+
+#### 设计
+
+- `client.mjs` 新增私有 `#exchange()`：**一次请求 + 失败归一化，不重试、不抛**。
+  产物 `{kind, brief, log, retryable, raw}`：`kind ∈ timeout | aborted | network |
+  protocol | http | business`。`brief` 是白名单拼装（status / 业务 code / 服务端
+  message / `cause.code`），**不含 base URL、路径、请求头、密钥**。
+- 三条外层各自保留原有职责：`post()` 抛错（写侧 `taskWriteFailure` 的 message 格式
+  逐字未变）、`safe()` 记日志回落（16 个调用点与注入链路零改动）、`#postTo()`
+  保留 1 次重试；两套链路从此共用同一脱敏口径。
+- 只读工具走新增的严格通道 `attemptXxx()`（`{ok, data|error}`，不抛），旧方法
+  （`searchL1` 等）保留原返回形状，内部改成「严格通道 + fallback」两行。
+- `protocol` 是**第四种失败形态**：旧代码 `resp.json().catch(() => ({}))` 把
+  HTTP 200 + HTML/空 body 洗成 `{}` 当成"成功但无数据"，现在归为
+  `响应无法解析（HTTP 200，不是 JSON）`。
+- 工具层失败文案写明「这次没有取到结果，不等于记忆里没有相关内容」，堵住
+  "失败 = 没有"的误读；合法空结果（200 + 空集合）仍严格回「（无结果）」。
+- 写侧：`taskWriteFailure` 与四个写工具不动（它们本来就走 `post()` 直抛）。
+
+#### 实现
+
+| 文件 | 改动 |
+| --- | --- |
+| `client.mjs` | 新增 `#exchange` / `#request` / `#attemptCall` 与 8 个 `attemptXxx`；`#postTo` 改走同一底层；`post()` / `safe()` 对外行为逐字不变 |
+| `lib/tools.mjs` | 8 个只读工具改走 `attemptXxx`；新增 `readFailureText`；`protocol` 失败不再塌成空结果 |
+| `test/tools-failure.test.mjs` | 新增 14 组用例：4xx / 5xx / 超时 / 取消 / 网络（`ECONNREFUSED`）/ 协议错误 / 合法空结果 / 业务码 / `null` 双语义 / 注入链路 fail-open / 写侧错误格式 / 10 只读工具行为级完备性 / 4 写侧不假成功 / 脱敏（host+port 显式断言） |
+
+### 测试：工具 schema 体积纳入 prompt 预算（候选 2）
+
+- 新增口径（与本文档旧数不同源，旧数作废）：逐项
+  `Buffer.byteLength(JSON.stringify({name, description, parameters}), 'utf8')`，
+  合计 = 逐项之和，**不含** output schema。实证 14 个工具合计 **9165 B**
+  （其中 name+description 5478 B；最大 `tdai_task_add` 1225 B）。
+- `test/prompt-budget.test.mjs` 两道闸：逐项等值 `prompt-budget.baseline.json`
+  的 `toolSchema` 段（由 `--save` 现场生成，不手填）+ 合计 ≤ 10000 B 政策上界
+  （9165 × 1.09 取整）；baseline 自洽断言「逐项之和 === 合计」；另做变异验证
+  （给任一 description 加 200 B，判定函数必须抛）。
+- 订正过期数字：`CHANGELOG.md`（旧称"10 个 ≈6446 字节未覆盖"）与
+  `docs/prompt-design.zh-CN.md` 的已知缺口表 d 行；README 补「六个键为何刻意
+  不上面板」的说明。
+
 ## [0.7.0] - 2026-10-15
 
 ### 新增：对话里说"记一下" → 待办直接写进 TDAI task（`taskWriteEnabled`，默认关）
@@ -841,8 +894,9 @@ system 段注入从 **9953 → 5768 字节（-42%）**，其中团队知识块�
   断言"清单里的每个标记都必须真能被剥掉"。
 - `docs/prompt-injection-redesign.md` §9 决策表第 4 行仍写着"L1 召回改成 prepend 语义"，
   该决定已在 §11 回退，**以 §11 为准**。
-- 工具 schema（10 个 ≈6446 字节）尚未纳入 `test/prompt-budget.test.mjs` 的预算覆盖，
-  后续加工具或改 description 时不会有红灯提醒。
+- ~~工具 schema 尚未纳入 prompt 预算~~ → **已覆盖**（[Unreleased] 改动）：`test/prompt-budget.test.mjs`
+  按「逐项 name+description+parameters 序列化字节」写入 baseline 等值断言（14 个工具实测 9165 B），
+  另有 10000 B 政策上界与变异验证。旧数「10 个 ≈6446 字节」是 0.6.1 的口径，已作废。
 - 子 agent 降级**不含工具**：10 个只读工具在子会话里仍然注册（约 6446 字节 schema）。
   要连工具一起对子 agent 收紧，用 DSH 原生的 `dsh-tool-subagent` 的 `toolFilter`
   （`tools.restrict()`）—— 那是部署级选择，且会让前缀在最前面分叉。

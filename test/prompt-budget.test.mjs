@@ -17,6 +17,7 @@ import assert from 'node:assert'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { apply } from '../index.mjs'
 import {
   renderSessionContext,
   renderProfileMemory,
@@ -30,6 +31,86 @@ import { OVERVIEW_TEXT } from '../lib/sections.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const baselinePath = join(here, 'prompt-budget.baseline.json')
+
+// ── 工具 schema 预算（14 个工具每轮都在上下文里，按 token 付费）─────────────────
+//
+// 口径（与 CHANGELOG / docs/prompt-design 的 9165 B 同源，**别再换算法**）：
+//   逐项 = Buffer.byteLength(JSON.stringify({ name, description, parameters }), 'utf8')
+//   合计 = 逐项之和（不是整数组序列化——否则逗号/括号/字段顺序一变数就漂）
+//   不含 output schema，也不含调用参数。
+// 两道闸：
+//   1) 逐项等值 baseline：任一 description +200 B 必红；baseline 由 --save 现场生成，不手填；
+//   2) 合计 ≤ 10000 B 政策上界（9165 × 1.09 取整）。只靠 1 挡不住"一次性刷新 baseline
+//      顺带涨 20%"，所以这道独立兜底闸不能少。
+const TOOL_SCHEMA_TOTAL_CAP = 10_000
+const TOOL_COUNT = 14
+
+/** 用与 test/load.test.mjs 同款的 mock cordis ctx 跑一次 apply()，
+ *  拿**真正注册进 DSH 的工具清单**——手抄名字表会在新增工具时悄悄漏测。 */
+function captureRegisteredTools() {
+  const tools = []
+  const settingsCtx = {
+    effect(fn) { const disposer = fn(); return typeof disposer === 'function' ? disposer : () => {} },
+    settings: {
+      configure() {},
+      describe() {
+        return [{
+          ns: 'tdai-memory', autoGenerate: false, schema: {}, value: {},
+          user: { serviceId: 'from-panel' }, base: { serviceId: 'from-env' },
+          revision: 1, applies: 'live',
+        }]
+      },
+    },
+  }
+  const commandsCtx = { commands: { register() {} } }
+  const ctx = {
+    logger: { warn() {} },
+    fiber: { id: 'tdai-memory' },
+    inject(deps, cb) {
+      if (!Array.isArray(deps)) return
+      if (deps.includes('settings')) cb(settingsCtx)
+      if (deps.includes('commands')) cb(commandsCtx)
+    },
+    tools: { register(def) { tools.push(def) } },
+    systemPrompt: { section() {} },
+    sessions: { list() { return [] } },
+    on() {},
+    get() { return undefined },
+  }
+  apply(ctx, {})
+  return tools
+}
+
+const serializeToolSchema = (tool) => JSON.stringify({
+  name: tool.name, description: tool.description, parameters: tool.parameters,
+})
+
+function measureToolSchema(tools) {
+  const perTool = {}
+  for (const tool of tools) perTool[tool.name] = Buffer.byteLength(serializeToolSchema(tool), 'utf8')
+  const total = Object.values(perTool).reduce((a, b) => a + b, 0)
+  return { perTool, total }
+}
+
+/** 判定函数单独抽出来：变异验证直接喂克隆对象，不用真改源码。 */
+function assertToolSchemaBudget(measured, baseline, cap) {
+  assert.equal(Object.keys(measured.perTool).length, TOOL_COUNT, `注册工具数应为 ${TOOL_COUNT}`)
+  for (const [name, bytes] of Object.entries(measured.perTool)) {
+    assert.notEqual(baseline.perTool[name], undefined,
+      `baseline 缺少工具 ${name} 的字节数（确认是有意新增工具后跑 --save）`)
+    assert.equal(bytes, baseline.perTool[name],
+      `工具 ${name} 的 schema 从 ${baseline.perTool[name]} → ${bytes} B。确认是有意改 description 再跑 --save`)
+  }
+  for (const name of Object.keys(baseline.perTool)) {
+    assert.notEqual(measured.perTool[name], undefined, `baseline 里有已不存在的工具 ${name}（跑 --save 重生成）`)
+  }
+  const sum = Object.values(baseline.perTool).reduce((a, b) => a + b, 0)
+  assert.equal(sum, baseline.total, 'baseline 自洽：逐项之和必须等于合计（防止只改一处）')
+  assert.ok(measured.total <= cap,
+    `工具 schema 合计 ${measured.total} B 超出政策上界 ${cap} B（当前 ${TOOL_COUNT} 个工具）`)
+}
+
+const measuredToolSchema = measureToolSchema(captureRegisteredTools())
 
 // ── 代表性样例（贴近真实会话的规模）──────────────────────────────────────────
 const agent = { id: 'agt-demo', name: 'ARK-ALPHA', description: '旧人类留下的最后一座人工智能核心' }
@@ -122,9 +203,31 @@ for (const [k, limit] of Object.entries(UPPER_BOUNDS)) {
   assert.ok(sizes[k] <= limit, `块 "${k}" 体积 ${sizes[k]} 字节超出上界 ${limit}——请确认是有意加内容，而不是文案回涨`)
 }
 
+// ── 工具 schema 体积：打印 + 变异验证（判定函数必须真能红）──────────────────────
+console.log('\n── 工具 schema 字节数（UTF-8，name+description+parameters）──')
+for (const [name, bytes] of Object.entries(measuredToolSchema.perTool)) {
+  console.log(`  ${String(bytes).padStart(6)}  ${name}`)
+}
+console.log(`  ${String(measuredToolSchema.total).padStart(6)}  合计（${TOOL_COUNT} 个工具）`)
+
+{
+  // 变异验证：给任一 description 加 200 B，判定必须红。喂克隆对象，不碰源码。
+  const names = Object.keys(measuredToolSchema.perTool)
+  const mutated = {
+    perTool: { ...measuredToolSchema.perTool },
+    total: measuredToolSchema.total + 200,
+  }
+  mutated.perTool[names[0]] += 200
+  assert.throws(
+    () => assertToolSchemaBudget(mutated, measuredToolSchema, TOOL_SCHEMA_TOTAL_CAP),
+    /description|schema/,
+    '变异验证失败：某条 description 加 200 B 居然没让预算测试红',
+  )
+}
+
 // ── 软基线：--save 写入，之后每次对比 ────────────────────────────────────────
 if (process.argv.includes('--save')) {
-  writeFileSync(baselinePath, JSON.stringify(sizes, null, 2) + '\n', 'utf8')
+  writeFileSync(baselinePath, `${JSON.stringify({ ...sizes, toolSchema: measuredToolSchema }, null, 2)}\n`, 'utf8')
   console.log(`\n已写入基线：${baselinePath}`)
 } else if (existsSync(baselinePath)) {
   const saved = JSON.parse(readFileSync(baselinePath, 'utf8'))
@@ -134,6 +237,8 @@ if (process.argv.includes('--save')) {
   }
   assert.equal(grew.length, 0,
     `有 ${grew.length} 个块比基线变大：${grew.map(([k]) => k).join(', ')}。确认是有意的就重跑 --save。`)
+  assert.ok(saved.toolSchema, '基线文件缺 toolSchema 段：跑 node test/prompt-budget.test.mjs --save 重新生成')
+  assertToolSchemaBudget(measuredToolSchema, saved.toolSchema, TOOL_SCHEMA_TOTAL_CAP)
 }
 
 console.log('\nprompt budget tests passed')

@@ -442,6 +442,12 @@ export TDAI_MEMORY_ASSET_RETRY_COOLDOWN_MS=15000  # 加载失败后的冷却期�
 配置优先级：**Web 设置 > env > 内置默认值**。身份不完整时读侧自动停用并告警，写侧不受影响；
 `TDAI_MEMORY_API_KEY` 只从 env 读取，不写入设置面板。
 
+**哪些键刻意不上面板**：`apiKeyEnv` / `l2Limit` / `timeoutMs` / `recallTimeoutMs` /
+`assetLoadBudgetMs` / `assetRetryCooldownMs` 六个键**故意**不放设置面板（= `lib/settings.mjs` 的
+`PATCH_ONLY_KEYS`），只能用 env 配置。原因：面板只放日常会调的项，这六个都是部署期 knob；
+其中 `apiKeyEnv` 是「环境变量名」而不是凭据本身，放进面板反而会让人把密钥值误填进一个
+期望变量名的格子。想改它们请改 env 并重启 profile —— 这是有意设计，不是缺功能。
+
 **三个"主链路保护"参数说明**：读侧对 MemoryCore 的调用全部发生在模型请求**之前**
 （`system-prompt/assemble` 注入资产、`agent/pre-step` 召回），网关慢或挂时如果无限等、
 或者失败了每一步都重拉一次，用户看到的就是"一开召回，发消息一直阻塞等待"。

@@ -1,7 +1,25 @@
 {
   "tdai:session-context": 281,
   "tdai:profile-memory": 4414,
-  "tdai:available-skills": 424,
   "tdai:knowledge-tools": 307,
-  "(memory-tools-guide)": 342
+  "(memory-tools-guide)": 342,
+  "toolSchema": {
+    "perTool": {
+      "tdai_memory_search": 901,
+      "tdai_memory_query": 714,
+      "tdai_conversation_search": 743,
+      "tdai_conversation_query": 599,
+      "tdai_skill_search": 591,
+      "tdai_read_scene": 556,
+      "tdai_scenario_ls": 375,
+      "tdai_skill_view": 567,
+      "tdai_knowledge_tools": 459,
+      "tdai_knowledge_call": 1038,
+      "tdai_task_add": 1225,
+      "tdai_task_list": 387,
+      "tdai_task_update": 554,
+      "tdai_task_delete": 456
+    },
+    "total": 9165
+  }
 }
