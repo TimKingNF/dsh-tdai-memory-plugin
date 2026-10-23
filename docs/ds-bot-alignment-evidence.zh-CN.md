@@ -47,8 +47,8 @@
 
 | 会话 | 路径 | 说明 |
 | --- | --- | --- |
-| 纯净（基线） | `~/.dsh/sessions/--mnt-d-workspace-github-dsh-tdai-memory-plugin--/session-af681dcc-4381-404e-b220-7c2ebf376c26/session.v4.jsonl.zstd` | 首条用户消息自述目的：「这是一次纯净的对话，用于等下和 ds-bot 对话的会话日志进行对比」；创建于 10:31 |
-| ds-bot | `~/.dsh/sessions/--home-tim-.dsh-bot-workspace--/session-d91212ec-e10b-4d86-85b7-a651db507647/session.v4.jsonl.zstd` | Bot「Chief」（Main Bot，role `Chief of Staff`）；第一轮开始于 10:38:22 |
+| 纯净（基线） | `~/.dsh/sessions/--mnt-d-workspace-github-dsh-tdai-memory-plugin--/session-af681dcc…（本地会话 id，已截断）/session.v4.jsonl.zstd` | 首条用户消息自述目的：「这是一次纯净的对话，用于等下和 ds-bot 对话的会话日志进行对比」；创建于 10:31 |
+| ds-bot | `~/.dsh/sessions/--home-tim-.dsh-bot-workspace--/session-d91212ec…（本地会话 id，已截断）/session.v4.jsonl.zstd` | Bot「Chief」（Main Bot，role `Chief of Staff`）；第一轮开始于 10:38:22 |
 
 两个会话**同进程、同 profile**，区别在于会话性质：纯净会话是普通（非 Bot）会话，ds-bot 会话是 Bot 的 root session。
 
