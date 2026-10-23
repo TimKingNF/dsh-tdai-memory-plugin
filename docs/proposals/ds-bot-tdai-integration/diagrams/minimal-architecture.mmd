@@ -1,0 +1,34 @@
+flowchart LR
+  subgraph DSB["ds-bot（只读）"]
+    ST["state.json<br/>bots / rooms / sessions / log"]
+    MM["memory/<br/>team/MEMORY.md<br/>bots/*/MEMORY.md"]
+    GL["group-lines/<br/>被截断长贴的全文"]
+  end
+
+  subgraph PLG["dsh-tdai-memory-plugin"]
+    SW["设置页开关<br/>botSkillInject / botWriteback<br/>串全局 enabled / skills / capture"]
+    EVH["agent/turn-stopping<br/>唯一写入口"]
+    IDX["lib/dsbot.mjs<br/>索引 · 四态 · lean 策略"]
+    CTX["lib/dsbot-context.mjs<br/>前文蒸馏 · 失败即跳过"]
+    LED["lib/dsbot-ledger.mjs<br/>索引持久化 · 断点 · pending"]
+    CAP["lib/capture.mjs<br/>人锚点 · 终稿 · 两阶段"]
+    RD["lib/sections.mjs<br/>lib/recall.mjs<br/>读侧分面"]
+    STORE[("dsbot-state.json")]
+  end
+
+  EVH --> CAP
+  CAP --> IDX
+  IDX --> ST
+  IDX --> LED
+  CAP --> LED
+  CAP --> CTX
+  CTX --> ST
+  CTX --> GL
+  CTX --> MM
+  CTX --> LLM["ctx.llm（主持 Bot 模型）"]
+  LED --> STORE
+  CAP --> CORE[("MemoryCore<br/>/v3/conversation/add")]
+  SW --> IDX
+  SW --> CAP
+  IDX --> RD
+  RD --> PROMPT["system prompt / 召回块"]
