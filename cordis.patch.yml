@@ -25,6 +25,18 @@
         knowledgeEnabled: !!js process.env.TDAI_MEMORY_KNOWLEDGE_ENABLED ?? ''
         subagentInjectionEnabled: !!js process.env.TDAI_MEMORY_SUBAGENT_INJECTION_ENABLED ?? ''
         subagentCaptureEnabled: !!js process.env.TDAI_MEMORY_SUBAGENT_CAPTURE_ENABLED ?? ''
+        # ds-bot 会话（方案 docs/proposals/ds-bot-tdai-integration/minimal.md）
+        # 总闸 + 两个子开关 + 群聊蒸馏参数 + 台账路径；有效值只在 lib/dsbot.mjs 计算。
+        dsbotAwarenessEnabled: !!js process.env.TDAI_MEMORY_DSBOT_AWARENESS_ENABLED ?? ''
+        botSkillInjectEnabled: !!js process.env.TDAI_MEMORY_BOT_SKILL_INJECT_ENABLED ?? ''
+        botWritebackEnabled: !!js process.env.TDAI_MEMORY_BOT_WRITEBACK_ENABLED ?? ''
+        botContextDistillEnabled: !!js process.env.TDAI_MEMORY_BOT_CONTEXT_DISTILL_ENABLED ?? ''
+        botContextMessages: !!js process.env.TDAI_MEMORY_BOT_CONTEXT_MESSAGES ?? ''
+        botContextReuseMemory: !!js process.env.TDAI_MEMORY_BOT_CONTEXT_REUSE_MEMORY ?? ''
+        botContextModel: !!js process.env.TDAI_MEMORY_BOT_CONTEXT_MODEL ?? ''
+        botContextMaxTokens: !!js process.env.TDAI_MEMORY_BOT_CONTEXT_MAX_TOKENS ?? ''
+        botContextTimeoutMs: !!js process.env.TDAI_MEMORY_BOT_CONTEXT_TIMEOUT_MS ?? ''
+        dsbotLedgerPath: !!js process.env.TDAI_MEMORY_DSBOT_LEDGER_PATH ?? ''
         recallLimit: !!js process.env.TDAI_MEMORY_RECALL_LIMIT ?? ''
         skillRecallLimit: !!js process.env.TDAI_MEMORY_SKILL_RECALL_LIMIT ?? ''
         skillRecallMinScore: !!js process.env.TDAI_MEMORY_SKILL_RECALL_MIN_SCORE ?? ''

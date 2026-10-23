@@ -8,6 +8,8 @@
  *   - 注入总闸关掉 → 只灰它下面那 4 段，**不能**连 L1 召回一起灰；
  *   - 回流**永远不灰**（它是独立的写侧开关）；
  *   - 身份不全 → 在读侧那组下面显式告警（这是"开关都开着却没注入"最常见的原因）。
+ *   - ds-bot 组：总闸是根；Bot skill 注入还受 enabled + skillsEnabled；回写还受
+ *     captureEnabled；蒸馏 / 窗口 / 复用受回写约束。身份与记忆**没有开关**（恒关）。
  *
  * 做法：esbuild 把 tsx 转成 ESM 后用 react-dom/server 静态渲染，不引 jsdom。
  * 卡片**没有折叠头**（全部字段直接渲染；测试反过来断言产物里不含 `aria-expanded`），
@@ -55,8 +57,12 @@ const FULL = {
   profileMemoryEnabled: true, skillsEnabled: true, knowledgeEnabled: false,
   endpoint: 'http://127.0.0.1:8420', serviceId: 'default', teamId: 'team-x', agentId: 'agt-x', userId: 'usr-x',
   userKey: '', knowledgeEndpoint: '', taskId: '', recallLimit: 7,
-  // 宿主 describe() 给的是**生效值**（含 schema 默认），所以面板能回显这两项
+  // 宿主 describe() 给的是**生效值**（含 schema 默认），所以面板能回显这些项
   skillRecallLimit: 3, skillRecallMinScore: 4,
+  // Bot 会话（ds-bot）：回写默认关 → 蒸馏 / 窗口 / 复用默认置灰
+  dsbotAwarenessEnabled: true, botSkillInjectEnabled: true, botWritebackEnabled: false,
+  botContextDistillEnabled: true, botContextMessages: 5, botContextReuseMemory: false,
+  dsbotLedgerPath: '',
 }
 
 /**
@@ -92,10 +98,10 @@ function dimmed(html, label) {
   return html.slice(start, at).includes('opacity:0.55')
 }
 
-// ── 1) 结构：四个分组 + 召回条数上限是个数字输入 ────────────────────────────
+// ── 1) 结构：五个分组 + 召回条数上限是个数字输入 ────────────────────────────
 {
   const html = render()
-  for (const title of ['读侧 · 把记忆读进上下文', '写侧 · 把对话回流给 MemoryCore', '子 agent · 委派出去的子会话', '身份与地址']) {
+  for (const title of ['读侧 · 把记忆读进上下文', '写侧 · 把对话回流给 MemoryCore', '子 agent · 委派出去的子会话', 'Bot 会话 · ds-bot', '身份与地址']) {
     assert.ok(html.includes(title), `应有分组标题「${title}」`)
   }
   // 顶层设置页：没有折叠头部，进入即见全部开关（一次点击都不需要）
@@ -140,6 +146,37 @@ function dimmed(html, label) {
   const subCaptureAt = html.indexOf('子 agent 对话回流')
   const subCaptureBlock = html.slice(html.lastIndexOf('<label', subCaptureAt), html.indexOf('</label>', subCaptureAt))
   assert.ok(!subCaptureBlock.includes('checked=""'), '「子 agent 对话回流」默认应为未勾选')
+
+  // ── Bot 会话 · ds-bot：独立小标题 + 一句说明，排在「子 agent」之后 ──────────
+  const subagentTitleAt = html.indexOf('子 agent · 委派出去的子会话')
+  const botTitleAt = html.indexOf('Bot 会话 · ds-bot')
+  const identityTitleAt = html.indexOf('身份与地址')
+  assert.ok(subagentTitleAt < botTitleAt && botTitleAt < identityTitleAt, 'Bot 组应排在「子 agent」之后、「身份与地址」之前')
+  assert.ok(html.includes('身份与记忆对 Bot 会话恒不注入'), 'Bot 组要有一句说明：身份与记忆恒不注入')
+  assert.ok(html.includes('读侧只注入云端 skill'), 'Bot 组的说明要写清读侧只注入 skill')
+  // 关键 hint / 置灰文案（方案 §3.1 的字段表）
+  for (const text of [
+    '总闸：关掉后不索引 ds-bot 的 state.json',
+    '「Bot 会话识别 / 读侧总开关 / 云端 skill 召回」任一关闭时置灰',
+    '「Bot 会话识别 / 对话回流」任一关闭时置灰',
+    '默认关，首次上线手动打开',
+    '默认关，避免归因回环',
+    '0 = 不蒸',
+  ]) {
+    assert.ok(html.includes(text), `Bot 组应包含文案「${text}」`)
+  }
+  // 台账路径：普通文本框 + 默认位置占位符 + 「不接受 bot 目录」的提示
+  const ledgerAt = html.indexOf('台账路径')
+  assert.ok(ledgerAt >= 0, '应有「台账路径」文本字段')
+  assert.ok(ledgerAt > botTitleAt && ledgerAt < identityTitleAt, '台账路径应渲染在 Bot 组内')
+  assert.ok(html.slice(ledgerAt, ledgerAt + 900).includes('type="text"'), '台账路径应是文本框，不是开关')
+  assert.ok(html.includes('storages/tdai-memory-plugin/dsbot-state.json'), '台账路径占位符应是默认位置')
+  assert.ok(html.includes('不接受') && html.includes('DSH_HOME'), '台账路径要说明不接受 <DSH_HOME>/bot 之下')
+  // 身份 / 记忆注入开关**绝不存在**（方案 §3.1：恒关，不做成配置项）。
+  // 注意别用"注入身份"这种宽泛串：子 agent 的既有 hint 里就有"不注入身份与记忆"。
+  for (const forbidden of ['Bot 会话注入身份', 'Bot 会话注入记忆', 'Bot 会话身份注入', 'Bot 会话记忆注入']) {
+    assert.ok(!html.includes(forbidden), `Bot 会话不该有身份 / 记忆注入开关：${forbidden}`)
+  }
 }
 
 // ── 2) 身份齐全：无告警，所有开关都不置灰 ───────────────────────────────────
@@ -221,4 +258,49 @@ function dimmed(html, label) {
   assert.ok(!html.includes('读侧总开关'), '不可用时不该渲染可编辑控件')
 }
 
-console.log('settings card render tests passed: 分组 / 条数上限输入框 / 依赖置灰矩阵 / 身份告警 / secret 侧信道 / 不可用自解释')
+// ── 8) Bot 会话 · ds-bot：总闸串联（父关闭 → 子置灰）──────────────────────────
+{
+  // 默认（总闸开、回写关）：skill 注入与回写自己不灰；蒸馏 / 窗口 / 复用灰
+  // （回写默认关时蒸馏没有意义 —— 这正是 dimmedBy 要表达的东西）
+  const base = render()
+  assert.equal(dimmed(base, '识别 ds-bot 会话'), false, '总闸是根，默认开且不置灰')
+  assert.equal(dimmed(base, 'Bot 会话注入云端 skill'), false, 'enabled + skillsEnabled 都开着 → 不灰')
+  assert.equal(dimmed(base, 'Bot 会话回写记忆'), false, '回写默认关但不置灰（它只受总闸与全局回流约束）')
+  assert.equal(dimmed(base, '群聊前文蒸馏'), true, '回写默认关 → 蒸馏置灰')
+  assert.equal(dimmed(base, '复用本群 MEMORY 条目'), true, '回写默认关 → 复用置灰')
+  assert.ok(base.includes('「Bot 会话回写记忆」已关闭，群聊蒸馏没有意义'), '置灰 tooltip 应点名回写开关')
+  {
+    const at = base.indexOf('群聊窗口条数')
+    const row = base.slice(at, at + 800)
+    assert.ok(row.includes('type="number"'), '群聊窗口条数应是数字输入')
+    assert.ok(row.includes('min="0"') && row.includes('max="20"'), '窗口条数的上下界应与 schema 一致（0–20）')
+    assert.ok(row.includes('value="5"'), '窗口条数应回显生效值 5')
+  }
+
+  // 总闸关：Bot 组所有子项全灰（含台账路径），tooltip 点名总闸；总闸自己永远可点
+  const off = render({ dsbotAwarenessEnabled: false })
+  for (const label of ['Bot 会话注入云端 skill', 'Bot 会话回写记忆', '群聊前文蒸馏', '复用本群 MEMORY 条目']) {
+    assert.equal(dimmed(off, label), true, `总闸关闭时「${label}」应置灰`)
+  }
+  assert.ok(off.includes('「识别 ds-bot 会话」已关闭'), '置灰 tooltip 应点名总闸')
+  assert.ok(off.includes('title="「识别 ds-bot 会话」已关闭，此项暂不生效"'), '台账路径文本框也只受总闸约束（同样置灰）')
+  assert.equal(dimmed(off, '识别 ds-bot 会话'), false, '总闸自己不能被置灰（否则没法重新打开）')
+
+  // 回写打开：蒸馏 / 窗口 / 复用解灰
+  const writeOn = render({ botWritebackEnabled: true })
+  assert.equal(dimmed(writeOn, '群聊前文蒸馏'), false, '回写打开后蒸馏解灰')
+  assert.equal(dimmed(writeOn, '复用本群 MEMORY 条目'), false, '回写打开后复用解灰')
+  assert.ok(!writeOn.includes('「Bot 会话回写记忆」已关闭'), '回写打开后不该再有"回写已关闭"的 tooltip')
+
+  // 读侧总开关 / 云端 skill 召回：只灰 skill 注入，**不灰回写**（写侧独立）
+  assert.equal(dimmed(render({ enabled: false }), 'Bot 会话注入云端 skill'), true, '读侧总开关关闭 → Bot skill 注入灰')
+  assert.equal(dimmed(render({ skillsEnabled: false }), 'Bot 会话注入云端 skill'), true, '云端 skill 召回关闭 → Bot skill 注入灰')
+  assert.equal(dimmed(render({ enabled: false }), 'Bot 会话回写记忆'), false, '回写不受读侧总开关影响')
+
+  // 全局回流关：灰回写（蒸馏只挂 Bot 回写开关，按方案 §3.1 的 dimmedBy 表不跟着灰）
+  const captureOff = render({ botWritebackEnabled: true, captureEnabled: false })
+  assert.equal(dimmed(captureOff, 'Bot 会话回写记忆'), true, '全局「对话回流」关闭 → Bot 回写灰')
+  assert.equal(dimmed(captureOff, '群聊前文蒸馏'), false, '蒸馏只挂 Bot 回写开关（方案 §3.1 的 dimmedBy 表）')
+}
+
+console.log('settings card render tests passed: 分组 / 条数上限输入框 / 依赖置灰矩阵 / Bot 会话串联 / 身份告警 / secret 侧信道 / 不可用自解释')

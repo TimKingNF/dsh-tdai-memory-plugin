@@ -46,7 +46,19 @@
  *                               但**团队知识库、知识 skill 与 10 个只读工具照常可用**
  *     subagentCaptureEnabled    默认**关**：子 agent 的执行过程不回流 L0
  *   两者都按 session.header.origin === 'subagent' 判定。
-
+ *
+ *   ds-bot 会话（方案 docs/proposals/ds-bot-tdai-integration/minimal.agents.md §3.1）：
+ *     dsbotAwarenessEnabled     总闸：关掉后不索引 ds-bot 的 state.json，Bot 会话按普通会话处理
+ *       ├─ botSkillInjectEnabled    读侧：只注入云端 skill；还要 AND 全局 enabled + skillsEnabled
+ *       │                           身份与记忆对 Bot 会话**恒关**，故意没有开关
+ *       └─ botWritebackEnabled      写侧：按人锚点回写 L0（默认**关**）；还要 AND captureEnabled
+ *            ├─ botContextDistillEnabled  群聊前文蒸馏
+ *            ├─ botContextMessages        群聊窗口条数（0 = 不蒸）
+ *            ├─ botContextMaxTokens       蒸馏输出上限（默认 5,000；思考 token 也从这里扣）
+ *            ├─ botContextTimeoutMs       蒸馏超时（默认 15,000；思考型模型 8 秒不够）
+ *            └─ botContextReuseMemory     摘要复用本群 MEMORY（默认关，避免归因回环）
+ *     dsbotLedgerPath           台账路径（空 = 默认位置；只受总闸约束）
+ *
  * 几个容易搞错的点：
  *   0. 云端 skill 召回**也不**依赖 injectionEnabled：它与 L1 召回同样走 agent/pre-step、
  *      注入到消息尾部（同一轮里两条块共用一条 plugin 消息），与 system 段无关；
@@ -153,6 +165,60 @@ const SUBAGENT_CAPTURE_TOGGLE = {
 }
 const SUBAGENT_TOGGLES = [SUBAGENT_INJECT_TOGGLE, SUBAGENT_CAPTURE_TOGGLE]
 
+/**
+ * Bot 会话（ds-bot）：总闸 + 读/写子开关 + 群聊蒸馏，语义见 minimal.agents.md §3.1。
+ *
+ * **身份与记忆对 Bot 会话恒关**（角色权威归 ds-bot；本阶段没有「每 Bot 一个 tdai agent」），
+ * 所以这里**故意没有**「注入身份 / 注入记忆」开关 —— 面板上一个能开的东西，早晚会被当成
+ * 受支持的用法。真要调试，改 `lib/dsbot.mjs` 的 sessionPolicy，不要做成配置项。
+ */
+const DSBOT_MASTER_TOGGLE = {
+  key: 'dsbotAwarenessEnabled',
+  label: '识别 ds-bot 会话',
+  hint: '总闸：关掉后不索引 ds-bot 的 state.json，Bot 会话按普通会话处理（回到改动前的唯一开关）',
+}
+const BOT_SKILL_INJECT_TOGGLE = {
+  key: 'botSkillInjectEnabled',
+  label: 'Bot 会话注入云端 skill',
+  hint: '「Bot 会话识别 / 读侧总开关 / 云端 skill 召回」任一关闭时置灰；身份与记忆对 Bot 会话恒不注入（没有开关）',
+  dimmedBy: ['dsbotAwarenessEnabled', 'enabled', 'skillsEnabled'],
+}
+const BOT_WRITEBACK_TOGGLE = {
+  key: 'botWritebackEnabled',
+  label: 'Bot 会话回写记忆',
+  hint: '「Bot 会话识别 / 对话回流」任一关闭时置灰；默认关，首次上线手动打开',
+  defaultOff: true,
+  dimmedBy: ['dsbotAwarenessEnabled', 'captureEnabled'],
+}
+/** 蒸馏 / 窗口 / 复用都挂在「Bot 会话回写记忆」下：回写关着时蒸馏没有意义。 */
+const BOT_CONTEXT_DISTILL_TOGGLE = {
+  key: 'botContextDistillEnabled',
+  label: '群聊前文蒸馏',
+  hint: '回写关着时蒸馏没有意义；关掉后群聊只写人话',
+  dimmedBy: ['dsbotAwarenessEnabled', 'botWritebackEnabled'],
+}
+const BOT_CONTEXT_REUSE_TOGGLE = {
+  key: 'botContextReuseMemory',
+  label: '复用本群 MEMORY 条目',
+  hint: '默认关，避免归因回环；「Bot 会话识别 / 回写」任一关闭时置灰',
+  defaultOff: true,
+  dimmedBy: ['dsbotAwarenessEnabled', 'botWritebackEnabled'],
+}
+const DSBOT_TOGGLES = [DSBOT_MASTER_TOGGLE, BOT_SKILL_INJECT_TOGGLE, BOT_WRITEBACK_TOGGLE]
+const BOT_CONTEXT_TOGGLES = [BOT_CONTEXT_DISTILL_TOGGLE, BOT_CONTEXT_REUSE_TOGGLE]
+
+/** Bot 那组的置灰原因：键 = `dimmedBy` 里那个父开关的 key。 */
+const DSBOT_DIM_REASON = '「识别 ds-bot 会话」已关闭，此项暂不生效'
+const CAPTURE_DIM_REASON = '「对话回流到 MemoryCore」已关闭，此项暂不生效'
+const BOT_CONTEXT_DIM_REASON = '「Bot 会话回写记忆」已关闭，群聊蒸馏没有意义'
+const DSBOT_DIM_REASONS: Record<string, string> = {
+  dsbotAwarenessEnabled: DSBOT_DIM_REASON,
+  enabled: READ_DIM_REASON,
+  skillsEnabled: SKILL_RECALL_DIM_REASON,
+  captureEnabled: CAPTURE_DIM_REASON,
+  botWritebackEnabled: BOT_CONTEXT_DIM_REASON,
+}
+
 /** 写侧：两个开关，都与读侧完全独立。 */
 const WRITE_TOGGLES = [
   {
@@ -178,12 +244,27 @@ const WRITE_TOGGLES = [
  * —— 见 `lib/settings.mjs` 的 `numField` 与 `test/settings-card.test.mjs` 的两侧断言。
  * 越界按 [min, max] 收敛，并把收敛结果回填草稿 + 提示用户。
  */
-const NUMERIC_FIELDS: Record<string, { min: number; max: number; label: string; dflt: number }> = {
+const NUMERIC_FIELDS: Record<string, { min: number; max: number; label: string; dflt: number; dimmedBy?: string[] }> = {
   recallLimit: { min: 1, max: 20, label: '单轮召回条数上限', dflt: 5 },
   // 云端 skill 召回的两个旋钮：**实际注入条数 = 分数过闸门后的前 skillRecallLimit 条**，
   // 所以"召回少了/多了"通常是这两个一起调（见 lib/recall.mjs 的 pickSkillHits）。
   skillRecallLimit: { min: 1, max: 10, label: 'skill 召回条数上限', dflt: 3 },
   skillRecallMinScore: { min: 0, max: 100, label: 'skill 召回分数下限', dflt: 4 },
+  // Bot 群聊窗口：0 是**有效语义**（= 不蒸），保存时不能被当成空串 unset 掉。
+  botContextMessages: {
+    min: 0, max: 20, label: '群聊窗口条数', dflt: 5,
+    dimmedBy: ['dsbotAwarenessEnabled', 'botWritebackEnabled'],
+  },
+  // 蒸馏输出上限：思考 token 也从这里扣，所以默认给到 5,000（正常摘要只花 200–300）。
+  botContextMaxTokens: {
+    min: 100, max: 32000, label: '蒸馏输出上限', dflt: 5000,
+    dimmedBy: ['dsbotAwarenessEnabled', 'botWritebackEnabled'],
+  },
+  // 蒸馏超时：会思考的模型在 5,000 预算下可能想十几秒，8 秒不够（现场 timeout 过）。
+  botContextTimeoutMs: {
+    min: 2000, max: 60000, label: '蒸馏超时', dflt: 15000,
+    dimmedBy: ['dsbotAwarenessEnabled', 'botWritebackEnabled'],
+  },
 }
 
 /** readEnabled() 需要的身份字段（缺一读侧就整体不生效）。 */
@@ -200,13 +281,45 @@ const IDENTITY_FIELDS = [
   { key: 'taskId', label: 'Task ID（可选）' },
 ]
 
+/**
+ * 普通文本框字段（路径类）。**不是身份字段**：不参与 `identitySource()` 判定、
+ * 不进 `missingIdentity()`、也不受 `blankSecrets()` 影响，所以单独放一组，
+ * 渲染时也不走 IDENTITY_FIELDS 那条「secret / 身份告警」的路径。
+ */
+const TEXT_FIELDS = [
+  {
+    key: 'botContextModel',
+    label: '蒸馏模型（provider/model）',
+    placeholder: '空 = 主持 Bot 的模型；如 deepseek-official/deepseek-flash',
+    hint: '群聊前文摘要用哪个模型蒸。主持 Bot 若挂在会思考的模型上，思考 token 会从输出预算里扣，'
+      + '容易把正文挤空（distill-empty）；换一个没有思考档位的小模型更稳也更省',
+    dimmedBy: ['dsbotAwarenessEnabled', 'botWritebackEnabled'],
+  },
+  {
+    key: 'dsbotLedgerPath',
+    label: '台账路径',
+    placeholder: '<DSH_HOME>/storages/tdai-memory-plugin/dsbot-state.json',
+    hint: '空 = <DSH_HOME>/storages/tdai-memory-plugin/dsbot-state.json；不接受 <DSH_HOME>/bot 之下',
+    dimmedBy: ['dsbotAwarenessEnabled'],
+  },
+]
+
 /** 卡片字段的单一事实来源，导出给 test/settings-card.test.mjs 做一致性断言。 */
 export const CARD_FIELDS = {
-  toggles: [...READ_TOGGLES, ...INJECT_TOGGLES, ...WRITE_TOGGLES, ...SUBAGENT_TOGGLES],
+  toggles: [...READ_TOGGLES, ...INJECT_TOGGLES, ...WRITE_TOGGLES, ...SUBAGENT_TOGGLES, ...DSBOT_TOGGLES, ...BOT_CONTEXT_TOGGLES],
   numeric: NUMERIC_FIELDS,
   identity: IDENTITY_FIELDS,
+  text: TEXT_FIELDS,
   requiredIdentity: REQUIRED_IDENTITY,
 }
+
+/**
+ * 默认关的开关集合：判定"父项是否关闭"时不能只看 `=== false` ——
+ * 默认关的项在快照缺字段时是**关**，默认开的项缺字段时是**开**。
+ */
+const DEFAULT_OFF_KEYS = new Set(
+  CARD_FIELDS.toggles.filter((t) => t.defaultOff === true).map((t) => t.key),
+)
 
 /**
  * 身份里缺哪些字段（读侧失效的判定与日志点名用的是同一组 key）。
@@ -371,6 +484,19 @@ function TdaiMemoryCard(props: { form: SettingsForm; describe?: SettingsDescribe
   // 只在快照就绪后判断，否则首帧 current 为空会误报。
   const missingIdentityKeys = snap.status === 'ready' ? missingIdentity(value) : []
 
+  /**
+   * Bot 会话那组的串联判定：`dimmedBy` 里**任一**开关关闭 → 本项置灰。
+   * 默认关的项（回写 / 复用 / persona…）在快照缺字段时按"关"算，所以不能只看 `=== false`。
+   */
+  const switchOff = (key: string) => (DEFAULT_OFF_KEYS.has(key) ? value[key] !== true : value[key] === false)
+  const dsbotDim = (t: { dimmedBy?: string[] }) => {
+    const offParent = (t.dimmedBy ?? []).find(switchOff)
+    return {
+      dim: offParent !== undefined,
+      reason: offParent === undefined ? '' : (DSBOT_DIM_REASONS[offParent] ?? DSBOT_DIM_REASON),
+    }
+  }
+
   const edit = (key: string, val: unknown) => {
     setDraft((d) => (d ? { ...d, [key]: val } : { [key]: val }))
     setTouched((s) => new Set(s).add(key))
@@ -406,6 +532,38 @@ function TdaiMemoryCard(props: { form: SettingsForm; describe?: SettingsDescribe
       {control}
     </div>
   )
+
+  /**
+   * 普通文本框行（路径类，**不是身份字段**）：这条路径不参与身份告警 / secret 脱敏，
+   * 只跟着自己的 `dimmedBy` 置灰（当前只有台账路径一项）。
+   */
+  const textFieldRow = (
+    f: { key: string; label: string; hint?: string; placeholder?: string; dimmedBy?: string[] },
+    dim: boolean,
+    dimReason: string,
+  ) => {
+    const shown = typeof value[f.key] === 'string' ? value[f.key] as string : ''
+    return (
+      <div
+        key={f.key}
+        title={dim ? dimReason : undefined}
+        style={{ display: 'flex', flexDirection: 'column', gap: '6px', padding: '12px 0', borderTop: C.border, opacity: dim ? 0.55 : 1 }}
+      >
+        <div style={{ fontSize: '13px', color: C.secondary }}>
+          {f.label}
+          {f.hint ? <span style={{ color: C.tertiary, marginLeft: '6px', fontSize: '12px' }}>{f.hint}</span> : null}
+        </div>
+        <input
+          type="text"
+          value={shown}
+          placeholder={f.placeholder}
+          disabled={!writable || saving}
+          style={inputStyle}
+          onChange={(e) => edit(f.key, e.target.value)}
+        />
+      </div>
+    )
+  }
 
   const inputStyle = {
     appearance: 'none', width: '100%', padding: '8px 12px', borderRadius: '8px',
@@ -542,6 +700,60 @@ function TdaiMemoryCard(props: { form: SettingsForm; describe?: SettingsDescribe
               {toggleItem(SUBAGENT_INJECT_TOGGLE, !readOn, READ_DIM_REASON)}
               {toggleItem(SUBAGENT_CAPTURE_TOGGLE, false, '')}
             </div>
+
+            {/* ── Bot 会话（ds-bot）：识别总闸 + 读/写子开关 + 群聊蒸馏 ──────────
+                身份与记忆对 Bot 会话**恒关**，所以这里没有对应开关（方案 §3.1 明确不给）：
+                角色权威归 ds-bot，本阶段也没有「每 Bot 一个 tdai agent」。 */}
+            {groupTitle('Bot 会话 · ds-bot')}
+            <p style={{ color: C.tertiary, margin: '0 0 2px', fontSize: '12px' }}>
+              识别 ds-bot 的 Bot / 房间会话：读侧只注入云端 skill，写侧按人锚点回写；
+              身份与记忆对 Bot 会话恒不注入（没有开关）。
+            </p>
+            <div style={flowStyle}>
+              {DSBOT_TOGGLES.map((t) => {
+                const d = dsbotDim(t)
+                return toggleItem(t, d.dim, d.reason)
+              })}
+            </div>
+            {/* 蒸馏三项挂在「Bot 会话回写记忆」下：回写关着时蒸馏没有意义 */}
+            <div style={{ ...flowStyle, paddingLeft: 22, marginLeft: 2, marginTop: 2, borderLeft: C.guide }}>
+              {(() => {
+                const d = dsbotDim(BOT_CONTEXT_DISTILL_TOGGLE)
+                return toggleItem(BOT_CONTEXT_DISTILL_TOGGLE, d.dim, d.reason)
+              })()}
+              {(() => {
+                const d = dsbotDim(NUMERIC_FIELDS.botContextMessages)
+                return numericRow(
+                  'botContextMessages',
+                  '条（0 = 不蒸；窗口取断点之后、锚点之前的最后 N 条，0–20）',
+                  d.dim, d.reason,
+                )
+              })()}
+              {(() => {
+                const d = dsbotDim(NUMERIC_FIELDS.botContextMaxTokens)
+                return numericRow(
+                  'botContextMaxTokens',
+                  'token（输出上限，100–32000；思考 token 也从这里扣，摘要正文通常只花 200–300）',
+                  d.dim, d.reason,
+                )
+              })()}
+              {(() => {
+                const d = dsbotDim(NUMERIC_FIELDS.botContextTimeoutMs)
+                return numericRow(
+                  'botContextTimeoutMs',
+                  '毫秒（2000–60000；思考型模型建议 ≥15000，超时只写人话）',
+                  d.dim, d.reason,
+                )
+              })()}
+              {(() => {
+                const d = dsbotDim(BOT_CONTEXT_REUSE_TOGGLE)
+                return toggleItem(BOT_CONTEXT_REUSE_TOGGLE, d.dim, d.reason)
+              })()}
+            </div>
+            {TEXT_FIELDS.map((f) => {
+              const d = dsbotDim(f)
+              return textFieldRow(f, d.dim, d.reason)
+            })}
 
             {/* ── 身份与地址（readEnabled = 读侧总开关 && 身份齐全）───────────── */}
             {groupTitle('身份与地址')}

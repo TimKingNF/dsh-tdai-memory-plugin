@@ -28,6 +28,12 @@ import {
   MEMORY_TOOLS_GUIDE,
 } from '../lib/prompts.mjs'
 import { OVERVIEW_TEXT } from '../lib/sections.mjs'
+// ── 测试环境隔离 ────────────────────────────────────────────────────────────
+// `apply()` 会构造 ds-bot 索引与台账（首次 apply 就异步 load → refresh）。不隔离
+// `DSH_HOME` 的话，单测会读写跑测机器上**真实的** `~/.dsh/bot/state.json` 与
+// `~/.dsh/storages/...` —— 既污染用户环境，也让断言依赖本机数据。
+// 用仓库内的 test/.tmp（已 gitignore），每次跑测互不影响。
+process.env.DSH_HOME = join(dirname(fileURLToPath(import.meta.url)), '.tmp', 'dsh-home')
 
 const here = dirname(fileURLToPath(import.meta.url))
 const baselinePath = join(here, 'prompt-budget.baseline.json')

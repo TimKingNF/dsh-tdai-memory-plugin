@@ -40,10 +40,15 @@ try {
 }
 
 assert.ok(card.CARD_FIELDS, '卡片应导出 CARD_FIELDS（面板字段的单一事实来源）')
-const { toggles, numeric, identity } = card.CARD_FIELDS
+const { toggles, numeric, identity, text } = card.CARD_FIELDS
 
 // ── 2) 卡片字段 ⊆ settings schema：面板能改的，都能落进 config ───────────────
-const cardKeys = [...toggles.map((t) => t.key), ...Object.keys(numeric), ...identity.map((f) => f.key)]
+const cardKeys = [
+  ...toggles.map((t) => t.key),
+  ...Object.keys(numeric),
+  ...identity.map((f) => f.key),
+  ...text.map((f) => f.key),
+]
 for (const key of cardKeys) {
   assert.ok(SCHEMA_KEYS.includes(key), `面板字段 "${key}" 不在 settings schema 里 → 用户改了不会生效`)
 }
@@ -55,6 +60,70 @@ for (const key of SCHEMA_KEYS) {
   assert.ok(cardKeys.includes(key), `schema 字段 "${key}" 在面板里没有入口，也不在 PANEL_LESS_BY_DESIGN 白名单里`)
 }
 assert.deepEqual(PATCH_ONLY_KEYS, PANEL_LESS_BY_DESIGN, 'lib/settings.mjs 的 PATCH_ONLY_KEYS 与本测试的白名单必须一致')
+
+// ── 2c) Bot 会话 · ds-bot：7 个字段全上板，串联关系与方案 §3.1 一致 ──────────
+//
+// 上面 2) 已保证这 7 个键都在 schema / volatile 里；这里把**开关树**钉死：
+// `dimmedBy` 就是置灰依据（列表里任一开关关闭 → 本项置灰，渲染行为见
+// settings-card-render.test.mjs）。方案 §3.1 的 dimmedBy 表是面板文案的唯一依据。
+const DSBOT_KEYS = [
+  'dsbotAwarenessEnabled', 'botSkillInjectEnabled', 'botWritebackEnabled',
+  'botContextDistillEnabled', 'botContextMessages', 'botContextReuseMemory', 'dsbotLedgerPath',
+]
+{
+  for (const key of DSBOT_KEYS) assert.ok(cardKeys.includes(key), `Bot 会话字段 "${key}" 应出现在面板里`)
+
+  const byKey = Object.fromEntries(toggles.map((t) => [t.key, t]))
+  assert.deepEqual(byKey.dsbotAwarenessEnabled.dimmedBy, undefined, '总闸是根，不受其它开关约束')
+  assert.deepEqual(byKey.botSkillInjectEnabled.dimmedBy, ['dsbotAwarenessEnabled', 'enabled', 'skillsEnabled'])
+  assert.deepEqual(byKey.botWritebackEnabled.dimmedBy, ['dsbotAwarenessEnabled', 'captureEnabled'])
+  assert.deepEqual(byKey.botContextDistillEnabled.dimmedBy, ['dsbotAwarenessEnabled', 'botWritebackEnabled'])
+  assert.deepEqual(byKey.botContextReuseMemory.dimmedBy, ['dsbotAwarenessEnabled', 'botWritebackEnabled'])
+  // 子项的每一级父开关都必须在 dimmedBy 里，否则"关了父项但子项看起来还能开"
+  for (const [child, parent] of [
+    ['botSkillInjectEnabled', 'enabled'],
+    ['botSkillInjectEnabled', 'skillsEnabled'],
+    ['botWritebackEnabled', 'captureEnabled'],
+    ['botContextDistillEnabled', 'botWritebackEnabled'],
+    ['botContextReuseMemory', 'botWritebackEnabled'],
+    ['botContextMessages', 'botWritebackEnabled'],
+  ]) {
+    const chain = (byKey[child] ?? numeric[child])?.dimmedBy ?? []
+    assert.ok(chain.includes(parent), `「${child}」的 dimmedBy 应包含父开关 ${parent}`)
+  }
+
+  // 默认值：总闸 / skill 注入 / 蒸馏开；回写 / 复用关（回写写 L0 不可逆，首次上线手动打开）
+  for (const key of ['dsbotAwarenessEnabled', 'botSkillInjectEnabled', 'botContextDistillEnabled']) {
+    assert.notEqual(byKey[key].defaultOff, true, `「${byKey[key].label}」默认应为开`)
+  }
+  for (const key of ['botWritebackEnabled', 'botContextReuseMemory']) {
+    assert.equal(byKey[key].defaultOff, true, `「${byKey[key].label}」默认应为关`)
+  }
+
+  // 身份与记忆对 Bot 会话**恒关**：面板上不能出现这两个开关（方案 §3.1 明确不给）。
+  // 面板上一个能开的东西，早晚会被当成受支持的用法。
+  for (const key of ['botIdentityEnabled', 'botMemoryEnabled', 'injectBotIdentity', 'injectBotMemory',
+    'dsbotIdentityInjectEnabled', 'dsbotMemoryInjectEnabled', 'botInjectIdentity', 'botInjectMemory']) {
+    assert.ok(!cardKeys.includes(key), `Bot 会话不该有身份 / 记忆开关（方案 §3.1）：${key}`)
+  }
+  for (const t of toggles) {
+    assert.ok(!/注入身份|注入记忆/.test(t.label), `开关「${t.label}」不该存在：身份与记忆对 Bot 会话恒关`)
+  }
+
+  // 群聊窗口条数：0 是有效语义（= 不蒸），不是一个"留空"的占位
+  assert.deepEqual(numeric.botContextMessages, {
+    min: 0, max: 20, label: '群聊窗口条数', dflt: 5,
+    dimmedBy: ['dsbotAwarenessEnabled', 'botWritebackEnabled'],
+  })
+
+  // 普通文本框（不是身份字段：不参与 identitySource / 身份告警）
+  assert.deepEqual(text.map((f) => f.key), ['botContextModel', 'dsbotLedgerPath'])
+  assert.deepEqual(text.find((f) => f.key === 'botContextModel').dimmedBy,
+    ['dsbotAwarenessEnabled', 'botWritebackEnabled'], '蒸馏模型只在 Bot 回写开着时有意义')
+  assert.ok(!identity.some((f) => f.key === 'dsbotLedgerPath'), '台账路径不该混进 IDENTITY_FIELDS')
+  assert.ok(!identity.some((f) => f.key === 'botContextModel'), '蒸馏模型不是身份字段')
+  assert.ok(!card.CARD_FIELDS.requiredIdentity.includes('dsbotLedgerPath'), '台账路径不该进 requiredIdentity')
+}
 
 // ── 2b) volatile 契约：它才是"面板可见性"的开关 ──────────────────────────────
 //
@@ -107,6 +176,24 @@ assert.equal(
   String(limit.min),
   'schema 应接受 env 字符串（组合层形态）',
 )
+
+// ── 3b) 群聊窗口条数：收敛区间与 schema 一致，且 0 是**有效值**而非空串 ────────
+{
+  const messages = numeric.botContextMessages
+  assert.equal(liveValue(schema({ botContextMessages: messages.min }).botContextMessages), messages.min, 'schema 应接受 0（= 不蒸）')
+  assert.equal(liveValue(schema({ botContextMessages: messages.max }).botContextMessages), messages.max, 'schema 应接受 20')
+  assert.throws(() => schema({ botContextMessages: messages.min - 1 }), 'schema 应拒绝负数')
+  assert.throws(() => schema({ botContextMessages: messages.max + 1 }), 'schema 应拒绝高于 20 的真数字')
+  // 0 必须落成数字 0，**不能**被当成空串 unset 掉（0 = 不蒸，是有效语义）
+  assert.deepEqual(
+    card.buildSaveOps({ botContextMessages: '0' }, ['botContextMessages']).ops,
+    [{ op: 'set', path: ['botContextMessages'], value: 0 }],
+  )
+  assert.equal(card.buildSaveOps({ botContextMessages: '99' }, ['botContextMessages']).ops[0].value, messages.max)
+  assert.deepEqual(card.buildSaveOps({ botContextMessages: '' }, ['botContextMessages']).ops, [
+    { op: 'unset', path: ['botContextMessages'] },
+  ], '留空 = 回落 schema 默认 5')
+}
 
 // ── 4) 保存归一化：空串回落 / 数值转 number / 越界收敛 / 非法值拦下 ──────────
 {
@@ -161,15 +248,27 @@ assert.deepEqual(card.missingIdentity(undefined), ['serviceId', 'teamId', 'agent
   const bundle = bundleRaw.replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
   assert.ok(bundle.includes('window.__ModuleLoader__.load'), 'client.js 应是 __ModuleLoader__ 注册格式')
 
-  // 每个开关的 label / hint、数值项 label、身份字段 label 都必须出现在产物里；
+  // 每个开关的 label / hint、数值项 label、身份 / 路径字段 label 都必须出现在产物里；
   // 少一个就说明改了 tsx 没重建（浏览器里跑的是旧卡片）。
   const labels = [
     ...toggles.flatMap((t) => [t.label, t.hint]),
-    numeric.recallLimit.label,
+    ...Object.values(numeric).map((f) => f.label),
     ...identity.flatMap((f) => [f.label, f.hint]),
+    ...text.flatMap((f) => [f.label, f.hint]),
   ].filter((s) => typeof s === 'string' && s.length > 0)
   const missing = labels.filter((label) => !bundle.includes(label))
   assert.equal(missing.length, 0, `client.js 缺少 ${missing.length} 个面板文案（忘了 npm run build:client？）：${missing.join(' / ')}`)
+
+  // Bot 组的关键文案（最容易被"改了 tsx 忘了 rebuild"漏掉的就是 hint）
+  for (const snippet of [
+    '总闸：关掉后不索引 ds-bot 的 state.json',
+    '身份与记忆对 Bot 会话恒不注入',
+    '默认关，首次上线手动打开',
+    '0 = 不蒸',
+    '不接受',
+  ]) {
+    assert.ok(bundle.includes(snippet), `client.js 缺少 Bot 组文案「${snippet}」（忘了 npm run build:client？）`)
+  }
 
   for (const key of cardKeys) {
     assert.ok(bundle.includes(key), `client.js 里找不到字段 "${key}"（忘了 npm run build:client？）`)
@@ -189,4 +288,4 @@ assert.deepEqual(card.missingIdentity(undefined), ['serviceId', 'teamId', 'agent
   assert.ok(!bundle.includes('settings.plugins.tab'), 'client.js 不该再挂 settings.plugins.tab（藏得太深）')
 }
 
-console.log('settings card tests passed: 字段↔schema 一致 / 数值归一化 / 身份判定 / client.js 与 tsx 同源')
+console.log('settings card tests passed: 字段↔schema 一致 / Bot 会话串联 / 数值归一化 / 身份判定 / client.js 与 tsx 同源')

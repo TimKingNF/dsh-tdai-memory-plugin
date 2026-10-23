@@ -452,6 +452,21 @@ export TDAI_MEMORY_KNOWLEDGE_ENABLED=false  # team knowledge injection, off by d
 export TDAI_MEMORY_SUBAGENT_INJECTION_ENABLED=false  # full read-side inheritance for child sessions (default: no; knowledge + tools are on regardless)
 export TDAI_MEMORY_SUBAGENT_CAPTURE_ENABLED=false    # write child conversations back (default: no)
 
+# ── ds-bot sessions (bot DMs / rooms / hidden room-member sessions) ──
+# Identity and memory are NEVER injected into Bot sessions (ds-bot owns the role; no per-Bot
+# tdai agent yet), so only skill injection and write-back have switches.
+# Effective value = master switch AND sub-switch AND the matching global gate.
+export TDAI_MEMORY_DSBOT_AWARENESS_ENABLED=true          # master switch; off = pre-change behavior (the only rollback switch)
+export TDAI_MEMORY_BOT_SKILL_INJECT_ENABLED=true         # inject on-demand cloud skills into Bot sessions
+export TDAI_MEMORY_BOT_WRITEBACK_ENABLED=false           # write Bot turns back to L0 (human-anchored); off by default
+export TDAI_MEMORY_BOT_CONTEXT_DISTILL_ENABLED=true      # distill room context (off = rooms write the human line only)
+export TDAI_MEMORY_BOT_CONTEXT_MESSAGES=5                # room window size (0-20; 0 = no distillation)
+export TDAI_MEMORY_BOT_CONTEXT_REUSE_MEMORY=false        # feed the room's MEMORY entries into the summary (off: avoid attribution loops)
+export TDAI_MEMORY_BOT_CONTEXT_MODEL=                     # model used for distillation (empty = the admin bot's model; prefer a small model with no thinking levels, e.g. deepseek-official/deepseek-flash)
+export TDAI_MEMORY_BOT_CONTEXT_MAX_TOKENS=5000            # distillation output cap (100-32000; thinking tokens are billed from it too)
+export TDAI_MEMORY_BOT_CONTEXT_TIMEOUT_MS=15000           # distillation timeout (2000-60000; thinking models need more than 8s)
+export TDAI_MEMORY_DSBOT_LEDGER_PATH=                    # ledger path; empty = <DSH_HOME>/storages/tdai-memory-plugin/dsbot-state.json
+
 # ── tuning ──
 export TDAI_MEMORY_ENDPOINT=http://127.0.0.1:8420
 export TDAI_MEMORY_RECALL_LIMIT=5           # merged top-K for L1 (1–20; also in the panel)

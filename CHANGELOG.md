@@ -4,6 +4,11 @@
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+> **测试范围声明（0.8.0）**：ds-bot 适配在 **DeepSeek Harness `0.2.0-rc.2`** +
+> **TencentDB-Agent-Memory `v2.0.1`** + **ds-bot 当前 main** 上实测：四态判定、lean 读侧（Bot 会话零身份
+> 零记忆、skill 仅命中时注入）、群聊自蒸摘要回写、私聊「人话 + 终稿」回写、台账断点与幂等位均跑通。
+> 端到端证据见 [minimal.md §11](docs/proposals/ds-bot-tdai-integration/minimal.md)。
+>
 > **测试范围声明（0.7.0）**：本版本在 **DeepSeek Harness `0.2.0-rc.2`**（本机当前运行版本）
 > 与 **TencentDB-Agent-Memory `v2.0.1`** 上实操验证过：system 段注入、`agent/pre-step` 两段召回
 > （L1 + skill）、14 个工具（10 只读 + 4 写侧待办，后者需另开开关与 User Key）、设置面板均已实际使用；
@@ -18,6 +23,8 @@
 ---
 
 ## [Unreleased]
+
+## [0.8.0] - 2026-10-23
 
 ### 修复：读侧工具失败不再伪装成「（无结果）」（候选 1，P0）
 
@@ -71,6 +78,79 @@
 - 订正过期数字：`CHANGELOG.md`（旧称"10 个 ≈6446 字节未覆盖"）与
   `docs/prompt-design.zh-CN.md` 的已知缺口表 d 行；README 补「六个键为何刻意
   不上面板」的说明。
+
+### 新增：ds-bot 会话识别 —— lean 读侧 + 按人锚点写回合
+
+方案：[docs/proposals/ds-bot-tdai-integration/minimal.md](docs/proposals/ds-bot-tdai-integration/minimal.md)
+（人读稿权威）与 [minimal.agents.md](docs/proposals/ds-bot-tdai-integration/minimal.agents.md)（执行层）；
+时序证据 [timing-probe.md](docs/proposals/ds-bot-tdai-integration/timing-probe.md)。
+
+#### 为什么
+
+ds-bot 把「Bot 私聊」「群聊房间」「群成员隐藏会话」都实现成普通 DSH 会话，插件从
+`session.header` 看不出区别。实测两个代价：Bot 会话白背 7,339 字符 `<session_context>`
+与 3,158 字符 `<tdai_profile_memory>`；群聊 129/129 个 completed 轮收尾步没有任何文本
+（每轮都是一次 `group_relay`），按普通会话回流会把 74% 的 relay 字符当成真人记忆写进 L0。
+
+#### 改了什么
+
+- **读侧按会话分面**（`lib/dsbot.mjs` 的 `sessionPolicy()`）：Bot / 房间 / 群成员隐藏会话
+  `identity=false`、`memory=false`、`skills` 受 `botSkillInjectEnabled` 约束、`knowledge=true`。
+  普通会话与子会话的四个能力面逐项不变（`subagentReadPolicy()` 保持原样，`sessionPolicy()`
+  返回它的超集）。
+- **写侧按人锚点写回合**（`lib/capture.mjs`）：私聊一轮写「人话 + 最高 step 终稿」；群聊每条
+  人消息写「自蒸前文摘要（assistant）+ 人话（user）」；relay、注入块、工具调用、纯 Bot 互投轮
+  一条不写；群成员隐藏会话永不写；失败轮只写人话。
+- **写入时机是 `agent/turn-stopping`**（不是消息到达）：真人消息实测 22/22 不带 `data.turn`，
+  只能按 `currentTurn` 归属。
+- **群聊锚点两阶段**：13 条锚点里 3 条晚 22–23 秒才进 room log，所以定位失败挂 pending，
+  下一次轮末重试；超限（3 次 / 10 分钟）只写人话 + `anchor-timeout` skip，并把断点推到日志末尾。
+- **蒸馏调用**（`lib/dsbot-context.mjs`）：主持 Bot 的模型（`rooms[*].admin` → `bots[admin].model`），超时与输出上限都可配
+  （`botContextTimeoutMs` 默认 15,000、`botContextMaxTokens` 默认 5,000），摘要 3–5 条 bullet +
+  `结论：`，整条 ≤1,200 字符。失败（超时/报错/
+  空输出/无模型）一律只写人话，**不写任何兜底原文**。
+- **台账**（`lib/dsbot-ledger.mjs`）：`<DSH_HOME>/storages/tdai-memory-plugin/dsbot-state.json`，
+  原子写；索引快照、群聊断点与 pending、私聊幂等位、阶段机（`summary/human`）都在这一个文件。
+  JSON 解析失败 / `version≠1` / 不可写 → **停写 + 告警**（不推断成"没有台账"）；路径指向
+  `<DSH_HOME>/bot` 之下 → 拒绝并回退默认。`state.json` 读不到时用台账里的旧索引继续 lean，
+  但写侧停写。
+- **配置与面板**：10 个新键（`dsbotAwarenessEnabled` 总闸 / `botSkillInjectEnabled` /
+  `botWritebackEnabled`（默认关）/ `botContextDistillEnabled` / `botContextMessages` /
+  `botContextReuseMemory` / `botContextModel`（蒸馏模型覆盖，空 = 主持 Bot 的模型）/
+  `botContextMaxTokens`（蒸馏输出上限，默认 5,000）/ `dsbotLedgerPath`），设置页新增「Bot 会话 · ds-bot」一组，
+  用 `dimmedBy` 表达串联；`cordis.patch.yml` 同步 8 行 env 透传。/tdai-status 新增一行
+  `dsbot=<bot|room|room-member|ordinary> skill=<on|off> write=<on|off> bot=<id|-> room=<id|-> ledger=<path>`，
+  其中 skill / write 打的是**有效值**。
+
+#### 刻意没做
+
+- 身份与记忆**不给开关**（恒关）：角色权威归 ds-bot；本阶段没有「每 Bot 一个 tdai agent」，
+  打开等于所有 Bot 共用一份人物画像。
+- 不做历史会话全量回流、不写群聊 Bot 终稿原文、不做空闲补写、不按 cwd 推断 Bot 会话
+  （实测 `ARK-Alpha` 的会话落在 `--mnt-d-workspace--`，按 cwd 会反向错判）。
+
+#### 上线后现场修的两处
+
+- **旁路蒸馏调用被 ds-bot 接管**：ds-bot 自己注册了 `llm/stream` 监听器，只要 `sessionId` 命中一个
+  房间且没带 `purpose`，就把调用当成群聊 relay 轮，直接合成一个空的 `finish(stop)`——请求根本到不了
+  模型。台账只能看到 `chunks={finish:1}`、L0 里只有 user 没有摘要。修法：蒸馏的 `sessionId` 改用按房间
+  派生的合成 id `tdai-distill:<roomId>`（`roomOf()` 是精确键查表，查不到就放行），并补 `botContextTimeoutMs`
+  ——思考型模型在 5,000 输出预算下 8 秒不够。
+- **终稿里的 `dsh-ui` 卡片污染 L0**：Bot 回复可能内嵌 `\`\`\`dsh-ui {...}` 的 UI spec。原样写进 L0 会吃掉
+  `RECORD_MAX_CHARS`（8,000）预算，并让 L1 把 `"type":"table"` 这类键名当对话内容。新增 `stripUiFences()`
+  把整块换成一行 `[结构化卡片]`，未闭合的尾巴也剥，正文不动。
+
+#### 测试
+
+新增 4 个测试文件、约 150 条断言：`test/dsbot.test.mjs`（四态 / lean 策略 / 写侧许可矩阵 /
+锚点定位 / 台账损坏语义 / stale 索引）、`test/dsbot-capture.test.mjs`（DM 正常轮与 relay 轮、
+收尾步无 text、群聊即命中 / 晚一轮 / 永不命中、崩溃恢复、重复投递、多锚点、环覆盖、
+蒸馏失败、回写开关三重 AND、失败轮只写人话、群成员会话不写、signal 停写）、
+`test/dsbot-context.test.mjs`（蒸馏六条失败路径 + prompt 与上限）、
+`test/dsbot-readside.test.mjs`（Bot 零身份零记忆、knowledge 面、skill 开关与 query 分流、
+普通会话逐字节不变）。`npm test` 全绿（含 prompt budget golden）。
+
+---
 
 ## [0.7.0] - 2026-10-15
 
