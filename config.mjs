@@ -40,6 +40,25 @@
  *   subagentCaptureEnabled    子 agent 会话是否回流。**默认关**：子 agent 的执行过程
  *                             不进 L0，避免后台抽取把工作噪音当成用户记忆。
  *                             两者判定见 lib/subagent.mjs（按 session.header.origin）。
+ *
+ *   ── ds-bot 会话（方案 docs/proposals/ds-bot-tdai-integration/minimal.md）──────────
+ *
+ *   dsbotAwarenessEnabled     **总闸**：是否按 ds-bot 的 state.json 识别 Bot / 房间会话。
+ *                             关掉后不索引 state.json，Bot 会话按普通会话处理 —— 这是
+ *                             唯一能回到改动前行为的开关。
+ *     ├─ botSkillInjectEnabled    读侧：Bot 会话注入云端 skill（身份与记忆**恒关**，
+ *     │                           没有开关，理由见 minimal.md §1）。默认开。
+ *     └─ botWritebackEnabled      写侧：Bot 会话回写 L0（按人锚点写回合）。默认**关**，
+ *                                 首次上线手动打开。还要 AND 全局 captureEnabled。
+ *          ├─ botContextDistillEnabled  群聊前文蒸馏（关掉后群聊只写人话）
+ *          └─ botContextMessages        群聊窗口条数（0 = 同关闭蒸馏）
+ *   botContextReuseMemory     群聊摘要是否复用本群 MEMORY 条目（默认关，避免归因回环）。
+ *   dsbotLedgerPath           台账路径（空 = <DSH_HOME>/storages/tdai-memory-plugin/
+ *                             dsbot-state.json）；不接受 <DSH_HOME>/bot 之下。
+ *
+ *   三个开关是**串联**的：Bot 侧两个子开关只有在总闸为真时才有效；有效值只在
+ *   `lib/dsbot.mjs` 的 `sessionPolicy()` 与 `writebackAllowed()` 两处计算，调用点
+ *   不得直接读 `botSkillInjectEnabled` / `botWritebackEnabled`。
  */
 const FALSEY = /^(0|false|no|off)$/i
 
@@ -162,6 +181,50 @@ export function resolveConfig(config = {}) {
      */
     subagentInjectionEnabled: boolOpt(config.subagentInjectionEnabled, false),
     subagentCaptureEnabled: boolOpt(config.subagentCaptureEnabled, false),
+
+    /**
+     * ds-bot 会话识别（总闸 + 两个子开关 + 群聊蒸馏参数），见文件头开关树。
+     *
+     * 有效值**不在这里算**：`dsbotAwarenessEnabled` 只是开关本身，与 `enabled` /
+     * `skillsEnabled` / `captureEnabled` 的 AND 在 `lib/dsbot.mjs`
+     * （`sessionPolicy()` 与 `writebackAllowed()`）里做一次，避免散落到各调用点。
+     */
+    dsbotAwarenessEnabled: boolOpt(config.dsbotAwarenessEnabled, true),
+    botSkillInjectEnabled: boolOpt(config.botSkillInjectEnabled, true),
+    /** 回写默认关：写 L0 不可逆，首次上线由人手打开。 */
+    botWritebackEnabled: boolOpt(config.botWritebackEnabled, false),
+    botContextDistillEnabled: boolOpt(config.botContextDistillEnabled, true),
+    /** 群聊窗口条数：0 是有效语义（= 不蒸），所以用 numOptZero；上限 20 与面板一致。 */
+    botContextMessages: Math.min(20, numOptZero(config.botContextMessages, 5)),
+    botContextReuseMemory: boolOpt(config.botContextReuseMemory, false),
+    /**
+     * 蒸馏用哪家的模型：空 = 主持 Bot 的模型（`rooms[*].admin` → `bots[admin].model`）。
+     *
+     * 为什么要能换：主持 Bot 多半挂在「会思考」的模型上，而 pi-ai 对这类模型**没有
+     * `off` 档**（`thinkingLevelMap.off = null`）——`reasoningEffort:'off'` 只是省略参数，
+     * 供应商默认照样思考，思考 token 从 `maxTokens` 里扣，正文被挤空（2026-10-23 现场：
+     * `distill-empty`）。换一个 DSH 层面没有思考档位的小模型，蒸馏更快也更省。
+     * 形如 `provider/model`（例：`deepseek-official/deepseek-flash`）；写错 → 该轮只写人话。
+     */
+    botContextModel: str(config.botContextModel) || '',
+    /**
+     * 蒸馏的输出上限（completion token）。默认 5,000。
+     *
+     * 为什么给这么大：会思考的模型把思考 token 也算进输出预算，600 那种量级会被思考吃光
+     * （现场 `distill-empty`）。5,000 是"思考随便写、正文留够"的兜底；实际输出通常只有
+     * 二三百 token，这个值只是上限，不产生额外成本。要省额度可以自己调小。
+     */
+    botContextMaxTokens: Math.min(32000, Math.max(100, numOpt(config.botContextMaxTokens, 5000))),
+    /**
+     * 蒸馏超时（毫秒）。默认 15,000。
+     *
+     * 为什么不再是写死的 8,000：会思考的模型在 5,000 输出预算下可能想十几秒（2026-10-23
+     * 现场：8 秒直接 timeout，台账 skip=distill-timeout）。turn-stopping 里等一会儿不影响
+     * 用户看到回复（回复已经渲染完），只是记忆写入晚几秒。
+     */
+    botContextTimeoutMs: Math.min(60000, Math.max(2000, numOpt(config.botContextTimeoutMs, 15000))),
+    /** 台账路径：空 = 默认位置（lib/dsbot-ledger.mjs 负责展开与校验）。 */
+    dsbotLedgerPath: str(config.dsbotLedgerPath) || '',
 
     endpoint: str(config.endpoint) || 'http://127.0.0.1:8420',
     apiKeyEnv: str(config.apiKeyEnv) || 'TDAI_MEMORY_API_KEY',

@@ -4,6 +4,11 @@
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+> **测试范围声明（0.8.0）**：ds-bot 适配在 **DeepSeek Harness `0.2.0-rc.2`** +
+> **TencentDB-Agent-Memory `v2.0.1`** + **ds-bot 当前 main** 上实测：四态判定、lean 读侧（Bot 会话零身份
+> 零记忆、skill 仅命中时注入）、群聊自蒸摘要回写、私聊「人话 + 终稿」回写、台账断点与幂等位均跑通。
+> 端到端证据见 [minimal.md §11](docs/proposals/ds-bot-tdai-integration/minimal.md)。
+>
 > **测试范围声明（0.7.0）**：本版本在 **DeepSeek Harness `0.2.0-rc.2`**（本机当前运行版本）
 > 与 **TencentDB-Agent-Memory `v2.0.1`** 上实操验证过：system 段注入、`agent/pre-step` 两段召回
 > （L1 + skill）、14 个工具（10 只读 + 4 写侧待办，后者需另开开关与 User Key）、设置面板均已实际使用；
@@ -18,6 +23,134 @@
 ---
 
 ## [Unreleased]
+
+## [0.8.0] - 2026-10-23
+
+### 修复：读侧工具失败不再伪装成「（无结果）」（候选 1，P0）
+
+#### 为什么
+
+读侧工具此前有两个叠加的吞口，模型看到的失败全变成"记忆里没有"：
+
+1. `client.mjs` 的 `safe()` 把 4xx / 超时 / 网络错误的原因吞进日志，回落 `{}` / `[]` / `null`；
+2. `lib/tools.mjs` 把 `null` / `[]` / `{}` 一律说成「（无结果）」。
+
+于是网关 403、请求超时、反代 200 错误页三种情况下，模型都对用户说"我不记得"。
+0.6.1 已经在知识链路上修过同类事故（把 4xx 说成"不可达"→ 模型连试 4 种参数后
+自己拼文档，见 [0.6.1] 一节）；本版把这套 `{ok, data|error}` 范式推广到普通读侧工具。
+
+#### 设计
+
+- `client.mjs` 新增私有 `#exchange()`：**一次请求 + 失败归一化，不重试、不抛**。
+  产物 `{kind, brief, log, retryable, raw}`：`kind ∈ timeout | aborted | network |
+  protocol | http | business`。`brief` 是白名单拼装（status / 业务 code / 服务端
+  message / `cause.code`），**不含 base URL、路径、请求头、密钥**。
+- 三条外层各自保留原有职责：`post()` 抛错（写侧 `taskWriteFailure` 的 message 格式
+  逐字未变）、`safe()` 记日志回落（16 个调用点与注入链路零改动）、`#postTo()`
+  保留 1 次重试；两套链路从此共用同一脱敏口径。
+- 只读工具走新增的严格通道 `attemptXxx()`（`{ok, data|error}`，不抛），旧方法
+  （`searchL1` 等）保留原返回形状，内部改成「严格通道 + fallback」两行。
+- `protocol` 是**第四种失败形态**：旧代码 `resp.json().catch(() => ({}))` 把
+  HTTP 200 + HTML/空 body 洗成 `{}` 当成"成功但无数据"，现在归为
+  `响应无法解析（HTTP 200，不是 JSON）`。
+- 工具层失败文案写明「这次没有取到结果，不等于记忆里没有相关内容」，堵住
+  "失败 = 没有"的误读；合法空结果（200 + 空集合）仍严格回「（无结果）」。
+- 写侧：`taskWriteFailure` 与四个写工具不动（它们本来就走 `post()` 直抛）。
+
+#### 实现
+
+| 文件 | 改动 |
+| --- | --- |
+| `client.mjs` | 新增 `#exchange` / `#request` / `#attemptCall` 与 8 个 `attemptXxx`；`#postTo` 改走同一底层；`post()` / `safe()` 对外行为逐字不变 |
+| `lib/tools.mjs` | 8 个只读工具改走 `attemptXxx`；新增 `readFailureText`；`protocol` 失败不再塌成空结果 |
+| `test/tools-failure.test.mjs` | 新增 14 组用例：4xx / 5xx / 超时 / 取消 / 网络（`ECONNREFUSED`）/ 协议错误 / 合法空结果 / 业务码 / `null` 双语义 / 注入链路 fail-open / 写侧错误格式 / 10 只读工具行为级完备性 / 4 写侧不假成功 / 脱敏（host+port 显式断言） |
+
+### 测试：工具 schema 体积纳入 prompt 预算（候选 2）
+
+- 新增口径（与本文档旧数不同源，旧数作废）：逐项
+  `Buffer.byteLength(JSON.stringify({name, description, parameters}), 'utf8')`，
+  合计 = 逐项之和，**不含** output schema。实证 14 个工具合计 **9165 B**
+  （其中 name+description 5478 B；最大 `tdai_task_add` 1225 B）。
+- `test/prompt-budget.test.mjs` 两道闸：逐项等值 `prompt-budget.baseline.json`
+  的 `toolSchema` 段（由 `--save` 现场生成，不手填）+ 合计 ≤ 10000 B 政策上界
+  （9165 × 1.09 取整）；baseline 自洽断言「逐项之和 === 合计」；另做变异验证
+  （给任一 description 加 200 B，判定函数必须抛）。
+- 订正过期数字：`CHANGELOG.md`（旧称"10 个 ≈6446 字节未覆盖"）与
+  `docs/prompt-design.zh-CN.md` 的已知缺口表 d 行；README 补「六个键为何刻意
+  不上面板」的说明。
+
+### 新增：ds-bot 会话识别 —— lean 读侧 + 按人锚点写回合
+
+方案：[docs/proposals/ds-bot-tdai-integration/minimal.md](docs/proposals/ds-bot-tdai-integration/minimal.md)
+（人读稿权威）与 [minimal.agents.md](docs/proposals/ds-bot-tdai-integration/minimal.agents.md)（执行层）；
+时序证据 [timing-probe.md](docs/proposals/ds-bot-tdai-integration/timing-probe.md)。
+
+#### 为什么
+
+ds-bot 把「Bot 私聊」「群聊房间」「群成员隐藏会话」都实现成普通 DSH 会话，插件从
+`session.header` 看不出区别。实测两个代价：Bot 会话白背 7,339 字符 `<session_context>`
+与 3,158 字符 `<tdai_profile_memory>`；群聊 129/129 个 completed 轮收尾步没有任何文本
+（每轮都是一次 `group_relay`），按普通会话回流会把 74% 的 relay 字符当成真人记忆写进 L0。
+
+#### 改了什么
+
+- **读侧按会话分面**（`lib/dsbot.mjs` 的 `sessionPolicy()`）：Bot / 房间 / 群成员隐藏会话
+  `identity=false`、`memory=false`、`skills` 受 `botSkillInjectEnabled` 约束、`knowledge=true`。
+  普通会话与子会话的四个能力面逐项不变（`subagentReadPolicy()` 保持原样，`sessionPolicy()`
+  返回它的超集）。
+- **写侧按人锚点写回合**（`lib/capture.mjs`）：私聊一轮写「人话 + 最高 step 终稿」；群聊每条
+  人消息写「自蒸前文摘要（assistant）+ 人话（user）」；relay、注入块、工具调用、纯 Bot 互投轮
+  一条不写；群成员隐藏会话永不写；失败轮只写人话。
+- **写入时机是 `agent/turn-stopping`**（不是消息到达）：真人消息实测 22/22 不带 `data.turn`，
+  只能按 `currentTurn` 归属。
+- **群聊锚点两阶段**：13 条锚点里 3 条晚 22–23 秒才进 room log，所以定位失败挂 pending，
+  下一次轮末重试；超限（3 次 / 10 分钟）只写人话 + `anchor-timeout` skip，并把断点推到日志末尾。
+- **蒸馏调用**（`lib/dsbot-context.mjs`）：主持 Bot 的模型（`rooms[*].admin` → `bots[admin].model`），超时与输出上限都可配
+  （`botContextTimeoutMs` 默认 15,000、`botContextMaxTokens` 默认 5,000），摘要 3–5 条 bullet +
+  `结论：`，整条 ≤1,200 字符。失败（超时/报错/
+  空输出/无模型）一律只写人话，**不写任何兜底原文**。
+- **台账**（`lib/dsbot-ledger.mjs`）：`<DSH_HOME>/storages/tdai-memory-plugin/dsbot-state.json`，
+  原子写；索引快照、群聊断点与 pending、私聊幂等位、阶段机（`summary/human`）都在这一个文件。
+  JSON 解析失败 / `version≠1` / 不可写 → **停写 + 告警**（不推断成"没有台账"）；路径指向
+  `<DSH_HOME>/bot` 之下 → 拒绝并回退默认。`state.json` 读不到时用台账里的旧索引继续 lean，
+  但写侧停写。
+- **配置与面板**：10 个新键（`dsbotAwarenessEnabled` 总闸 / `botSkillInjectEnabled` /
+  `botWritebackEnabled`（默认关）/ `botContextDistillEnabled` / `botContextMessages` /
+  `botContextReuseMemory` / `botContextModel`（蒸馏模型覆盖，空 = 主持 Bot 的模型）/
+  `botContextMaxTokens`（蒸馏输出上限，默认 5,000）/ `dsbotLedgerPath`），设置页新增「Bot 会话 · ds-bot」一组，
+  用 `dimmedBy` 表达串联；`cordis.patch.yml` 同步 8 行 env 透传。/tdai-status 新增一行
+  `dsbot=<bot|room|room-member|ordinary> skill=<on|off> write=<on|off> bot=<id|-> room=<id|-> ledger=<path>`，
+  其中 skill / write 打的是**有效值**。
+
+#### 刻意没做
+
+- 身份与记忆**不给开关**（恒关）：角色权威归 ds-bot；本阶段没有「每 Bot 一个 tdai agent」，
+  打开等于所有 Bot 共用一份人物画像。
+- 不做历史会话全量回流、不写群聊 Bot 终稿原文、不做空闲补写、不按 cwd 推断 Bot 会话
+  （实测 `ARK-Alpha` 的会话落在 `--mnt-d-workspace--`，按 cwd 会反向错判）。
+
+#### 上线后现场修的两处
+
+- **旁路蒸馏调用被 ds-bot 接管**：ds-bot 自己注册了 `llm/stream` 监听器，只要 `sessionId` 命中一个
+  房间且没带 `purpose`，就把调用当成群聊 relay 轮，直接合成一个空的 `finish(stop)`——请求根本到不了
+  模型。台账只能看到 `chunks={finish:1}`、L0 里只有 user 没有摘要。修法：蒸馏的 `sessionId` 改用按房间
+  派生的合成 id `tdai-distill:<roomId>`（`roomOf()` 是精确键查表，查不到就放行），并补 `botContextTimeoutMs`
+  ——思考型模型在 5,000 输出预算下 8 秒不够。
+- **终稿里的 `dsh-ui` 卡片污染 L0**：Bot 回复可能内嵌 `\`\`\`dsh-ui {...}` 的 UI spec。原样写进 L0 会吃掉
+  `RECORD_MAX_CHARS`（8,000）预算，并让 L1 把 `"type":"table"` 这类键名当对话内容。新增 `stripUiFences()`
+  把整块换成一行 `[结构化卡片]`，未闭合的尾巴也剥，正文不动。
+
+#### 测试
+
+新增 4 个测试文件、约 150 条断言：`test/dsbot.test.mjs`（四态 / lean 策略 / 写侧许可矩阵 /
+锚点定位 / 台账损坏语义 / stale 索引）、`test/dsbot-capture.test.mjs`（DM 正常轮与 relay 轮、
+收尾步无 text、群聊即命中 / 晚一轮 / 永不命中、崩溃恢复、重复投递、多锚点、环覆盖、
+蒸馏失败、回写开关三重 AND、失败轮只写人话、群成员会话不写、signal 停写）、
+`test/dsbot-context.test.mjs`（蒸馏六条失败路径 + prompt 与上限）、
+`test/dsbot-readside.test.mjs`（Bot 零身份零记忆、knowledge 面、skill 开关与 query 分流、
+普通会话逐字节不变）。`npm test` 全绿（含 prompt budget golden）。
+
+---
 
 ## [0.7.0] - 2026-10-15
 
@@ -841,8 +974,9 @@ system 段注入从 **9953 → 5768 字节（-42%）**，其中团队知识块�
   断言"清单里的每个标记都必须真能被剥掉"。
 - `docs/prompt-injection-redesign.md` §9 决策表第 4 行仍写着"L1 召回改成 prepend 语义"，
   该决定已在 §11 回退，**以 §11 为准**。
-- 工具 schema（10 个 ≈6446 字节）尚未纳入 `test/prompt-budget.test.mjs` 的预算覆盖，
-  后续加工具或改 description 时不会有红灯提醒。
+- ~~工具 schema 尚未纳入 prompt 预算~~ → **已覆盖**（[Unreleased] 改动）：`test/prompt-budget.test.mjs`
+  按「逐项 name+description+parameters 序列化字节」写入 baseline 等值断言（14 个工具实测 9165 B），
+  另有 10000 B 政策上界与变异验证。旧数「10 个 ≈6446 字节」是 0.6.1 的口径，已作废。
 - 子 agent 降级**不含工具**：10 个只读工具在子会话里仍然注册（约 6446 字节 schema）。
   要连工具一起对子 agent 收紧，用 DSH 原生的 `dsh-tool-subagent` 的 `toolFilter`
   （`tools.restrict()`）—— 那是部署级选择，且会让前缀在最前面分叉。

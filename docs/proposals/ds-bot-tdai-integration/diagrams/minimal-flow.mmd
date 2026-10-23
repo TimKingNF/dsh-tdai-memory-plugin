@@ -1,0 +1,32 @@
+flowchart TD
+  A["agent/turn-stopping"] --> G0{"总闸 on 且<br/>回写开关 on?"}
+  G0 -- 否 --> Z0["直接返回（不改任何行为）"]
+  G0 -- 是 --> B{"会话类型<br/>（state.json 索引）"}
+  B -- "普通会话" --> R["原逻辑不变"]
+  B -- "群成员会话 / 纯 relay 轮" --> Z["丢弃"]
+  B -- "未解析但见过 kind=bot" --> Z2["停写 + 告警"]
+  B -- "私聊（bot）" --> D{"本轮有人锚点?"}
+  D -- 否 --> Z3["整轮不写"]
+  D -- 是 --> E["取最高 step 的 assistant text"]
+  E --> F{"有 text?"}
+  F -- 否 --> G["只写人话"]
+  F -- 是 --> H["写 user + assistant（同批）"]
+  B -- "群聊（room）" --> I["强制刷新 state.json<br/>定位锚点 seq"]
+  I --> J{"命中?"}
+  J -- 否 --> K["记 pending<br/>不写、不推进断点"]
+  K --> K2{"重试超限?"}
+  K2 -- 否 --> I
+  K2 -- 是 --> L["只写人话 + typed skip<br/>断点推进到日志末尾"]
+  J -- 是 --> M{"断点已滑出环?"}
+  M -- 是 --> M2["重置断点到 log[0]<br/>checkpoint-lost 告警"]
+  M -- 否 --> N["窗口 = 断点后到锚点前<br/>取最后 N 条"]
+  M2 --> N
+  N --> O{"窗口有 Bot 行?"}
+  O -- 否 --> L2["只写人话"]
+  O -- 是 --> P["拼窗口 + 本群 MEMORY 条目"]
+  P --> Q["ctx.llm 蒸馏（8s）"]
+  Q --> R2{"成功?"}
+  R2 -- 是 --> S["写 assistant 摘要"]
+  R2 -- 否 --> S2["只写人话 + skip(distill-failed)"]
+  S --> T["写 user 人话 → 断点推进"]
+  S2 --> T

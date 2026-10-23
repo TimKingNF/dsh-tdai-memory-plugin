@@ -424,6 +424,20 @@ export TDAI_MEMORY_KNOWLEDGE_ENABLED=false  # 团队知识资源注入，默认�
 export TDAI_MEMORY_SUBAGENT_INJECTION_ENABLED=false  # 子会话是否全量继承读侧（默认关；知识库与工具本就可用）
 export TDAI_MEMORY_SUBAGENT_CAPTURE_ENABLED=false    # 子会话是否回流（默认关）
 
+# ── ds-bot 会话（识别 bot 私聊 / 群聊 / 群成员隐藏会话）──
+# 身份与记忆对 Bot 会话**恒不注入**（角色权威归 ds-bot；本阶段没有每 Bot 一个 agent），
+# 所以只有 skill 注入与回写两个子开关。有效值 = 总闸 ∧ 子开关 ∧ 对应全局闸。
+export TDAI_MEMORY_DSBOT_AWARENESS_ENABLED=true          # 总闸；关掉 = 回到改动前（唯一回滚开关）
+export TDAI_MEMORY_BOT_SKILL_INJECT_ENABLED=true         # Bot 会话注入云端 skill（每轮检索）
+export TDAI_MEMORY_BOT_WRITEBACK_ENABLED=false           # Bot 会话回写 L0（按人锚点写回合）；默认关
+export TDAI_MEMORY_BOT_CONTEXT_DISTILL_ENABLED=true      # 群聊前文蒸馏（关掉后群聊只写人话）
+export TDAI_MEMORY_BOT_CONTEXT_MESSAGES=5                # 群聊窗口条数（0–20；0 = 不蒸）
+export TDAI_MEMORY_BOT_CONTEXT_REUSE_MEMORY=false        # 摘要复用本群 MEMORY 条目（默认关，避免归因回环）
+export TDAI_MEMORY_BOT_CONTEXT_MODEL=                     # 蒸馏用模型（空 = 主持 Bot 的模型；建议无思考档位的小模型，如 deepseek-official/deepseek-flash）
+export TDAI_MEMORY_BOT_CONTEXT_MAX_TOKENS=5000            # 蒸馏输出上限（100–32000；思考 token 也从这里扣）
+export TDAI_MEMORY_BOT_CONTEXT_TIMEOUT_MS=15000           # 蒸馏超时（2000–60000；思考型模型 8 秒不够）
+export TDAI_MEMORY_DSBOT_LEDGER_PATH=                    # 台账路径；空 = <DSH_HOME>/storages/tdai-memory-plugin/dsbot-state.json
+
 # ── 调参 ──
 export TDAI_MEMORY_ENDPOINT=http://127.0.0.1:8420
 export TDAI_MEMORY_RECALL_LIMIT=5           # L1 合并 top-K（1–20，面板里也可改）
@@ -441,6 +455,12 @@ export TDAI_MEMORY_ASSET_RETRY_COOLDOWN_MS=15000  # 加载失败后的冷却期�
 
 配置优先级：**Web 设置 > env > 内置默认值**。身份不完整时读侧自动停用并告警，写侧不受影响；
 `TDAI_MEMORY_API_KEY` 只从 env 读取，不写入设置面板。
+
+**哪些键刻意不上面板**：`apiKeyEnv` / `l2Limit` / `timeoutMs` / `recallTimeoutMs` /
+`assetLoadBudgetMs` / `assetRetryCooldownMs` 六个键**故意**不放设置面板（= `lib/settings.mjs` 的
+`PATCH_ONLY_KEYS`），只能用 env 配置。原因：面板只放日常会调的项，这六个都是部署期 knob；
+其中 `apiKeyEnv` 是「环境变量名」而不是凭据本身，放进面板反而会让人把密钥值误填进一个
+期望变量名的格子。想改它们请改 env 并重启 profile —— 这是有意设计，不是缺功能。
 
 **三个"主链路保护"参数说明**：读侧对 MemoryCore 的调用全部发生在模型请求**之前**
 （`system-prompt/assemble` 注入资产、`agent/pre-step` 召回），网关慢或挂时如果无限等、

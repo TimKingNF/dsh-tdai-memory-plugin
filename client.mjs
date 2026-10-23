@@ -45,6 +45,31 @@ function describeError(error) {
 }
 
 /**
+ * 网络层失败的 `cause.code`（`ECONNREFUSED` / `ENOTFOUND` / `UND_ERR_*`）。
+ *
+ * 只取 code，**绝不取 cause.message**：后者形如 `connect ECONNREFUSED 127.0.0.1:8420`，
+ * 会把内网地址带进模型可见的文案。模型可见错误串一律由 `#exchange` 白名单拼装，
+ * 本函数只提供其中一个变量。
+ */
+function causeCodeOf(error) {
+  const code = error?.cause?.code
+  return typeof code === 'string' && code ? code : ''
+}
+
+/** L1 命中归一化（`#attemptCall` 的 map）。 */
+function mapL1Items(data) {
+  return (data?.items ?? [])
+    .map((item) => ({
+      id: String(item?.id ?? ''),
+      type: typeof item?.type === 'string' ? item.type : undefined,
+      content: typeof item?.content === 'string' ? item.content : '',
+      score: typeof item?.score === 'number' ? item.score : undefined,
+      updatedAt: typeof item?.updated_at === 'string' ? item.updated_at : undefined,
+    }))
+    .filter((m) => m.id && m.content)
+}
+
+/**
  * wiki 的 `read_page` 成功时返回 `{ items: [{ ref, content }] }`：
  * **引用取不到内容时服务端照样回 `code=0` + 空 `content`**（实测 2026-10-14：
  * `wiki/concepts/不存在的页.md` → 空串，200 OK）。对模型来说，"页面不存在 / 路径写错 /
@@ -102,15 +127,68 @@ export class GatewayClient {
     return h
   }
 
-  /** 原始 POST：失败抛错，由 safe() 或调用方决定降级策略。 */
-  async post(path, body, opts = {}) {
-    const resp = await fetch(`${this.endpoint}${path}`, {
-      method: 'POST',
-      headers: this.headers(opts.identity, opts),
-      body: JSON.stringify(stripUndefined(body ?? {})),
-      signal: opts.signal ?? AbortSignal.timeout(opts.timeoutMs ?? this.timeoutMs),
-    })
-    const payload = await resp.json().catch(() => ({}))
+  /**
+   * 一次 POST + 失败归一化。**只干这一件事：不重试、不抛。**
+   *
+   * 返回 `{ ok: true, data }`，或 `{ ok: false, error: { kind, brief, log, retryable, status?, code?, raw } }`：
+   *   - `kind`：`timeout` / `aborted` / `network` / `protocol` / `http` / `business`。
+   *     `protocol` 专指"拿到了响应但解析不出 JSON"（反代 200 错误页、空 body）——
+   *     旧实现 `resp.json().catch(() => ({}))` 把它洗成 `{}` 当成"成功但无数据"，
+   *     与"检索确实没命中"混为一谈，必须单独归一类。
+   *   - `brief`：给模型看的**一句话**，白名单拼装（status / code / 服务端 message /
+   *     `cause.code`），不含 base URL、路径、请求头、密钥。
+   *   - `log`：给日志看的（可带 cause 细节，走 `describeError`）。
+   *   - `raw`：`post()` 要抛出的 Error（写侧 `taskWriteFailure` 依赖它的 message/cause）。
+   *
+   * 外层按需要包：`post()` 抛错、`safe()` 记日志回落、`#postTo` 加重试。
+   */
+  async #exchange(url, { path, headers, body, signal, timeoutMs } = {}) {
+    const budget = Number(timeoutMs) > 0 ? Number(timeoutMs) : this.timeoutMs
+    let resp
+    try {
+      resp = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(stripUndefined(body ?? {})),
+        signal: signal ?? AbortSignal.timeout(budget),
+      })
+    } catch (error) {
+      // 判据只看 `error.name`：`AbortSignal.timeout()` 抛 DOMException name='TimeoutError'；
+      // `controller.abort(reason)` 带自定义 reason 时抛的是那个 reason（name 可能不是
+      // AbortError），只有裸 `abort()` 才是 'AbortError'。所以再用 `signal.aborted` 兜底。
+      const aborted = signal?.aborted === true
+      const kind = error?.name === 'TimeoutError' ? 'timeout'
+        : (error?.name === 'AbortError' || aborted) ? 'aborted'
+          : 'network'
+      const brief = kind === 'timeout'
+        // 调用方自带 signal（召回路径）时我们不知道它的预算，不编 ms。
+        ? (signal ? '请求超时' : `请求超时（${budget}ms 无响应）`)
+        : kind === 'aborted' ? '请求已取消'
+          : `请求失败（${causeCodeOf(error) || '网络异常'}）`
+      return {
+        ok: false,
+        error: { kind, brief, log: describeError(error), retryable: kind !== 'aborted', raw: error },
+      }
+    }
+
+    let payload
+    try {
+      payload = await resp.json()
+    } catch {
+      const raw = new Error(`${TAG} ${path} 响应无法解析（HTTP ${resp.status}）`)
+      return {
+        ok: false,
+        error: {
+          kind: 'protocol',
+          brief: `响应无法解析（HTTP ${resp.status}，不是 JSON）`,
+          log: describeError(raw),
+          retryable: resp.status >= 500 || resp.status === 429,
+          status: resp.status,
+          raw,
+        },
+      }
+    }
+
     if (!resp.ok) {
       // 非 2xx 时内核把原因放在**响应体**里（实测 401 `missing_user_key`、
       // 403 `permission_denied: caller is not resource owner`）。只抛一句 `HTTP 403`
@@ -118,21 +196,103 @@ export class GatewayClient {
       // 它必须能分清"没配 user key" / "没权限" / "服务不可达"。
       const detail = [payload?.code !== undefined ? `code=${payload.code}` : '', payload?.message ?? '']
         .filter(Boolean).join(' ')
-      throw new Error(`${TAG} ${path} HTTP ${resp.status}${detail ? ` ${detail}` : ''}`)
+      const raw = new Error(`${TAG} ${path} HTTP ${resp.status}${detail ? ` ${detail}` : ''}`)
+      const message = typeof payload?.message === 'string' ? payload.message : ''
+      // 服务端只回业务码、不回 message 时（如 401 `{code:'missing_user_key'}`），业务码是
+      // 唯一可操作的线索，不能丢；有 message 时保持旧文案逐字不变（知识链路的既有断言依赖它）。
+      const note = message || (payload?.code !== undefined ? `code=${payload.code}` : '')
+      return {
+        ok: false,
+        error: {
+          kind: 'http',
+          brief: `HTTP ${resp.status}${note ? ` · ${note}` : ''}`,
+          log: describeError(raw),
+          retryable: resp.status >= 500 || resp.status === 429,
+          status: resp.status,
+          code: payload?.code,
+          raw,
+        },
+      }
     }
     if (typeof payload?.code === 'number' && payload.code !== 0) {
-      throw new Error(`${TAG} ${path} code=${payload.code} ${payload.message ?? ''}`.trim())
+      const raw = new Error(`${TAG} ${path} code=${payload.code} ${payload.message ?? ''}`.trim())
+      const message = typeof payload?.message === 'string' ? payload.message : ''
+      return {
+        ok: false,
+        error: {
+          kind: 'business',
+          brief: `code=${payload.code}${message ? ` · ${message}` : ''}`,
+          log: describeError(raw),
+          retryable: false,
+          code: payload.code,
+          raw,
+        },
+      }
     }
-    return payload?.data ?? {}
+    return { ok: true, data: payload?.data ?? {} }
   }
 
-  /** fail-open 包装：出错记日志并返回 fallback。 */
+  /** 固定 endpoint + 数据面 header 的一次请求（不重试、不抛）。 */
+  #request(path, body, opts = {}) {
+    return this.#exchange(`${this.endpoint}${path}`, {
+      path,
+      headers: this.headers(opts.identity, opts),
+      body,
+      signal: opts.signal,
+      timeoutMs: opts.timeoutMs,
+    })
+  }
+
+  /**
+   * 原始 POST：失败抛错，由 safe() 或调用方决定降级策略。
+   * 抛出的 `message` 与旧实现逐字一致（写侧 `taskWriteFailure` 的正则依赖它）。
+   */
+  async post(path, body, opts = {}) {
+    const result = await this.#request(path, body, opts)
+    if (result.ok) return result.data
+    throw result.error.raw
+  }
+
+  /**
+   * fail-open 包装：出错记日志并返回 fallback（对外形状与旧实现完全一致）。
+   *
+   * try 包住整段而不是只包 `#request`：`fail-open` 的契约是"绝不把异常抛进 DSH 主链路"，
+   * 请求构造阶段（`headers()`、signal 组装）理论上不抛，但旧实现的 catch-all 是最后一道兜底，
+   * 不能因为换了底层就悄悄收窄。
+   */
   async safe(path, body, opts = {}, fallback = null) {
     try {
-      return await this.post(path, body, opts)
+      const result = await this.#request(path, body, opts)
+      if (!result.ok) {
+        this.log(`${path} failed: ${result.error.log}`)
+        return fallback
+      }
+      return result.data
     } catch (error) {
       this.log(`${path} failed: ${describeError(error)}`)
       return fallback
+    }
+  }
+
+  /**
+   * 只读工具的**严格通道**：`{ ok:true, data }` / `{ ok:false, error:'…', kind }`，**不抛**。
+   *
+   * 形态与 `#postTo` 一致（`{ ok, data|error }`），`error` 是白名单拼出来的给模型看的一句话。
+   * 日志与 `safe()` 完全一致（`${path} failed: …`）—— 失败可观测性不能因为换通道而回退。
+   * 老方法（`searchL1` 等）保留原返回形状，内部改成「本方法 + fallback」两行。
+   */
+  async #attemptCall(path, body, opts, map) {
+    try {
+      const result = await this.#request(path, body, opts)
+      if (!result.ok) {
+        this.log(`${path} failed: ${result.error.log}`)
+        return { ok: false, error: result.error.brief, kind: result.error.kind }
+      }
+      return { ok: true, data: map ? map(result.data) : result.data }
+    } catch (error) {
+      // 与 safe() 同一条兜底：严格通道也承诺"不抛"，工具层只需要一个失败信封。
+      this.log(`${path} failed: ${describeError(error)}`)
+      return { ok: false, error: '请求构造失败（内部错误）', kind: 'internal' }
     }
   }
 
@@ -159,89 +319,125 @@ export class GatewayClient {
   // ── L0 / L1 检索 ─────────────────────────────────────────────────────────
 
   /**
-   * L1 召回。ctx = { teamId, userId, agentId }（自有或借入 agent）；
-   * session/task 归属用调用方的，与 proxy searchL1ForCtx 语义一致。
+   * L1 召回的严格通道（工具层用）：`{ ok, data|error }`，不抛。
+   * ctx = { teamId, userId, agentId }（自有或借入 agent）。
+   */
+  async attemptSearchL1(ctx, query, { sessionId, taskId, limit, signal } = {}, signalArg) {
+    if (!query || !query.trim()) return { ok: true, data: [] }
+    const identity = { ...toCtxIds(ctx), session_id: sessionId, task_id: taskId }
+    return this.#attemptCall('/v3/atomic/search', {
+      ...identity, query: query.slice(0, 2048), limit,
+    }, { identity, signal: signal ?? signalArg }, mapL1Items)
+  }
+
+  /**
+   * L1 召回（fail-open 版，注入/召回链路用；返回值形状与旧实现一致）。
    *
    * `opts.signal` 让调用方（lib/recall.mjs）能施加**硬超时**：网关不响应时这一步
-   * 必须放弃召回继续走，而不是把整轮挡住（超时由 safe() 归为失败 → 返回空命中）。
+   * 必须放弃召回继续走，而不是把整轮挡住（超时归为失败 → 返回空命中）。
    */
-  async searchL1(ctx, query, { sessionId, taskId, limit, signal } = {}, signalArg) {
-    if (!query || !query.trim()) return []
-    const identity = { ...toCtxIds(ctx), session_id: sessionId, task_id: taskId }
-    const data = await this.safe('/v3/atomic/search', {
-      ...identity, query: query.slice(0, 2048), limit,
-    }, { identity, signal: signal ?? signalArg }, {})
-    return (data?.items ?? [])
-      .map((item) => ({
-        id: String(item?.id ?? ''),
-        type: typeof item?.type === 'string' ? item.type : undefined,
-        content: typeof item?.content === 'string' ? item.content : '',
-        score: typeof item?.score === 'number' ? item.score : undefined,
-        updatedAt: typeof item?.updated_at === 'string' ? item.updated_at : undefined,
-      }))
-      .filter((m) => m.id && m.content)
+  async searchL1(ctx, query, opts = {}, signalArg) {
+    const result = await this.attemptSearchL1(ctx, query, opts, signalArg)
+    return result.ok ? result.data : []
   }
 
-  /** L0 对话原文检索（tdai_conversation_search 工具用）。 */
-  searchConversation(identity, query, limit, signal) {
-    return this.safe('/v3/conversation/search', {
+  /** L0 对话原文检索的严格通道（tdai_conversation_search 工具用）。 */
+  attemptSearchConversation(identity, query, limit, signal) {
+    return this.#attemptCall('/v3/conversation/search', {
       ...identityBody(identity),
       query: String(query ?? '').slice(0, 2048), limit,
-    }, { identity, signal }, {})
+    }, { identity, signal })
   }
 
-  /** L1 结构化查询：按 type / 时间窗 / 分页（tdai_memory_query 工具用）。 */
-  atomicQuery(identity, { type, timeStart, timeEnd, limit, offset } = {}, signal) {
-    return this.safe('/v3/atomic/query', {
+  /** L0 对话原文检索（fail-open 版）。 */
+  async searchConversation(identity, query, limit, signal) {
+    const result = await this.attemptSearchConversation(identity, query, limit, signal)
+    return result.ok ? result.data : {}
+  }
+
+  /** L1 结构化查询的严格通道（tdai_memory_query 工具用）。 */
+  attemptAtomicQuery(identity, { type, timeStart, timeEnd, limit, offset } = {}, signal) {
+    return this.#attemptCall('/v3/atomic/query', {
       ...identityBody(identity),
       type,
       time_start: timeStart,
       time_end: timeEnd,
       limit,
       offset,
-    }, { identity, signal }, {})
+    }, { identity, signal })
   }
 
-  /** L0 结构化查询：按 session / 时间窗 / 分页（tdai_conversation_query 工具用）。 */
-  conversationQuery(identity, { sessionId, timeStart, timeEnd, limit, offset } = {}, signal) {
-    return this.safe('/v3/conversation/query', {
+  /** L1 结构化查询（fail-open 版）：按 type / 时间窗 / 分页。 */
+  async atomicQuery(identity, params = {}, signal) {
+    const result = await this.attemptAtomicQuery(identity, params, signal)
+    return result.ok ? result.data : {}
+  }
+
+  /** L0 结构化查询的严格通道（tdai_conversation_query 工具用）。 */
+  attemptConversationQuery(identity, { sessionId, timeStart, timeEnd, limit, offset } = {}, signal) {
+    return this.#attemptCall('/v3/conversation/query', {
       ...identityBody(identity),
       session_id: sessionId ?? identity.session_id,
       time_start: timeStart,
       time_end: timeEnd,
       limit,
       offset,
-    }, { identity, signal }, {})
+    }, { identity, signal })
+  }
+
+  /** L0 结构化查询（fail-open 版）：按 session / 时间窗 / 分页。 */
+  async conversationQuery(identity, params = {}, signal) {
+    const result = await this.attemptConversationQuery(identity, params, signal)
+    return result.ok ? result.data : {}
   }
 
   // ── L2 / L3 ──────────────────────────────────────────────────────────────
 
-  /** L2 场景索引：仅 path + summary，不读全文。prefix 可选前缀过滤。 */
-  async listL2(ctx, limit, prefix = '') {
+  /** L2 场景索引的严格通道（tdai_scenario_ls 工具用）。 */
+  attemptListL2(ctx, limit, prefix = '') {
     const identity = toCtxIds(ctx)
-    const data = await this.safe('/v3/scenario/ls',
+    return this.#attemptCall('/v3/scenario/ls',
       { team_id: ctx.teamId, agent_id: ctx.agentId, path_prefix: prefix },
-      { identity, session: false, task: false }, {})
-    return (data?.entries ?? [])
-      .map((e) => ({
-        path: String(e?.path ?? ''),
-        summary: typeof e?.summary === 'string' ? e.summary : undefined,
-        updatedAt: typeof e?.updated_at === 'string' ? e.updated_at : undefined,
-      }))
-      .filter((e) => e.path && !e.path.endsWith('/'))
-      .slice(0, limit)
+      { identity, session: false, task: false },
+      (data) => (data?.entries ?? [])
+        .map((e) => ({
+          path: String(e?.path ?? ''),
+          summary: typeof e?.summary === 'string' ? e.summary : undefined,
+          updatedAt: typeof e?.updated_at === 'string' ? e.updated_at : undefined,
+        }))
+        .filter((e) => e.path && !e.path.endsWith('/'))
+        .slice(0, limit))
   }
 
-  /** L2 场景全文（tdai_read_scene 工具用）。 */
-  async readL2(ctx, path) {
-    if (!path) return null
+  /** L2 场景索引（fail-open 版）：仅 path + summary，不读全文。prefix 可选前缀过滤。 */
+  async listL2(ctx, limit, prefix = '') {
+    const result = await this.attemptListL2(ctx, limit, prefix)
+    return result.ok ? result.data : []
+  }
+
+  /**
+   * L2 场景全文的严格通道（tdai_read_scene 工具用）。
+   *
+   * `ok:true` 且 `data:null` 只能表示"服务端 200 但没内容"——"路径不存在"与
+   * "请求失败"由 `ok:false` 分开，这正是旧实现 `null` 双语义被拆开的证据。
+   */
+  attemptReadL2(ctx, path) {
+    if (!path) return Promise.resolve({ ok: true, data: null })
     const identity = toCtxIds(ctx)
-    const data = await this.safe('/v3/scenario/read',
+    return this.#attemptCall('/v3/scenario/read',
       { team_id: ctx.teamId, agent_id: ctx.agentId, path },
-      { identity, session: false, task: false }, null)
-    const content = typeof data?.content === 'string' ? data.content : ''
-    if (!content) return null
-    return { path, content, updatedAt: typeof data?.updated_at === 'string' ? data.updated_at : undefined }
+      { identity, session: false, task: false },
+      (data) => {
+        const content = typeof data?.content === 'string' ? data.content : ''
+        if (!content) return null
+        return { path, content, updatedAt: typeof data?.updated_at === 'string' ? data.updated_at : undefined }
+      })
+  }
+
+  /** L2 场景全文（fail-open 版）。 */
+  async readL2(ctx, path) {
+    const result = await this.attemptReadL2(ctx, path)
+    return result.ok ? result.data : null
   }
 
   /** L3 persona（可能内嵌 Scene Navigation 段，由调用方剥离）。 */
@@ -257,23 +453,35 @@ export class GatewayClient {
 
   // ── Skill ────────────────────────────────────────────────────────────────
 
-  /** 团队 Skill 库检索（tdai_skill_search 工具用，跨 agent；也用于每轮 skill 召回）。 */
-  searchSkills(identity, query, topK, signal) {
-    return this.safe('/v3/skill/search', {
+  /** 团队 Skill 库检索的严格通道（tdai_skill_search 工具用）。 */
+  attemptSearchSkills(identity, query, topK, signal) {
+    return this.#attemptCall('/v3/skill/search', {
       ...identityBody(identity),
       // core 的 searchRequestSchema 限 query 1..2048 字符：**必须在客户端截断**，
       // 否则粘贴长日志/长文时会被 core 以 40001 拒绝。历史事故：`/v3/skill/listing`
       // 那条路径就是因为 query 没截断（7,162 字符）而永久失败、且静默。
       query: String(query ?? '').slice(0, 2048), top_k: topK,
-    }, { identity, signal }, {})
+    }, { identity, signal })
   }
 
-  /** 打开单个 skill：SKILL.md 全文 + manifest（tdai_skill_view 工具用）。 */
-  skillView(identity, skillName) {
-    return this.safe('/v3/skill/get-by-name', {
+  /** 团队 Skill 库检索（fail-open 版；跨 agent，也用于每轮 skill 召回）。 */
+  async searchSkills(identity, query, topK, signal) {
+    const result = await this.attemptSearchSkills(identity, query, topK, signal)
+    return result.ok ? result.data : {}
+  }
+
+  /** 打开单个 skill 的严格通道（tdai_skill_view 工具用）：`{ ok, data|error }`，不抛。 */
+  attemptSkillView(identity, skillName) {
+    return this.#attemptCall('/v3/skill/get-by-name', {
       team_id: identity.team_id, agent_id: identity.agent_id, user_id: identity.user_id,
       skill_name: skillName, include_content: true, include_manifest: true,
-    }, { identity }, null)
+    }, { identity })
+  }
+
+  /** 打开单个 skill（fail-open 版）：SKILL.md 全文 + manifest。 */
+  async skillView(identity, skillName) {
+    const result = await this.attemptSkillView(identity, skillName)
+    return result.ok ? result.data : null
   }
 
   // ── Knowledge ────────────────────────────────────────────────────────────
@@ -325,45 +533,31 @@ export class GatewayClient {
     const maxAttempts = 2
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       const startedAt = Date.now()
-      try {
-        const resp = await fetch(`${base}${path}`, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            'x-tdai-service-id': this.serviceId || 'default',
-          },
-          body: JSON.stringify(stripUndefined(body ?? {})),
-          signal: AbortSignal.timeout(this.timeoutMs),
-        })
-        const payload = await resp.json().catch(() => ({}))
-        if (!resp.ok) {
-          const error = new Error(`${TAG} ${base}${path} HTTP ${resp.status}`)
-          error.retryable = resp.status >= 500 || resp.status === 429
-          // 服务端在 4xx 里通常也带了 message，一并转达
-          error.brief = `HTTP ${resp.status}${payload?.message ? ` · ${payload.message}` : ''}`
-          throw error
-        }
-        if (typeof payload?.code === 'number' && payload.code !== 0) {
-          const error = new Error(`${TAG} ${base}${path} code=${payload.code} ${payload.message ?? ''}`.trim())
-          error.retryable = false // 业务拒绝：重试无意义
-          error.brief = `code=${payload.code}${payload.message ? ` · ${payload.message}` : ''}`
-          throw error
-        }
+      // 请求执行与错误归一化和数据面共用 `#exchange`（同一脱敏口径），
+      // 重试策略留在这里：知识链路网络/超时/5xx/429 重试一次，4xx 与业务码不重试。
+      const result = await this.#exchange(`${base}${path}`, {
+        path,
+        headers: {
+          'content-type': 'application/json',
+          'x-tdai-service-id': this.serviceId || 'default',
+        },
+        body,
+      })
+      if (result.ok) {
         if (attempt > 1) {
-          this.log(`knowledge ${path} 第 ${attempt} 次尝试成功（${Date.now() - startedAt}ms）`)
+          this.log(`knowledge ${base}${path} 第 ${attempt} 次尝试成功（${Date.now() - startedAt}ms）`)
         }
-        return { ok: true, data: payload?.data ?? {} }
-      } catch (error) {
-        const detail = describeError(error)
-        const elapsed = Date.now() - startedAt
-        if (error?.retryable !== false && attempt < maxAttempts) {
-          this.log(`knowledge ${path} 第 ${attempt}/${maxAttempts} 次尝试失败（${elapsed}ms）：${detail} —— 重试一次`)
-          continue
-        }
-        const why = error?.retryable === false ? '确定性失败，不重试' : `重试后仍失败（共 ${attempt} 次）`
-        this.log(`knowledge ${path} ${why}（${elapsed}ms）：${detail}`)
-        return { ok: false, error: error?.brief ?? `请求失败（${detail}）` }
+        return result
       }
+      const detail = result.error.log
+      const elapsed = Date.now() - startedAt
+      if (result.error.retryable && attempt < maxAttempts) {
+        this.log(`knowledge ${base}${path} 第 ${attempt}/${maxAttempts} 次尝试失败（${elapsed}ms）：${detail} —— 重试一次`)
+        continue
+      }
+      const why = result.error.retryable ? `重试后仍失败（共 ${attempt} 次）` : '确定性失败，不重试'
+      this.log(`knowledge ${base}${path} ${why}（${elapsed}ms）：${detail}`)
+      return { ok: false, error: result.error.brief }
     }
     return { ok: false, error: '知识服务请求失败。' }
   }

@@ -1,0 +1,24 @@
+sequenceDiagram
+    autonumber
+    participant U as 人
+    participant R as 房间会话 root
+    participant P as 插件
+    participant L as ctx.llm
+    participant C as MemoryCore
+
+    U->>R: H1（turn 18 内，seq 未定）
+    P->>P: 缓冲 H1 到 turn 18
+    R-->>P: turn-stopping（turn 18）
+    P->>P: 刷 state.json，定位 H1 → 未命中（实测 3/13 如此）
+    P->>P: 记 pending(attempts=1)，不写
+    Note over R: 约 20 秒后 ds-bot 把 H1 写进 log 并投给成员
+
+    R-->>P: turn-stopping（turn 19）
+    P->>P: 重试定位 → 命中 seq=92
+    P->>L: 蒸前文（窗口 = 断点后到 H1 前，N=5）
+    L-->>P: 3–5 条 bullet + 结论
+    P->>C: 写 assistant 前文摘要
+    P->>C: 写 user H1
+    P->>P: 断点推进到 seq=92
+
+    Note over U,C: 人不再说话 → pending 为空，不写（无空闲补写）

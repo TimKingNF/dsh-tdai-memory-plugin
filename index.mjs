@@ -51,7 +51,9 @@ import { wireCapture } from './lib/capture.mjs'
 import { registerTools, registerKnowledgeTools, registerTaskTools } from './lib/tools.mjs'
 import { registerCommands } from './lib/commands.mjs'
 import { buildSettingsSchema, applySettings, identitySourceOf, SETTINGS_NAMESPACE } from './lib/settings.mjs'
-import { subagentReadPolicy, isSubagentSession } from './lib/subagent.mjs'
+import { isSubagentSession } from './lib/subagent.mjs'
+import { DsbotIndex, resolveDshHome } from './lib/dsbot.mjs'
+import { DsbotLedger } from './lib/dsbot-ledger.mjs'
 
 export const name = 'dsh-tdai-memory-plugin'
 export const inject = ['tools', 'systemPrompt', 'sessions']
@@ -90,6 +92,39 @@ export function apply(ctx, config = {}) {
     return built
   }
 
+  /**
+   * ds-bot 索引层（`DsbotLedger` + `DsbotIndex`），按「DSH_HOME + 台账路径」惰性重建。
+   *
+   * 为什么不跟着上面 `built` 的配置签名整体重建：索引层的构造只取决于磁盘位置
+   *（读哪份 `state.json`、台账落哪），识别总闸 / skill 注入 / 回写这些 volatile 开关
+   * 都是**读时判定**（每次调用都把当前 cfg 传进 `sessionPolicy()` /
+   * `writebackAllowedFor()`，见 lib/dsbot.mjs）。反过来，若跟着任意开关重建，就会为一次
+   * 无关的面板改动 new 一份台账，把还没落盘的群聊 pending / 断点丢掉 —— 那是写侧状态，
+   * 不该被读侧开关影响。
+   *
+   * 首次构建即异步预热（`load()` → `refresh()`），**不 await**：插件加载不能被一次
+   * 磁盘读阻塞。预热完成前 `lookup()` 返回 ordinary（fail-open），普通会话不受影响；
+   * Bot 会话的首个 `assemble` / `pre-step` 会经 `dsbotReady()` 等它一次。
+   */
+  let dsbotLayer
+  const layerFor = (cfg) => {
+    const dshHome = resolveDshHome(process.env.DSH_HOME)
+    const key = `${dshHome}\u0000${cfg.dsbotLedgerPath ?? ''}`
+    if (!dsbotLayer || dsbotLayer.key !== key) {
+      const ledger = new DsbotLedger({ path: cfg.dsbotLedgerPath, dshHome, log })
+      const dsbot = new DsbotIndex({ dshHome, ledger, log })
+      dsbotLayer = { key, ledger, dsbot }
+      // 先读台账、再刷索引：`DsbotIndex` 构造时会从台账恢复上一次成功的索引，
+      // 供 `state.json` 读不到时兜底（stale）。两步内部都已 fail-open，这里再兜一层，
+      // 避免异步链上的拒绝变成 unhandledRejection。
+      void Promise.resolve()
+        .then(() => ledger.load())
+        .then(() => dsbot.refresh())
+        .catch((error) => log(`[dsbot] 索引初始化失败：${error?.message ?? error}`))
+    }
+    return dsbotLayer
+  }
+
   /** settings 服务句柄（宿主没有该服务时恒为 undefined）。仅用于读用户层判断身份来源。 */
   let settings
   applySettings(ctx, log, (handle) => { settings = handle })
@@ -110,8 +145,71 @@ export function apply(ctx, config = {}) {
     hasUserKey() { return Boolean(str(live().cfg.userKey)) },
     /** 待办写入开关（独立写侧；不在 readEnabled 之下）。 */
     taskWriteEnabled() { return Boolean(live().cfg.taskWriteEnabled) },
-    /** 该会话的读侧能力面（身份 / 记忆 / 云端 skill 召回 / 知识，见 lib/subagent.mjs）。 */
-    readPolicyFor(session) { return subagentReadPolicy(live().cfg, session) },
+    /**
+     * 该会话的读侧能力面（身份 / 记忆 / 云端 skill 召回 / 知识）。
+     *
+     * 单一计算点是 `DsbotIndex.sessionPolicy()`（lib/dsbot.mjs）：
+     *   - 普通会话：返回 `subagentReadPolicy()` 的超集（多 bot/kind/botId/roomId/sessionId/
+     *     skillInject/writeback 几个只读字段），四个能力面的取值与原逻辑逐项相同；
+     *   - Bot / 房间 / 群成员隐藏会话：lean（identity=false、memory=false），
+     *     skills 受 `botSkillInjectEnabled` 约束、knowledge 恒 true。
+     * 调用方**只读四个面**（以及 Bot 分支的 `skillInject`），不要在这里另做 AND。
+     */
+    readPolicyFor(session) {
+      const cfg = live().cfg
+      return layerFor(cfg).dsbot.sessionPolicy(cfg, session)
+    },
+    /**
+     * ds-bot 索引（只读 `state.json`；四态判定、room log、主持 Bot 模型都从这里取）。
+     *
+     * ⚠️ 每次调用都取当前层：调用点不要把这个对象缓存进长生命周期结构（配置里改
+     * DSH_HOME / 台账路径时会整体重建）。读侧只用它算策略；写侧另有台账。
+     */
+    get dsbot() { return layerFor(live().cfg).dsbot },
+    /** ds-bot 台账（写侧断点 / pending / 幂等位；读侧不依赖它，见文件头）。 */
+    get ledger() { return layerFor(live().cfg).ledger },
+    /**
+     * 宿主的 llm 服务（群聊前文蒸馏用主持 Bot 的模型）。
+     *
+     * 为什么是 `ctx.get` + try/catch 而不是写进 `inject`：llm 是**可选**服务，
+     * 宿主没挂 llm 插件时本插件也必须能加载（写侧按"没有 llm"降级为只写人话）。
+     * cordis 的 ctx 是 Proxy，读一个没声明的服务名**取值动作本身就会抛**，
+     * 所以这里必须兜住；取不到 = undefined，不向上抛。
+     */
+    llm() {
+      try { return ctx.get('llm') } catch { return undefined }
+    },
+    /**
+     * 确保 ds-bot 索引已经尝试刷新过（`agent/pre-step` / `system-prompt/assemble`
+     * 在算策略前 await 一次）。
+     *
+     * 幂等：`refresh()` 自带 5 秒 mtime 缓存，只做本地 stat/读，不碰网络。
+     * 判定为什么必须等它：索引是 apply 时异步预热的，Bot 会话的首个回合很容易
+     * 赶在它前面 —— 那一刻会话会被当成 ordinary，白注入身份与画像。
+     */
+    dsbotReady() { return layerFor(live().cfg).dsbot.refresh() },
+    /**
+     * `/tdai-status` 的 `dsbot=` 行数据。
+     *
+     * `skillInject` / `writeback` 是**有效值**（已在 `sessionPolicy()` 里与全局
+     * enabled / skillsEnabled / captureEnabled 做过 AND），不是配置值：用户问的
+     * 往往是"开关明明开着，为什么没注入 / 还在写"，打印配置值只会误导。
+     */
+    dsbotStatus(session) {
+      const cfg = live().cfg
+      const layer = layerFor(cfg)
+      const policy = layer.dsbot.sessionPolicy(cfg, session)
+      return {
+        kind: policy.kind,
+        bot: policy.bot,
+        skillInject: policy.skillInject,
+        writeback: policy.writeback,
+        botId: policy.botId,
+        roomId: policy.roomId,
+        ledgerPath: layer.ledger.path,
+        index: layer.dsbot.status(),
+      }
+    },
     /** 这个会话是不是 DSH 派出去的子 agent 会话（/tdai-status 用它解释"为什么没注入"）。 */
     isSubagent(session) { return isSubagentSession(session) },
     identityFor(session) {
@@ -166,17 +264,21 @@ export function apply(ctx, config = {}) {
   //
   // 0.1.7-rc.1 里 `agent/session-start` **已不存在**（全源码 grep 为 0），事件改为
   // `agent/created`（serial，payload `{ agent, source, signal? }`）。旧监听是静默死代码。
-  ctx.on('agent/created', (payload) => {
+  ctx.on('agent/created', async (payload) => {
     const session = payload?.agent?.session
     const sessionId = session?.id
     if (!sessionId || !runtime.readEnabled()) return
-    // 子 agent 会话按策略降级时**只预热它真会用到的那几面**：子会话默认只有知识面，
-    // 就不再为一份用不到的画像打网关（并发扇出 N 个子 agent 就是 N 份）。
-    // 见 lib/subagent.mjs 的能力面表。
+    // 策略依赖 ds-bot 索引（Bot / 房间会话只预热知识面）。索引是 apply 时异步预热的，
+    // 首个会话很可能赶在它前面 —— 先等一次，否则 Bot 会话会白拉一整包画像资产。
+    // refresh 自带 mtime 缓存，命中时只是一个同步返回。
+    try { await runtime.dsbotReady() } catch {}
+    // 只预热它真会用到的那几面：子会话默认只有知识面；Bot 会话只有 skill 面
+    // （云端 skill 不占资产）与知识面，都不该为一份用不到的画像打网关。
+    // 能力面定义见 lib/subagent.mjs 与 lib/dsbot.mjs。
     //
     // 云端 skill 召回**不在预热范围内**：它每轮直接查 core，不依赖会话资产（2026-10 改版）。
     const cfg = runtime.config
-    const policy = subagentReadPolicy(cfg, session)
+    const policy = runtime.readPolicyFor(session)
     const needsAssets = (policy.identity && cfg.injectionEnabled && cfg.sessionContextEnabled)
       || (policy.memory && ((cfg.injectionEnabled && cfg.profileMemoryEnabled) || cfg.recallEnabled))
       || (policy.knowledge && cfg.knowledgeEnabled)
@@ -199,6 +301,9 @@ export function apply(ctx, config = {}) {
     }
   }
   const boot = live().cfg
+  // ds-bot 索引预热：首次 apply 就把台账读起来、`state.json` 刷一次（**不 await**，
+  // 别阻塞插件加载）。构造时即触发 load → refresh，见上面的 layerFor()。
+  layerFor(boot)
   log(`enabled: endpoint=${boot.endpoint} instance=${boot.serviceId} team=${boot.teamId} agent=${boot.agentId} recall=${boot.recallEnabled} inject=${boot.injectionEnabled} capture=${boot.captureEnabled} taskWrite=${boot.taskWriteEnabled}`)
 }
 
