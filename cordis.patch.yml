@@ -12,6 +12,10 @@
         userKey: !!js process.env.TDAI_MEMORY_USER_KEY || ''
         knowledgeEndpoint: !!js process.env.TDAI_MEMORY_KNOWLEDGE_ENDPOINT || ''
         taskId: !!js process.env.TDAI_MEMORY_TASK_ID || ''
+        # 工作区身份覆盖：数组用 JSON 字符串传（schema 同时接受数组与字符串）。
+        # 例：TDAI_MEMORY_WORKSPACE_AGENTS='[{"workspace":"/repo/a","teamId":"t","agentId":"agt"}]'
+        workspaceAgentsEnabled: !!js process.env.TDAI_MEMORY_WORKSPACE_AGENTS_ENABLED ?? ''
+        workspaceAgents: !!js process.env.TDAI_MEMORY_WORKSPACE_AGENTS ?? ''
         enabled: !!js process.env.TDAI_MEMORY_ENABLED ?? ''
         recallEnabled: !!js process.env.TDAI_MEMORY_RECALL_ENABLED ?? ''
         injectionEnabled: !!js process.env.TDAI_MEMORY_INJECTION_ENABLED ?? ''

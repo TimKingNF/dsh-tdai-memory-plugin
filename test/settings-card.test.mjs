@@ -18,7 +18,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { dirname, join } from 'node:path'
 import { transform } from 'esbuild'
 import { buildSettingsSchema, SCHEMA_KEYS, VOLATILE_KEYS, PATCH_ONLY_KEYS } from '../lib/settings.mjs'
-import { liveValue } from '../config.mjs'
+import { liveValue, normalizeWorkspacePath } from '../config.mjs'
+import { buildCardText } from '../build-card.mjs'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = join(here, '..')
@@ -40,7 +41,7 @@ try {
 }
 
 assert.ok(card.CARD_FIELDS, '卡片应导出 CARD_FIELDS（面板字段的单一事实来源）')
-const { toggles, numeric, identity, text } = card.CARD_FIELDS
+const { toggles, numeric, identity, text, workspace } = card.CARD_FIELDS
 
 // ── 2) 卡片字段 ⊆ settings schema：面板能改的，都能落进 config ───────────────
 const cardKeys = [
@@ -48,6 +49,10 @@ const cardKeys = [
   ...Object.keys(numeric),
   ...identity.map((f) => f.key),
   ...text.map((f) => f.key),
+  // 工作区规则表是数组节点，不在 toggles/numeric/identity/text 任一组里，
+  // 但它是面板可编辑字段，必须同样落进 schema。
+  workspace.master,
+  workspace.rules,
 ]
 for (const key of cardKeys) {
   assert.ok(SCHEMA_KEYS.includes(key), `面板字段 "${key}" 不在 settings schema 里 → 用户改了不会生效`)
@@ -241,6 +246,86 @@ assert.deepEqual(card.missingIdentity({ serviceId: 'default', teamId: 't', userI
 assert.deepEqual(card.missingIdentity({ serviceId: '  ', teamId: 't', agentId: 'a', userId: 'u' }), ['serviceId'], '空白串算未填')
 assert.deepEqual(card.missingIdentity(undefined), ['serviceId', 'teamId', 'agentId', 'userId'], '快照未就绪时不崩')
 
+// ── 5b) 工作区规则保存前归一：空行 / 两栏都空 / 重复路径 ───────────────────────
+{
+  const { rows, error } = card.sanitizeWorkspaceAgents([
+    { workspace: ' /mnt/d/a ', title: ' A ', teamId: ' t ', agentId: '' },
+    { workspace: '/mnt/d/b', teamId: '', agentId: ' agt-b ' },
+    { workspace: '', teamId: 't', agentId: 'a' },
+    { workspace: '/mnt/d/c', teamId: '  ', agentId: '  ' },
+    null,
+  ])
+  assert.equal(error, '')
+  assert.deepEqual(rows, [
+    { workspace: '/mnt/d/a', title: 'A', teamId: 't', agentId: '' },
+    { workspace: '/mnt/d/b', title: '', teamId: '', agentId: 'agt-b' },
+  ], '只保留有路径、且 team/agent 至少填一个的行；值要 trim')
+  const dup = card.sanitizeWorkspaceAgents([
+    { workspace: '/mnt/d/a', agentId: 'a1' },
+    { workspace: '/mnt/d/a', agentId: 'a2' },
+  ])
+  assert.ok(dup.error.includes('工作区重复'), '重复路径应拦住保存，而不是静默丢一条')
+  assert.deepEqual(card.asWorkspaceRows('[{"workspace":"/mnt/d/x","agentId":"ax"}]'), [
+    { workspace: '/mnt/d/x', title: '', teamId: '', agentId: 'ax' },
+  ], 'env 的 JSON 字符串形态应能回显到面板')
+  assert.deepEqual(card.asWorkspaceRows('not json'), [])
+}
+
+// ── 5c) 判重必须与运行期同口径：/a/ 与 /a 是同一目录（否则前者被静默覆盖）──────
+{
+  // 运行期 normalizeWorkspacePath 的归一：去尾分隔符、折叠 ..、根路径保留
+  for (const raw of ['/mnt/d/repo/a', '/mnt/d/repo/a/', '/mnt/d/repo//a', '/mnt/d/repo/../repo/a', '/']) {
+    assert.equal(card.workspacePathKey(raw), normalizeWorkspacePath(raw),
+      `面板判重键必须与 config.mjs 的归一一致：${raw}`)
+  }
+  assert.equal(card.workspacePathKey(''), '')
+  assert.equal(card.workspacePathKey('   '), '')
+  assert.equal(card.workspacePathKey('C:\\Repo\\A\\'), card.workspacePathKey('c:/repo/a'),
+    'Windows 同一目录的不同写法应判为同一条')
+
+  const trailing = card.sanitizeWorkspaceAgents([
+    { workspace: '/mnt/d/repo/a', agentId: 'FIRST' },
+    { workspace: '/mnt/d/repo/a/', agentId: 'SECOND' },
+  ])
+  assert.ok(trailing.error.includes('同一个目录'), `/a/ 与 /a 必须拦住保存：${trailing.error}`)
+  assert.ok(trailing.error.includes('/mnt/d/repo/a'), '错误信息要点名是哪个路径')
+
+  const dotted = card.sanitizeWorkspaceAgents([
+    { workspace: '/mnt/d/repo/a', agentId: 'FIRST' },
+    { workspace: '/mnt/d/repo/./a', agentId: 'SECOND' },
+  ])
+  assert.ok(dotted.error.includes('同一个目录'), '带 . 段的等价路径也要拦住')
+}
+
+// ── 5d) 相对路径必须拦住：运行期按插件进程 cwd 解析，规则永远不命中 ─────────────
+{
+  assert.equal(card.isAbsoluteWorkspacePath('/mnt/d/a'), true)
+  assert.equal(card.isAbsoluteWorkspacePath('C:\\repo'), true)
+  assert.equal(card.isAbsoluteWorkspacePath('c:/repo'), true)
+  assert.equal(card.isAbsoluteWorkspacePath('\\\\server\\share'), true)
+  assert.equal(card.isAbsoluteWorkspacePath('repo/a'), false)
+  assert.equal(card.isAbsoluteWorkspacePath('./repo'), false)
+  assert.equal(card.isAbsoluteWorkspacePath('~/repo'), false)
+  assert.equal(card.isAbsoluteWorkspacePath(''), false)
+
+  const relative = card.sanitizeWorkspaceAgents([{ workspace: 'repo/a', agentId: 'agt-a' }])
+  assert.ok(relative.error.includes('绝对路径'), `相对路径应拦住保存：${relative.error}`)
+  assert.deepEqual(relative.rows, [], '拦住时不应带出任何行')
+}
+
+// ── 5e) 开关的"有效布尔值"：env 传的是字符串 ────────────────────────────────
+{
+  assert.equal(card.boolOn(undefined, true), true, '缺省按默认值')
+  assert.equal(card.boolOn(undefined, false), false)
+  assert.equal(card.boolOn(true), true)
+  assert.equal(card.boolOn(false, true), false)
+  assert.equal(card.boolOn('true', false), true, 'env 的 "true" 必须算开')
+  assert.equal(card.boolOn('false'), false, 'env 的 "false" 必须算关')
+  assert.equal(card.boolOn('off'), false)
+  assert.equal(card.boolOn('', false), false, '空串 = 没配 → 默认值')
+  assert.equal(card.boolOn('', true), true)
+}
+
 // ── 6) 构建产物新鲜度：client.js 必须是当前 tsx 的产物 ───────────────────────
 {
   const bundleRaw = readFileSync(join(root, 'client.js'), 'utf8')
@@ -286,6 +371,19 @@ assert.deepEqual(card.missingIdentity(undefined), ['serviceId', 'teamId', 'agent
   // 挂顶层设置导航（settings.section），不是「内置插件」里的二级 tab —— 后者在实测中
   // 会让人以为"没有设置项"。
   assert.ok(!bundle.includes('settings.plugins.tab'), 'client.js 不该再挂 settings.plugins.tab（藏得太深）')
+
+  // ── 逐字节新鲜度（上面那些 label / key 检查只覆盖文案，漏得掉"改了逻辑没改文案"）──
+  // 用 build-card.mjs 的同一份构建函数重新产一次，与已提交产物比对。
+  {
+    const expected = await buildCardText()
+    if (expected !== bundleRaw) {
+      const at = [...expected].findIndex((ch, i) => ch !== bundleRaw[i])
+      const where = at < 0
+        ? `长度不一致：产物 ${bundleRaw.length} 字节 / 预期 ${expected.length} 字节`
+        : `首个差异在第 ${at} 字节`
+      assert.fail(`client.js 不是当前 client.card.tsx 的产物（${where}）—— 请跑 npm run build:client`)
+    }
+  }
 }
 
 console.log('settings card tests passed: 字段↔schema 一致 / Bot 会话串联 / 数值归一化 / 身份判定 / client.js 与 tsx 同源')

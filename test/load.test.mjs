@@ -230,4 +230,79 @@ assert.ok(!events.includes('agent/session-start'), '不应再监听已不存在�
   assert.equal(resolveConfig({ assetRetryCooldownMs: '' }).assetRetryCooldownMs, 15000, '留空回落到默认值')
 }
 
+// ── 工作区身份覆盖：从 apply() 到 /tdai-status 的端到端接线 ──────────────────
+//
+// 纯函数测试（test/workspace-agents.test.mjs）只证明解析语义；这里证明 index.mjs
+// 真的把有效身份接到了命令/状态输出上——否则会出现"配置对了，但会话仍用默认 agent"。
+{
+  const commands = []
+  const ctx2 = {
+    logger: { warn() {} },
+    fiber: { id: 'tdai-memory' },
+    inject(deps, cb) {
+      if (Array.isArray(deps)) {
+        if (deps.includes('settings')) cb(mockSettingsCtx)
+        if (deps.includes('commands')) cb({ commands: { register(def) { commands.push(def) } } })
+      }
+    },
+    tools: { register() {} },
+    systemPrompt: { section() {} },
+    sessions: {
+      // 只对 s-from-store 给完整会话：用来验证"裸会话 → store 补 header.cwd → 命中工作区规则"
+      get(id) { return id === 's-from-store' ? { id, header: { cwd: '/mnt/d/repo/a' } } : undefined },
+      list() { return [] },
+    },
+    on() {},
+    get() { return undefined },
+  }
+  apply(ctx2, {
+    serviceId: 'default', teamId: 'team-default', agentId: 'agt-default', userId: 'usr',
+    enabled: true, captureEnabled: false,
+    workspaceAgentsEnabled: true,
+    workspaceAgents: [
+      { workspace: '/mnt/d/repo/a', title: 'Repo A', teamId: 'team-a', agentId: 'agt-a' },
+    ],
+  })
+
+  const status = commands.find((c) => c.name === 'tdai-status')
+  assert.ok(status, '应注册 tdai-status')
+
+  const hit = await status.handler({
+    agent: { session: { id: 's-a', header: { cwd: '/mnt/d/repo/a' } } },
+  })
+  assert.equal(hit.kind, 'success', '/tdai-status 应成功')
+  assert.ok(hit.text.includes('身份来源: workspace'), `命中工作区时来源应为 workspace：${hit.text}`)
+  assert.ok(hit.text.includes('team: team-a'), '应打印有效 team（覆盖值）')
+  assert.ok(hit.text.includes('agent: agt-a'), '应打印有效 agent（覆盖值）')
+  assert.ok(hit.text.includes('工作区: /mnt/d/repo/a'), '应打印当前会话 cwd')
+  assert.ok(hit.text.includes('覆盖总开关=开，规则 1 条'), '应打印规则总数')
+
+  const miss = await status.handler({
+    agent: { session: { id: 's-other', header: { cwd: '/mnt/d/other' } } },
+  })
+  assert.equal(miss.kind, 'success', '/tdai-status 未命中时也应成功')
+  assert.ok(miss.text.includes('team: team-default'), '未命中规则应回落默认 team')
+  assert.ok(miss.text.includes('agent: agt-default'), '未命中规则应回落默认 agent')
+  assert.ok(miss.text.includes('身份来源: settings'), '未命中时来源仍是默认身份来源')
+  assert.ok(!miss.text.includes('工作区覆盖：'), '未命中时不该出现"工作区覆盖"标记')
+
+  // ── 裸会话（只有 sessionId / id）的身份解析 ────────────────────────────────
+  //
+  // `lib/tools.mjs` 的 `sessionIdOf()` 一直支持 `id ?? sessionId` 两种形状（老宿主 /
+  // 内部调用只给裸会话）。会话级身份必须同口径，否则这类会话会报"未取到当前会话身份"。
+  // `ctx2.sessions.get()` 在这里刻意返回 undefined（宿主查不到），只验证 id 取值的口径。
+  const bareId = await status.handler({ agent: { session: { sessionId: 's-legacy' } } })
+  assert.equal(bareId.kind, 'success', '只有 sessionId 的裸会话也应解析出身份')
+  assert.ok(bareId.text.includes('agent: agt-default'), '裸会话回落默认 agent')
+  assert.ok(!bareId.text.includes('身份不完整'), '裸会话不该被判成身份不完整')
+
+  // 有 cwd 时（store 能查到完整会话）仍要按工作区规则覆盖。
+  const storeHit = await status.handler({
+    agent: { session: { sessionId: 's-from-store' } },
+  })
+  assert.equal(storeHit.kind, 'success', '只有 sessionId 时也应能查 store 拿 cwd')
+  assert.ok(storeHit.text.includes('身份来源: workspace'), `store 补到 cwd 后应命中工作区规则：${storeHit.text}`)
+  assert.ok(storeHit.text.includes('agent: agt-a'), 'store 补到 cwd 后 agent 应为规则值')
+}
+
 console.log(`load test passed: ${registered.tools.length} tools, Config schema + settings.configure, ${registered.sections.length} sections, ${registered.commands.length} commands, lifecycle listeners`)

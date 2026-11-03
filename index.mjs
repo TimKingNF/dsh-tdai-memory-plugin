@@ -42,7 +42,7 @@
  *
  * 所有远端调用 fail-open，不阻断 DSH。
  */
-import { resolveConfig, identityComplete, baseIdentity, str } from './config.mjs'
+import { resolveConfig, identityComplete, baseIdentity, identityForWorkspace, str } from './config.mjs'
 import { GatewayClient } from './client.mjs'
 import { SessionAssets } from './lib/assets.mjs'
 import { registerSections } from './lib/sections.mjs'
@@ -129,12 +129,56 @@ export function apply(ctx, config = {}) {
   let settings
   applySettings(ctx, log, (handle) => { settings = handle })
 
+  /**
+   * 取带 `header` 的完整会话。工具执行上下文有时只给 `{ id }`（lib/tools.mjs 的
+   * `identityFor({ id })`），这里补一次 store 查找，保证能读到 `header.cwd`。
+   *
+   * `ctx.sessions` 是顶层 `inject` 声明的服务，正常都在；查找失败按"没有 cwd"处理，
+   * 回落默认身份 —— 这是 fail-open，不会因为一次会话查询失败把读侧打挂。
+   */
+  const sessionWithHeader = (session) => {
+    if (session?.header) return session
+    // 裸会话可能只有 `sessionId`（老宿主/内部调用），与 tools 的 `sessionIdOf()` 同口径。
+    const sessionId = str(session?.id) ?? str(session?.sessionId)
+    if (!sessionId) return undefined
+    try { return ctx.sessions.get(sessionId) } catch { return undefined }
+  }
+
+  /**
+   * 会话级有效配置 = 默认配置 + 命中的工作区覆盖。
+   *
+   * 每次调用都重新解析：面板改完立刻生效（volatile 字段不会重新 apply 插件），
+   * 且同一个进程里不同工作区的会话互不污染。
+   */
+  const effectiveFor = (session) => {
+    const cfg = live().cfg
+    const cwd = sessionWithHeader(session)?.header?.cwd
+    return identityForWorkspace(cfg, cwd)
+  }
+
   const runtime = {
     get client() { return live().client },
     get assets() { return live().assets },
     get config() { return live().cfg },
     log,
     readEnabled() { const cfg = live().cfg; return cfg.enabled && identityComplete(cfg) },
+    /**
+     * 会话级读侧开关：全局总开关 AND **该会话的有效身份**齐全。
+     *
+     * 为什么不能复用 `readEnabled()`：默认 team / agent 可能留空，而某个工作区
+     * 的覆盖规则把它们补全了；那种会话的读侧应当可用。反之，某个工作区规则把
+     * 身份覆盖成空（不会——空字段回落默认）也不会误开。
+     */
+    readEnabledFor(session) {
+      const cfg = effectiveFor(session).cfg
+      return cfg.enabled && identityComplete(cfg)
+    },
+    /** 当前会话的有效配置（默认 + 工作区覆盖）。读侧各模块都该用它，而不是 `runtime.config`。 */
+    configFor(session) { return effectiveFor(session).cfg },
+    /** 当前会话命中的工作区规则；未命中时 undefined（/tdai-status 与面板状态用）。 */
+    workspaceBindingFor(session) { return effectiveFor(session).rule },
+    /** 当前会话的 cwd（面板/状态展示用；不是判定来源）。 */
+    workspacePathFor(session) { return sessionWithHeader(session)?.header?.cwd ?? '' },
     /**
      * 有没有配 user key（meta 面鉴权）。
      *
@@ -213,17 +257,19 @@ export function apply(ctx, config = {}) {
     /** 这个会话是不是 DSH 派出去的子 agent 会话（/tdai-status 用它解释"为什么没注入"）。 */
     isSubagent(session) { return isSubagentSession(session) },
     identityFor(session) {
-      const sessionId = str(session?.id)
-      const cfg = live().cfg
+      // 与 lib/tools.mjs 的 `sessionIdOf()` 保持同口径：老宿主/内部调用给的裸会话
+      // 可能只有 `sessionId` 而没有 `id`，只认 `id` 会让这些会话拿不到身份。
+      const sessionId = str(session?.id) ?? str(session?.sessionId)
+      const cfg = effectiveFor(session).cfg
       if (!identityComplete(cfg) || !sessionId) return undefined
       return { ...baseIdentity(cfg), session_id: sessionId }
     },
     /**
-     * 身份来自哪一层：组合层（env 派生的 patch config）返回 'env'，被设置面板覆盖返回 'settings'。
+     * 身份来自哪一层：工作区覆盖 > 设置面板 > 组合层（env 派生的 patch config）。
      *
      * 为什么需要它：绕开 proxy 之后（docs/prompt-injection-redesign.md §6.1 决定 A），
-     * 身份完全来自本地配置，**一个 dsh 进程只对应一个 TDAI 身份**。用户必须能一眼
-     * 看出"当前生效的身份是哪来的"，否则改了面板没生效时会误判成插件坏了。
+     * 默认身份完全来自本地配置；再加上工作区覆盖后，"当前会话到底用了哪个 agent"
+     * 必须一眼可见，否则改了面板没生效时会误判成插件坏了。
      *
      * 判定方式（0.1.7-rc.1）：读 `settings.describe()` 里本 entry 的**用户层**——
      * 身份键出现在用户层才算面板改过。老实现比较"当前值 vs env 值"，用户把某个字段
@@ -239,9 +285,13 @@ export function apply(ctx, config = {}) {
       // 宿主没有 settings 服务（或 describe 不可用）：只剩组合层一条来源。
       return 'env'
     },
-    /** 身份缺哪些字段（用于日志点名，而不是只说一句 "identity incomplete"）。 */
-    missingIdentityFields() {
-      const cfg = live().cfg
+    /** 会话级身份来源：命中工作区规则时是 'workspace'，否则沿用默认身份的来源。 */
+    identitySourceFor(session) {
+      return effectiveFor(session).rule ? 'workspace' : runtime.identitySource()
+    },
+    /** 该会话有效身份缺哪些字段（用于日志点名与 /tdai-status）。 */
+    missingIdentityFields(session) {
+      const cfg = effectiveFor(session).cfg
       return [
         ['TDAI_MEMORY_INSTANCE_ID', cfg.serviceId],
         ['TDAI_MEMORY_TEAM_ID', cfg.teamId],
@@ -267,7 +317,7 @@ export function apply(ctx, config = {}) {
   ctx.on('agent/created', async (payload) => {
     const session = payload?.agent?.session
     const sessionId = session?.id
-    if (!sessionId || !runtime.readEnabled()) return
+    if (!sessionId || !runtime.readEnabledFor(session)) return
     // 策略依赖 ds-bot 索引（Bot / 房间会话只预热知识面）。索引是 apply 时异步预热的，
     // 首个会话很可能赶在它前面 —— 先等一次，否则 Bot 会话会白拉一整包画像资产。
     // refresh 自带 mtime 缓存，命中时只是一个同步返回。
@@ -277,7 +327,11 @@ export function apply(ctx, config = {}) {
     // 能力面定义见 lib/subagent.mjs 与 lib/dsbot.mjs。
     //
     // 云端 skill 召回**不在预热范围内**：它每轮直接查 core，不依赖会话资产（2026-10 改版）。
-    const cfg = runtime.config
+    //
+    // ⚠️ cfg 必须是**该会话的有效配置**（含工作区覆盖）：预热时用的 agent 若与
+    // 后续 assemble / 召回用的不一致，资产会按错的 agent 拉一遍，命中缓存后
+    // 整场会话都在用别的 agent 的画像。
+    const cfg = runtime.configFor(session)
     const policy = runtime.readPolicyFor(session)
     const needsAssets = (policy.identity && cfg.injectionEnabled && cfg.sessionContextEnabled)
       || (policy.memory && ((cfg.injectionEnabled && cfg.profileMemoryEnabled) || cfg.recallEnabled))
@@ -285,7 +339,7 @@ export function apply(ctx, config = {}) {
     if (!needsAssets) return
     // 后台预热，不 await：会话刚建立时把整包资产拉起来，
     // 让第一次 pre-step / assemble 尽量命中缓存（加载本身有总预算与失败冷却）。
-    live().assets.warm(sessionId, policy)
+    live().assets.warm(sessionId, policy, cfg)
   })
   ctx.on('session/disposed', (session) => {
     live().assets.dispose(session?.id)
@@ -296,7 +350,12 @@ export function apply(ctx, config = {}) {
       log('disabled (TDAI_MEMORY_ENABLED=false 或设置面板已关闭); capture-only')
     } else {
       const missing = runtime.missingIdentityFields()
-      log(`identity incomplete — 缺 ${missing.join(', ')}；读侧（召回 / 注入 / 工具）全部停用，写侧不受影响。`
+      const ws = live().cfg
+      const overrideNote = ws.workspaceAgentsEnabled && ws.workspaceAgents.length > 0
+        ? `已启用工作区覆盖（${ws.workspaceAgents.length} 条规则）：命中规则且补全缺失字段的会话仍可用读侧。`
+        : ''
+      log(`default identity incomplete — 缺 ${missing.join(', ')}；未命中工作区覆盖的会话读侧（召回 / 注入 / 工具）停用，写侧不受影响。`
+        + overrideNote
         + '配置来源：TDAI_MEMORY_* 环境变量，或 Web「设置 → TDAI Memory」页。')
     }
   }
@@ -304,7 +363,9 @@ export function apply(ctx, config = {}) {
   // ds-bot 索引预热：首次 apply 就把台账读起来、`state.json` 刷一次（**不 await**，
   // 别阻塞插件加载）。构造时即触发 load → refresh，见上面的 layerFor()。
   layerFor(boot)
-  log(`enabled: endpoint=${boot.endpoint} instance=${boot.serviceId} team=${boot.teamId} agent=${boot.agentId} recall=${boot.recallEnabled} inject=${boot.injectionEnabled} capture=${boot.captureEnabled} taskWrite=${boot.taskWriteEnabled}`)
+  log(`enabled: endpoint=${boot.endpoint} instance=${boot.serviceId} team=${boot.teamId} agent=${boot.agentId}`
+    + ` workspaceAgents=${boot.workspaceAgentsEnabled ? `${boot.workspaceAgents.length} 条` : 'off'}`
+    + ` recall=${boot.recallEnabled} inject=${boot.injectionEnabled} capture=${boot.captureEnabled} taskWrite=${boot.taskWriteEnabled}`)
 }
 
 function buildClient(cfg, log) {

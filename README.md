@@ -269,7 +269,7 @@ message. Design and live evidence: [docs/task-capture-design.zh-CN.md](docs/task
 | Endpoint | roles | how tools are represented |
 | --- | --- | --- |
 | `/v3/skill/conversation/add` | user / assistant / `tool_call` / `tool_result` / system | separate messages + `tool_call_id` pairing anchor |
-| `/v3/conversation/add` (L0) | user / assistant / system | folded into `[tool_call] name(args)` / `[tool_result:name] …` |
+| `/v3/conversation/add` (L0) | user / assistant / system | **dropped entirely** — tool calls and results never reach L0 |
 
 - **Internal reasoning and images are always dropped**, matching
   `MemoryProxy/src/skill/normalize-conversation.ts`. In DSH, reasoning and visible reply live in the
@@ -365,7 +365,8 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
 
 ### Option 1: Web settings panel (recommended)
 
-"Settings → TDAI Memory" page (a top-level entry in the settings navigation), switchable live:
+"Settings → TDAI Memory" page (a top-level entry in the settings navigation), organized into four
+tabs — **Read / Write / Bot & subagents / Identity & workspaces** — switchable live:
 
 - **Read side**: read master switch, L1 auto recall (with a **per-turn recall cap**), **cloud-skill
   recall** (with its own **hit cap** and **score floor** — injected count = the first N hits above
@@ -374,11 +375,17 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
   rules prompt** — optionally keeping the original persona line — long-term memory, knowledge base)
 - **Write side**: conversation write-back (independent of the read side), todo capture into tasks
   (independent, off by default, needs a User Key)
-- **Subagents**: whether child sessions fully inherit the read side (identity + memory + skill recall) and whether
-  their conversations are written back (both off by default — knowledge and the 14 tools
-  are available in child sessions regardless)
-- **Identity & addresses**: MemoryCore endpoint, instance id, Team / Agent / User / Task id,
-  User Key, knowledge-service origin override
+- **Bot & subagents**: ds-bot master switch / skill injection / write-back, room-context
+  distillation (advanced knobs collapsed by default), and whether child sessions fully inherit the
+  read side (identity + memory + skill recall; off by default — knowledge and the 14 tools are
+  available in child sessions regardless)
+- **Identity & workspaces**: MemoryCore endpoint, instance id, default Team / Agent / User / Task
+  id, User Key, knowledge-service origin override, plus **Workspace agents** — override Team / Agent
+  per session working directory (master switch off by default; no match or an empty field falls back
+  to the default identity)
+
+Long hints now sit on their own line below the label and wrap; inputs fill their container. The
+settings panel scrolls vertically only — the old `white-space:nowrap` horizontal scrollbar is gone.
 
 Switch dependencies (the card groups them and greys out anything that is currently inert):
 
@@ -402,6 +409,13 @@ write switch taskWriteEnabled —— equally independent (off by default, needs 
                                 panel does not re-apply the plugin) and the switch is checked at call
                                 time — so while it is off, a call gets an explicit "not enabled".
 
+workspace identity override (off by default)
+  workspaceAgentsEnabled —— match workspace rules against the session cwd?  Off = one identity per process.
+  workspaceAgents        —— rules: cwd → { teamId?, agentId? }. An empty field falls back to the
+                            default; no match / master off → default identity. Resolution lives only
+                            in config.mjs `identityForWorkspace()`. Paths must be absolute; the panel
+                            de-duplicates on the normalized path (`/repo/a/` and `/repo/a` are one rule).
+
 subagents (keyed on the child session, not on the switches above)
   subagentInjectionEnabled —— child sessions fully inherit the read side (identity + memory + skill recall)?  (default: no)
                               knowledge + tools are available in child sessions either way
@@ -414,11 +428,13 @@ Three easy traps:
    L1 recall.
 2. **Write-back does not depend on the read side**: with everything on the read side off, turns are
    still written back to MemoryCore (capture-only).
-3. **Incomplete identity is the number one cause of a dead read side** (`readEnabled = enabled && identity complete`);
-   the card names the missing fields right below the read-side group.
+3. **Incomplete identity is the number one cause of a dead read side** (`readEnabled = enabled && effective identity complete`);
+   the card names the missing fields at the top. If a workspace rule fills them in, that workspace's
+   sessions still get the read side; sessions with no matching rule stay disabled (write-back is unaffected).
 
-Switches apply immediately; identity changes apply to **new sessions** (an existing session keeps its
-injection cache). An empty text field falls back to env; leaving the recall cap empty falls back to
+Switches apply immediately; identity fields and workspace rules are resolved per session, so **new
+sessions** pick them up at once, and an existing session's asset cache is reloaded when its effective
+team/agent changes. An empty text field falls back to env; leaving the recall cap empty falls back to
 env/default 5, and values outside 1–20 are clamped with a note in the save result.
 
 ### Option 2: env
@@ -467,6 +483,11 @@ export TDAI_MEMORY_BOT_CONTEXT_MAX_TOKENS=5000            # distillation output 
 export TDAI_MEMORY_BOT_CONTEXT_TIMEOUT_MS=15000           # distillation timeout (2000-60000; thinking models need more than 8s)
 export TDAI_MEMORY_DSBOT_LEDGER_PATH=                    # ledger path; empty = <DSH_HOME>/storages/tdai-memory-plugin/dsbot-state.json
 
+# ── workspace identity override (off by default; the panel is the recommended way) ──
+export TDAI_MEMORY_WORKSPACE_AGENTS_ENABLED=false
+# rules as a JSON string; workspace must be an absolute path (the plugin normalizes it lightly)
+export TDAI_MEMORY_WORKSPACE_AGENTS='[{"workspace":"/repo/a","teamId":"team-a","agentId":"agt-a"}]'
+
 # ── tuning ──
 export TDAI_MEMORY_ENDPOINT=http://127.0.0.1:8420
 export TDAI_MEMORY_RECALL_LIMIT=5           # merged top-K for L1 (1–20; also in the panel)
@@ -482,9 +503,10 @@ export TDAI_MEMORY_ASSET_LOAD_BUDGET_MS=5000    # total budget for the whole ass
 export TDAI_MEMORY_ASSET_RETRY_COOLDOWN_MS=15000 # cooldown after a failed load: no retry within it (0 = retry every step)
 ```
 
-Priority: **Web settings > env > built-in defaults**. With incomplete identity the read side disables
-itself and warns, while the write side is unaffected. `TDAI_MEMORY_API_KEY` is read from env only and
-is never written into the settings panel.
+Priority: **Web settings > env > built-in defaults**. With an incomplete identity the read side is
+judged per session (sessions whose workspace rule fills the missing fields keep it; sessions with no
+match stay disabled), while the write side is unaffected. `TDAI_MEMORY_API_KEY` is read from env only
+and is never written into the settings panel.
 
 **About the three "main-loop protection" knobs**: every read-side call to MemoryCore happens *before*
 the model request (`system-prompt/assemble` injects assets, `agent/pre-step` recalls). If the gateway
@@ -514,16 +536,18 @@ an invalid URL falls back to the original address.
 
 ## Identity semantics (important)
 
-**One dsh process corresponds to exactly one TDAI identity.** It comes from `TDAI_MEMORY_*` env vars
-or the Web settings panel (panel wins) and is resolved once when the plugin loads; `session_id` is
-taken from the current session on every call.
+**The default identity is process-wide; workspace rules can switch Team / Agent per session.** The
+default comes from `TDAI_MEMORY_*` env vars or the Web settings panel (panel wins). Each session then
+matches its `header.cwd` against `workspaceAgents`; a hit overrides team / agent (empty fields fall
+back to the default). `session_id` is taken from the current session on every call.
 
-This is deliberate: proxy's "choose Team/Agent/Task per session" form is a capability it needs *because*
-it is a multi-user gateway. This plugin is a single-user component inside a DSH process, so a static
-identity is the more natural shape. Need multiple identities? Use multiple processes or change config.
+This is deliberate: proxy's "choose Team/Agent/Task per session" form is a capability it needs
+*because* it is a multi-user gateway. This plugin is a single-user component inside a DSH process, so
+a default identity plus explicit workspace overrides is the lighter shape. Need more identities? Add
+a workspace rule; turning the master switch off returns to one identity per process.
 
-`/tdai-status` shows the currently effective identity, where it came from (env / settings), and which
-fields are missing.
+`/tdai-status` shows the currently effective identity, where it came from (env / settings /
+workspace), the current session cwd and matched rule, and which fields are missing.
 
 ## Development
 
@@ -555,6 +579,7 @@ content:
 | [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md) | 中文 | compatibility audit against DSH 0.1.7-rc.1: every contract checked, with live evidence, plus the migration record and verification results |
 | [docs/prompt-design.zh-CN.md](docs/prompt-design.zh-CN.md) | 中文 | the prompt-injection optimisation rationale, prompt-cache risks (including "installing other plugins invalidates the prefix cache") and known open issues |
 | [docs/prompt-injection-redesign.md](docs/prompt-injection-redesign.md) | 中文 | the construction blueprint: every decision, every citation into DSH / plugin / proxy source |
+| [docs/proposals/workspace-agent-identity.zh-CN.md](docs/proposals/workspace-agent-identity.zh-CN.md) | 中文 | multi-workspace multi-agent: identity resolution semantics, settings interaction design, horizontal-overflow fix, runtime chain and rollback |
 
 ## License
 

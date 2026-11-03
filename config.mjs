@@ -59,7 +59,24 @@
  *   三个开关是**串联**的：Bot 侧两个子开关只有在总闸为真时才有效；有效值只在
  *   `lib/dsbot.mjs` 的 `sessionPolicy()` 与 `writebackAllowed()` 两处计算，调用点
  *   不得直接读 `botSkillInjectEnabled` / `botWritebackEnabled`。
+ *
+ *   ── 工作区身份覆盖（多工作区多 agent）──────────────────────────────────────
+ *
+ *   workspaceAgentsEnabled  总开关（默认**关**，保持历史行为不变）
+ *   workspaceAgents         规则表：工作目录（会话 header.cwd，规范化后的绝对路径）
+ *                           → { teamId?, agentId? }。命中时覆盖默认身份里的同名字段；
+ *                           未命中 / 总开关关 / 字段为空 → 回落到默认身份。
+ *
+ *   解析语义只有一处：`identityForWorkspace()`（本文件底部）。调用点不要自己按 cwd
+ *   匹配规则，也不要直接把 `cfg.agentId` 当成"当前会话的 agent"——会话级身份必须走
+ *   `runtime.identityFor(session)` / `runtime.configFor(session)`。
+ *
+ *   为什么按**路径**而不是 Workspace 记录的 uuid：DSH 的 workspace 归属由会话
+ *   `header.cwd` 决定，且同一个目录可能被多个入口创建（含未登记的目录）；路径是
+ *   会话本来就有的、无需额外 RPC 的事实。Workspace 的 title 只作为面板显示名。
  */
+import path from 'node:path'
+
 const FALSEY = /^(0|false|no|off)$/i
 
 /**
@@ -107,6 +124,103 @@ export function str(value) {
   const raw = liveValue(value)
   const text = typeof raw === 'string' ? raw.trim() : ''
   return text || undefined
+}
+
+/**
+ * 工作目录规范化：只做"同一路径不同写法"的归一，不碰文件系统。
+ *
+ * - 相对路径按插件进程的 cwd 解析（面板写入的应是绝对路径；手填相对路径至少能工作）；
+ * - 去掉末尾分隔符（根路径除外）；
+ * - Windows 下大小写不敏感（同一目录写成 `D:\Work` / `d:\work` 应命中同一条）。
+ *
+ * 为什么不做 `realpath`：这一步在 pre-step / assemble 热路径上，且路径可能暂时不存在
+ * （工作区目录被移动）；`fs.realpath` 会让"目录暂时不可用"变成匹配失败。DSH 的
+ * Workspace 记录本身存的是 canonical path，面板选择工作区时拿到的已经是规范路径，
+ * 手填路径的边界由这里的轻量归一兜住。
+ */
+export function normalizeWorkspacePath(value) {
+  const raw = liveValue(value)
+  const text = typeof raw === 'string' ? raw.trim() : ''
+  if (!text) return ''
+  let resolved
+  try {
+    resolved = path.resolve(text)
+  } catch {
+    return ''
+  }
+  const root = path.parse(resolved).root
+  if (resolved !== root) resolved = resolved.replace(/[\\/]+$/, '')
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+}
+
+/**
+ * 工作区覆盖规则的归一化。坏条目一律丢弃（不抛）：这是面板/配置文件里的数据，
+ * 一条写错不该让整个插件加载失败。
+ *
+ * 规则至少要有一个覆盖字段（teamId / agentId）；只有路径、两个覆盖都为空的条目
+ * 等价于"没配"，保留它只会让面板看起来有配置、实际不生效。
+ *
+ * 同一路径重复出现时**后者覆盖前者**：面板保存前会先去重，但 env / 手改配置文件
+ * 不受面板约束，这里给一个确定性的兜底。
+ */
+export function normalizeWorkspaceAgents(value) {
+  const raw = liveValue(value)
+  let list = raw
+  if (typeof raw === 'string') {
+    const text = raw.trim()
+    if (!text) return []
+    try { list = JSON.parse(text) } catch { return [] }
+  }
+  if (!Array.isArray(list)) return []
+  const byPath = new Map()
+  for (const item of list.slice(0, 100)) {
+    if (!item || typeof item !== 'object') continue
+    const workspace = normalizeWorkspacePath(item.workspace ?? item.path)
+    const teamId = typeof item.teamId === 'string' ? item.teamId.trim() : ''
+    const agentId = typeof item.agentId === 'string' ? item.agentId.trim() : ''
+    if (!workspace || (!teamId && !agentId)) continue
+    const title = typeof item.title === 'string' ? item.title.trim() : ''
+    byPath.set(workspace, { workspace, title, teamId, agentId })
+  }
+  return [...byPath.values()]
+}
+
+/**
+ * 当前会话命中的工作区覆盖规则（未启用 / 无 cwd / 未命中 → undefined）。
+ *
+ * `cwd` 传会话的 `header.cwd`。Bot 会话、子会话也走同一条规则：它们同样是 DSH
+ * 会话，header.cwd 是创建时的工作目录；ds-bot 的身份/记忆本来就恒关，覆盖不会
+ * 改变那部分策略（见 lib/dsbot.mjs），只是让普通会话能按工作区换 agent。
+ */
+export function workspaceBindingFor(cfg, cwd) {
+  if (!cfg?.workspaceAgentsEnabled) return undefined
+  const rules = cfg.workspaceAgents
+  if (!Array.isArray(rules) || rules.length === 0) return undefined
+  const key = normalizeWorkspacePath(cwd)
+  if (!key) return undefined
+  return rules.find((rule) => rule.workspace === key)
+}
+
+/**
+ * 会话级有效配置：默认身份 + 命中的工作区覆盖。
+ *
+ * 只覆盖 `teamId` / `agentId` 两个字段（用户维度仍共用同一个人，serviceId / userId /
+ * userKey / taskId 保持默认）。规则里某一项为空 → 该项回落默认值，因此可以只覆盖
+ * agent、把 team 留给默认，也可以两个都换。
+ *
+ * @returns {{ cfg: object, rule: object | undefined }} cfg 恒为对象；rule 为命中的规则。
+ */
+export function identityForWorkspace(cfg, cwd) {
+  const rule = workspaceBindingFor(cfg, cwd)
+  if (!rule) return { cfg, rule: undefined }
+  return {
+    cfg: {
+      ...cfg,
+      teamId: rule.teamId || cfg.teamId,
+      agentId: rule.agentId || cfg.agentId,
+    },
+    rule,
+  }
 }
 
 export function resolveConfig(config = {}) {
@@ -225,6 +339,13 @@ export function resolveConfig(config = {}) {
     botContextTimeoutMs: Math.min(60000, Math.max(2000, numOpt(config.botContextTimeoutMs, 15000))),
     /** 台账路径：空 = 默认位置（lib/dsbot-ledger.mjs 负责展开与校验）。 */
     dsbotLedgerPath: str(config.dsbotLedgerPath) || '',
+
+    /**
+     * 工作区身份覆盖（多工作区多 agent）。默认关：历史部署升级后行为不变。
+     * 开关关着时 `workspaceAgents` 仍会被归一化（面板需要回显），但不参与解析。
+     */
+    workspaceAgentsEnabled: boolOpt(config.workspaceAgentsEnabled, false),
+    workspaceAgents: normalizeWorkspaceAgents(config.workspaceAgents),
 
     endpoint: str(config.endpoint) || 'http://127.0.0.1:8420',
     apiKeyEnv: str(config.apiKeyEnv) || 'TDAI_MEMORY_API_KEY',
