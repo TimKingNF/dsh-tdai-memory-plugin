@@ -159,4 +159,64 @@ const ctxCfg = (over = {}) => ({ ...baseCfg, sessionContextEnabled: true, ...ove
   assert.equal(withKnowledgeOrigin('http://kb.internal/v3', ''), 'http://kb.internal/v3')
 }
 
-console.log('assets budget tests passed: 总预算封顶 / 失败冷却 / refresh 破冷却 / 并发幂等 / dispose 清理 / 知识地址改写')
+// 9) 同一会话换有效身份（工作区覆盖切换）→ 旧资产作废重载，不能拿 A 的画像当 B
+{
+  const state = { agentIds: [] }
+  const client = {
+    async metaGetAgent(id) {
+      state.agentIds.push(id)
+      return { agent_id: id, name: id, description: '', prompt: '' }
+    },
+    metaGetTask: async () => null,
+    metaAgentFixedAssets: async () => null,
+    skillListing: async () => null,
+    knowledgeList: async () => [],
+  }
+  const assets = new SessionAssets(client, ctxCfg())
+  const a = await assets.ensure('s1', null, ctxCfg({ teamId: 't-a', agentId: 'agt-a' }))
+  assert.equal(a.agentDetail.id, 'agt-a', '首次应按会话级 cfg 的 agent 加载')
+  assert.equal(a.identity.team_id, 't-a')
+  const b = await assets.ensure('s1', null, ctxCfg({ teamId: 't-b', agentId: 'agt-b' }))
+  assert.equal(b.agentDetail.id, 'agt-b', '有效身份变了必须重载，不能复用旧 agent 的资产')
+  assert.equal(b.identity.agent_id, 'agt-b')
+  assert.equal(state.agentIds.length, 2, '两种身份各打一次 meta')
+  // 同一身份再次 ensure 命中缓存，不重复打网关
+  const c = await assets.ensure('s1', null, ctxCfg({ teamId: 't-b', agentId: 'agt-b' }))
+  assert.equal(c, b, '同一有效身份应命中缓存')
+  assert.equal(state.agentIds.length, 2)
+}
+
+// 10) 晚到的失败不得踢掉同会话**已成功的新资产**（并发两次加载：预热 vs 换身份/刷新）
+//
+// 线上形态：同一个会话可能并发存在两次加载 —— 预热用旧身份在飞、assemble 换成工作区
+// 身份后成功，或 `/tdai-sync` 顶掉旧的。旧请求晚到失败时若还去删 cache，成功的那份
+// 就被踢掉，会话还会落进冷却期：注入静默变空，日志只有一句 asset load failed。
+{
+  const state = { calls: 0 }
+  let rejectFirst
+  const client = {
+    metaGetAgent(id) {
+      state.calls += 1
+      if (state.calls === 1) return new Promise((_, reject) => { rejectFirst = reject })
+      return Promise.resolve({ agent_id: id, name: id, description: '', prompt: '' })
+    },
+    metaGetTask: async () => null,
+    metaAgentFixedAssets: async () => null,
+    skillListing: async () => null,
+    knowledgeList: async () => [],
+  }
+  const assets = new SessionAssets(client, ctxCfg())
+  const stale = assets.ensure('s1', null, ctxCfg({ teamId: 't', agentId: 'agt-old' })) // 在飞，稍后超时
+  const fresh = await assets.ensure('s1', null, ctxCfg({ teamId: 't', agentId: 'agt-new' }))
+  assert.equal(fresh.agentDetail.id, 'agt-new', '新身份应立刻加载成功')
+  assert.ok(assets.peek('s1'), '新条目应已进缓存')
+
+  rejectFirst(new Error('gateway timeout')) // 旧请求晚到失败
+  await stale
+  assert.ok(assets.peek('s1'), '晚到的失败不得踢掉已成功的新资产')
+  const again = await assets.ensure('s1', null, ctxCfg({ teamId: 't', agentId: 'agt-new' }))
+  assert.equal(again, fresh, '仍应命中缓存（不得被旧失败盖成冷却期）')
+  assert.equal(state.calls, 2, '不应因旧失败重新打网关')
+}
+
+console.log('assets budget tests passed: 总预算封顶 / 失败冷却 / refresh 破冷却 / 并发幂等 / dispose 清理 / 知识地址改写 / 身份切换重载 / 晚到失败不踢新资产')

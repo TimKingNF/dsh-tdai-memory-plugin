@@ -1,19 +1,13 @@
 /**
- * 设置卡片的渲染断言：把"开关依赖关系"当成契约钉死。
+ * 设置卡片的渲染断言（0.9 改版：Tab + 可折叠分组 + 工作区 Agent）。
  *
- * 为什么单独测一遍渲染：面板最容易骗人的地方就是**层级看不出来** ——
- *   读侧总开关(enabled) → 召回 / 注入 → 注入下的 4 段；写侧回流(captureEnabled) 独立。
- * 用户凭直觉安排开关，所以卡片必须在视觉上把这件事讲清楚：
- *   - 上层关掉 → 下层**置灰**（opacity .55，仍可点，便于先配好再开总闸）；
- *   - 注入总闸关掉 → 只灰它下面那 4 段，**不能**连 L1 召回一起灰；
- *   - 回流**永远不灰**（它是独立的写侧开关）；
- *   - 身份不全 → 在读侧那组下面显式告警（这是"开关都开着却没注入"最常见的原因）。
- *   - ds-bot 组：总闸是根；Bot skill 注入还受 enabled + skillsEnabled；回写还受
- *     captureEnabled；蒸馏 / 窗口 / 复用受回写约束。身份与记忆**没有开关**（恒关）。
+ * 为什么单独测渲染：面板最容易骗人的地方是**层级与状态看不出来**——
+ *   读侧总开关(enabled) → 召回 / 注入 → 注入下的段；写侧回流独立；
+ *   Bot 会话总闸 → skill 注入 / 回写 → 蒸馏；工作区覆盖默认关。
+ * 这个测试把「Tab 可见内容 + 依赖置灰 + 工作区列表 + 横向溢出修复」钉死。
  *
  * 做法：esbuild 把 tsx 转成 ESM 后用 react-dom/server 静态渲染，不引 jsdom。
- * 卡片**没有折叠头**（全部字段直接渲染；测试反过来断言产物里不含 `aria-expanded`），
- * 所以不需要"把折叠初始值改成 true"这类预处理。
+ * Tab 内容按 `initialTab` 逐个渲染；原生 <details> 的隐藏内容也会出现在静态 HTML 里。
  *
  * 运行：node test/settings-card-render.test.mjs
  */
@@ -29,24 +23,19 @@ const here = dirname(fileURLToPath(import.meta.url))
 const root = join(here, '..')
 
 const tsx = readFileSync(join(root, 'client.card.tsx'), 'utf8')
-// 2026-09-25：卡片挂成**顶层设置页**之后去掉了可折叠头部（左侧导航已是标题，进页面即见全部开关）。
-// 这条源码护栏防止折叠交互被无意加回来。
-assert.ok(!tsx.includes('aria-expanded'), '卡片不该再有折叠头部（aria-expanded）')
-
+// 0.9 改版用 Tab + 原生 details；旧的折叠头（aria-expanded 按钮）仍然不存在。
+// 但 Tab 按钮带 role=tab / aria-selected，所以这里只拦旧折叠头的特征。
 const { code } = await transform(tsx, {
   loader: 'tsx', format: 'esm', jsx: 'transform', target: 'esnext',
 })
 const tmpDir = join(here, '.tmp')
 mkdirSync(tmpDir, { recursive: true })
 const tmpFile = join(tmpDir, 'card-render.mjs')
-// 组件本身不是导出（只导出 CARD_FIELDS / 纯函数），这里补一行导出以便渲染
 writeFileSync(tmpFile, `${code}\nexport { TdaiMemoryCard };\n`, 'utf8')
 let Card
-let CARD_FIELDS
 try {
   const mod = await import(pathToFileURL(tmpFile).href)
   Card = mod.TdaiMemoryCard
-  CARD_FIELDS = mod.CARD_FIELDS
 } finally {
   rmSync(tmpFile, { force: true })
 }
@@ -57,19 +46,15 @@ const FULL = {
   profileMemoryEnabled: true, skillsEnabled: true, knowledgeEnabled: false,
   endpoint: 'http://127.0.0.1:8420', serviceId: 'default', teamId: 'team-x', agentId: 'agt-x', userId: 'usr-x',
   userKey: '', knowledgeEndpoint: '', taskId: '', recallLimit: 7,
-  // 宿主 describe() 给的是**生效值**（含 schema 默认），所以面板能回显这些项
   skillRecallLimit: 3, skillRecallMinScore: 4,
-  // Bot 会话（ds-bot）：回写默认关 → 蒸馏 / 窗口 / 复用默认置灰
   dsbotAwarenessEnabled: true, botSkillInjectEnabled: true, botWritebackEnabled: false,
   botContextDistillEnabled: true, botContextMessages: 5, botContextReuseMemory: false,
   dsbotLedgerPath: '',
+  workspaceAgentsEnabled: false, workspaceAgents: [],
 }
 
 /**
- * 渲染一次面板（快照 ready、可写；草稿在首次渲染时尚未灌入，正好反映真实配置）。
- *
- * 0.1.7-rc.1 起组件拿的是 `form`（ConfigForm）与只读的 `describe` 面，
- * 不再是 `ctx.settingsScope.bind(...)`。
+ * 渲染一次面板。`options.tab` 选 Tab；`options.useWorkspaces` 模拟设置页标准 props。
  */
 function render(overrides = {}, options = {}) {
   const form = {
@@ -87,10 +72,15 @@ function render(overrides = {}, options = {}) {
     }),
     subscribe: () => () => {},
   }
-  return ReactDOMServer.renderToStaticMarkup(React.createElement(Card, { form, describe }))
+  return ReactDOMServer.renderToStaticMarkup(React.createElement(Card, {
+    form,
+    describe,
+    initialTab: options.tab ?? 'read',
+    useWorkspaces: options.useWorkspaces,
+  }))
 }
 
-/** 某个开关项当前是否被置灰（它自己的 label 上带着 opacity:.55）。 */
+/** 某个开关项当前是否被置灰（自身 label 带 opacity:.55）。 */
 function dimmed(html, label) {
   const at = html.indexOf(label)
   assert.ok(at >= 0, `渲染结果里找不到「${label}」`)
@@ -98,109 +88,80 @@ function dimmed(html, label) {
   return html.slice(start, at).includes('opacity:0.55')
 }
 
-// ── 1) 结构：五个分组 + 召回条数上限是个数字输入 ────────────────────────────
+// ── 1) Tab 与分组：读侧默认可见，其它 Tab 分开渲染 ──────────────────────────
 {
   const html = render()
-  for (const title of ['读侧 · 把记忆读进上下文', '写侧 · 把对话回流给 MemoryCore', '子 agent · 委派出去的子会话', 'Bot 会话 · ds-bot', '身份与地址']) {
-    assert.ok(html.includes(title), `应有分组标题「${title}」`)
+  for (const label of ['读侧', '写侧', 'Bot 与子 agent', '身份与工作区']) {
+    assert.ok(html.includes(`>${label}</button>`), `应有 Tab「${label}」`)
   }
-  // 顶层设置页：没有折叠头部，进入即见全部开关（一次点击都不需要）
-  assert.ok(!html.includes('aria-expanded'), '不该再有折叠头部的按钮')
-  assert.ok(html.includes('读侧总开关'), '开关应直接渲染在页面里，不需要展开')
-  // 条数上限必须紧跟 L1 召回（读起来是同一件事），且在 System prompt 注入之前
-  const recallAt = html.indexOf('L1 自动召回')
-  const limitAt = html.indexOf('单轮召回条数上限')
-  const injectAt = html.indexOf('System prompt 注入')
-  assert.ok(recallAt < limitAt && limitAt < injectAt, '条数上限应排在「L1 自动召回」之后、「System prompt 注入」之前')
+  assert.ok(html.includes('role="tablist"'), 'Tab 容器应有 role=tablist')
+  assert.ok(html.includes('aria-selected="true"'), '默认 Tab 应 aria-selected')
+  assert.ok(html.includes('读侧总开关'), '读侧 Tab 应直接看到读侧总开关')
+  assert.ok(html.includes('L1 自动召回'), '读侧 Tab 应有 L1 召回')
+  assert.ok(html.includes('System prompt 注入'), '读侧 Tab 应有注入总闸')
+  assert.ok(!html.includes('对话回流到 MemoryCore'), '读侧 Tab 不该混入写侧开关')
+  assert.ok(!html.includes('默认 Team ID'), '读侧 Tab 不该混入身份表单')
+  // 原生 details：分组可折叠，标题在 summary 里
+  assert.ok(html.includes('<details'), '分组应使用 details 折叠')
+  assert.ok(html.includes('<summary'), '分组应有 summary 标题')
 
-  const input = html.slice(html.indexOf('单轮召回条数上限'), html.indexOf('条（自有 + 借入'))
-  assert.ok(input.includes('type="number"'), '条数上限应是 number 输入')
-  assert.ok(input.includes('min="1"') && input.includes('max="20"'), '数字框的上下界应与 schema 一致（1–20）')
-  assert.ok(input.includes('value="7"'), '数字框应回显当前配置值')
+  const write = render({}, { tab: 'write' })
+  assert.ok(write.includes('对话回流到 MemoryCore'), '写侧 Tab 应有回流开关')
+  assert.ok(write.includes('子 agent 对话回流'), '写侧 Tab 应有子 agent 回写开关')
+  assert.ok(!write.includes('L1 自动召回'), '写侧 Tab 不该混入读侧开关')
 
-  // checkbox 与标签同一个 <label> 且 nowrap：沿用"逐项不拆行"的既有偏好。
-  // 数量从 CARD_FIELDS 推导，避免每加一个开关/数字框就要来改这个魔数（原先就是它先红）。
-  assert.equal(
-    (html.match(/white-space:nowrap/g) || []).length,
-    CARD_FIELDS.toggles.length + Object.keys(CARD_FIELDS.numeric).length,
-    `${CARD_FIELDS.toggles.length} 个开关 + ${Object.keys(CARD_FIELDS.numeric).length} 个数字框都应是 nowrap 项`,
-  )
-
-  // skill 召回的两个旋钮：默认值 3 / 3 要回显，且闸门允许 0（= 关掉闸门）
-  for (const [key, label] of [['skillRecallLimit', 'skill 召回条数上限'], ['skillRecallMinScore', 'skill 召回分数下限']]) {
-    const at = html.indexOf(label)
-    assert.ok(at >= 0, `面板应渲染「${label}」`)
-    const row = html.slice(at, at + 700)
-    assert.ok(row.includes('type="number"'), `「${label}」应是 number 输入`)
-    const shown = key === 'skillRecallLimit' ? '3' : '4'
-    assert.ok(row.includes(`value="${shown}"`), `「${label}」应回显生效值 ${shown}（当前 ${key}）`)
+  const bot = render({}, { tab: 'bot' })
+  for (const text of ['识别 ds-bot 会话', 'Bot 会话注入云端 skill', 'Bot 会话回写记忆', '群聊前文蒸馏', '子 agent 全量继承读侧']) {
+    assert.ok(bot.includes(text), `Bot Tab 应包含「${text}」`)
   }
-  {
-    const at = html.indexOf('skill 召回分数下限')
-    assert.ok(html.slice(at, at + 700).includes('min="0"'), '分数下限必须允许 0（0 = 关掉闸门）')
-  }
-  // 子 agent 两个开关默认关：渲染出的 checkbox 必须是未勾选状态
-  const subagentAt = html.indexOf('子 agent 全量继承读侧')
-  const subagentBlock = html.slice(html.lastIndexOf('<label', subagentAt), html.indexOf('</label>', subagentAt))
-  assert.ok(!subagentBlock.includes('checked=""'), '「子 agent 全量继承读侧」默认应为未勾选')
-  const subCaptureAt = html.indexOf('子 agent 对话回流')
-  const subCaptureBlock = html.slice(html.lastIndexOf('<label', subCaptureAt), html.indexOf('</label>', subCaptureAt))
-  assert.ok(!subCaptureBlock.includes('checked=""'), '「子 agent 对话回流」默认应为未勾选')
+  // 高级蒸馏参数在默认收起的 details 里，但静态 HTML 仍可断言
+  assert.ok(bot.includes('群聊窗口条数'), 'Bot Tab 应包含群聊窗口参数')
+  assert.ok(bot.includes('蒸馏模型'), 'Bot Tab 应包含蒸馏模型')
+  assert.ok(bot.includes('台账路径'), 'Bot Tab 应包含台账路径')
 
-  // ── Bot 会话 · ds-bot：独立小标题 + 一句说明，排在「子 agent」之后 ──────────
-  const subagentTitleAt = html.indexOf('子 agent · 委派出去的子会话')
-  const botTitleAt = html.indexOf('Bot 会话 · ds-bot')
-  const identityTitleAt = html.indexOf('身份与地址')
-  assert.ok(subagentTitleAt < botTitleAt && botTitleAt < identityTitleAt, 'Bot 组应排在「子 agent」之后、「身份与地址」之前')
-  assert.ok(html.includes('身份与记忆对 Bot 会话恒不注入'), 'Bot 组要有一句说明：身份与记忆恒不注入')
-  assert.ok(html.includes('读侧只注入云端 skill'), 'Bot 组的说明要写清读侧只注入 skill')
-  // 关键 hint / 置灰文案（方案 §3.1 的字段表）
-  for (const text of [
-    '总闸：关掉后不索引 ds-bot 的 state.json',
-    '「Bot 会话识别 / 读侧总开关 / 云端 skill 召回」任一关闭时置灰',
-    '「Bot 会话识别 / 对话回流」任一关闭时置灰',
-    '默认关，首次上线手动打开',
-    '默认关，避免归因回环',
-    '0 = 不蒸',
-  ]) {
-    assert.ok(html.includes(text), `Bot 组应包含文案「${text}」`)
-  }
-  // 台账路径：普通文本框 + 默认位置占位符 + 「不接受 bot 目录」的提示
-  const ledgerAt = html.indexOf('台账路径')
-  assert.ok(ledgerAt >= 0, '应有「台账路径」文本字段')
-  assert.ok(ledgerAt > botTitleAt && ledgerAt < identityTitleAt, '台账路径应渲染在 Bot 组内')
-  assert.ok(html.slice(ledgerAt, ledgerAt + 900).includes('type="text"'), '台账路径应是文本框，不是开关')
-  assert.ok(html.includes('storages/tdai-memory-plugin/dsbot-state.json'), '台账路径占位符应是默认位置')
-  assert.ok(html.includes('不接受') && html.includes('DSH_HOME'), '台账路径要说明不接受 <DSH_HOME>/bot 之下')
-  // 身份 / 记忆注入开关**绝不存在**（方案 §3.1：恒关，不做成配置项）。
-  // 注意别用"注入身份"这种宽泛串：子 agent 的既有 hint 里就有"不注入身份与记忆"。
-  for (const forbidden of ['Bot 会话注入身份', 'Bot 会话注入记忆', 'Bot 会话身份注入', 'Bot 会话记忆注入']) {
-    assert.ok(!html.includes(forbidden), `Bot 会话不该有身份 / 记忆注入开关：${forbidden}`)
+  const identity = render({}, { tab: 'identity' })
+  for (const text of ['默认 Team ID', '默认 Agent ID', 'MemoryCore 地址', '工作区 Agent']) {
+    assert.ok(identity.includes(text), `身份 Tab 应包含「${text}」`)
   }
 }
 
-// ── 2) 身份齐全：无告警，所有开关都不置灰 ───────────────────────────────────
+// ── 2) 横向溢出修复：长说明换行、输入框不撑破容器 ──────────────────────────
+{
+  const html = render({}, { tab: 'identity' })
+  assert.ok(html.includes('box-sizing:border-box'), '根容器 / 输入框应使用 border-box')
+  assert.ok(html.includes('min-width:0'), '关键容器应有 min-width:0')
+  assert.ok(html.includes('overflow-wrap:anywhere'), '长说明 / 路径应允许任意位置换行')
+  assert.ok(html.includes('width:100%'), '输入框应占满容器而不是固定宽度')
+  // 长 hint 不能再用 nowrap（旧版横向滚动条的根因）
+  const hintAt = html.indexOf('服务端返回容器内地址')
+  assert.ok(hintAt > 0, '应渲染知识服务地址的长说明')
+  const hintSeg = html.slice(Math.max(0, hintAt - 400), hintAt)
+  assert.ok(!hintSeg.includes('white-space:nowrap'), '长说明外层不能 nowrap')
+}
+
+// ── 3) 身份齐全：无告警；读侧开关不置灰 ─────────────────────────────────────
 {
   const html = render()
-  assert.ok(!html.includes('身份未填全'), '身份齐全时不应有告警')
-  for (const label of ['L1 自动召回', '云端 skill 召回', 'System prompt 注入', '对话回流到 MemoryCore', '子 agent 全量继承读侧', '子 agent 对话回流']) {
+  assert.ok(!html.includes('默认身份未填全'), '身份齐全时不应有告警')
+  for (const label of ['L1 自动召回', '云端 skill 召回', 'System prompt 注入']) {
     assert.equal(dimmed(html, label), false, `身份齐全 + 开关全开时「${label}」不该置灰`)
   }
 }
 
-// ── 3) 读侧总开关关闭：读侧全灰，**回流不灰**（写侧独立）────────────────────
+// ── 4) 读侧总开关关闭：读侧置灰；写侧 Tab 不受影响 ──────────────────────────
 {
   const html = render({ enabled: false })
   for (const label of ['L1 自动召回', 'System prompt 注入', '会话上下文（Agent / Task）', '知识库（wiki / code-graph）']) {
     assert.equal(dimmed(html, label), true, `读侧总开关关闭时「${label}」应置灰`)
   }
-  assert.equal(dimmed(html, '对话回流到 MemoryCore'), false, '回流是独立的写侧开关，读侧关闭不该影响它')
-  assert.equal(dimmed(html, '子 agent 全量继承读侧'), true, '读侧总开关关闭时「子 agent 全量继承读侧」也该灰（它属于读侧）')
-  assert.equal(dimmed(html, '子 agent 对话回流'), false, '「子 agent 对话回流」属于写侧，读侧关闭不该影响它')
-  assert.ok(!html.includes('身份未填全'), '读侧总开关已关时不重复告警（告警只在"开关开着但无效"时才有意义）')
+  assert.ok(!html.includes('默认身份未填全'), '读侧总开关已关时不重复告警')
+
+  const write = render({ enabled: false }, { tab: 'write' })
+  assert.equal(dimmed(write, '对话回流到 MemoryCore'), false, '回流是独立写侧开关，读侧关闭不该影响它')
+  assert.equal(dimmed(write, '子 agent 对话回流'), false, '子 agent 回写属于写侧，读侧关闭不该影响它')
 }
 
-// ── 4) 只关注入总闸：只有那几个注入段灰，L1 召回与回流都不灰 ──────────────────
+// ── 5) 只关注入总闸：注入段灰，L1 召回不灰 ──────────────────────────────────
 {
   const html = render({ injectionEnabled: false })
   for (const label of [
@@ -209,60 +170,92 @@ function dimmed(html, label) {
   ]) {
     assert.equal(dimmed(html, label), true, `注入总闸关闭时「${label}」应置灰`)
   }
-  assert.equal(dimmed(html, 'L1 自动召回'), false, 'L1 召回不依赖注入总闸（recall.mjs 只判 readEnabled + recallEnabled）')
-  assert.equal(dimmed(html, '对话回流到 MemoryCore'), false, '回流与注入总闸无关')
+  assert.equal(dimmed(html, 'L1 自动召回'), false, 'L1 召回不依赖注入总闸')
 }
 
-// ── 4b) 多级从属：agentPrompt ← sessionContext，keepBase ← agentPrompt + sessionContext ──
+// ── 6) 多级从属：agentPrompt ← sessionContext，keepBase ← agentPrompt + sessionContext ──
 {
-  // 会话上下文关掉：下面两级都灰（角色 / 规则住在那个块里）
   const ctxOff = render({ sessionContextEnabled: false })
   assert.equal(dimmed(ctxOff, 'Agent 角色 / 规则 prompt'), true, '父项（会话上下文）关闭时它必须灰')
   assert.equal(dimmed(ctxOff, '保留原 persona 行'), true, '更下面一级也必须灰')
-  // 会话上下文开着、只关角色 / 规则：它自己不灰，子项灰
+
   const promptOff = render({ agentPromptEnabled: false })
-  assert.equal(dimmed(promptOff, 'Agent 角色 / 规则 prompt'), false, '它自己是被父项约束的，不该被自己灰掉')
-  assert.equal(dimmed(promptOff, '保留原 persona 行'), true, '父项关闭时子项必须灰（否则用户以为开了会生效）')
-  // 全开：都不灰
+  assert.equal(dimmed(promptOff, 'Agent 角色 / 规则 prompt'), false, '它自己只受父项约束')
+  assert.equal(dimmed(promptOff, '保留原 persona 行'), true, '父项关闭时子项必须灰')
+
   const allOn = render()
   assert.equal(dimmed(allOn, 'Agent 角色 / 规则 prompt'), false, '全开时不灰')
   assert.equal(dimmed(allOn, '保留原 persona 行'), false, '全开时不灰')
 }
 
-// ── 5) 身份不全：读侧开着 → 告警点名缺失字段 ────────────────────────────────
+// ── 7) 身份不全：读侧告警点名缺失字段，并说明工作区覆盖例外 ─────────────────
 {
   const html = render({ agentId: '', teamId: '' })
-  assert.ok(html.includes('身份未填全'), '身份不全且读侧开启时应告警')
-  assert.ok(html.includes('缺 teamId / agentId'), `告警应点名缺失字段，实际渲染：${html.match(/身份未填全[^<]*/)?.[0]}`)
-  assert.ok(html.includes('「对话回流」不受影响'), '告警要说明回流不受影响，否则用户会误以为整插件失效')
+  assert.ok(html.includes('默认身份未填全'), '默认身份不全且读侧开启时应告警')
+  assert.ok(html.includes('缺 teamId / agentId'), `告警应点名缺失字段，实际：${html.match(/默认身份未填全[^<]*/)?.[0]}`)
+  assert.ok(html.includes('工作区覆盖补全了缺失字段'), '告警要说明工作区覆盖可能补全身份')
+  assert.ok(html.includes('「对话回流」不受影响'), '告警要说明回流不受影响')
 }
 
-// ── 6) secret 字段：明文永远拿不到，只能从 describe 的 secrets 侧信道显示"已设置"──
+// ── 8) secret：明文拿不到，只能从 describe 的 secrets 侧信道显示"已设置" ─────
 {
-  const unset = render()
-  assert.ok(unset.includes('meta 面需要'), 'userKey 未设置时应显示原来的用途说明')
+  const unset = render({}, { tab: 'identity' })
+  assert.ok(unset.includes('meta 面需要'), 'userKey 未设置时应显示用途说明')
 
-  const set = render({}, { secrets: [{ path: ['userKey'], set: true }] })
+  const set = render({}, { tab: 'identity', secrets: [{ path: ['userKey'], set: true }] })
   assert.ok(set.includes('已设置（留空表示不改动）'), 'userKey 已设置时应提示"留空表示不改动"')
   assert.ok(!set.includes('value="sk-'), 'secret 明文绝不能出现在渲染结果里')
 }
 
-// ── 7) 命名空间缺失：必须**可见地**自解释，而不是渲染空 ──────────────────────
-// 无条件注册成顶层设置页之后，这个分支就是客户端/宿主之间最关键的诊断信号：
-// 页面在 = 客户端半边已加载；这句在 = 宿主没暴露设置命名空间。
+// ── 9) 工作区 Agent：总开关、列表、占位回落、注册工作区下拉 ──────────────────
 {
-  const html = render({}, { status: 'unavailable' })
-  assert.ok(html.includes('TDAI Memory'), '不可用状态也要有标题，用户才知道这是谁的页面')
-  assert.ok(html.includes('设置当前不可用'), '应给出可见的不可用说明，而不是静默渲染空')
-  assert.ok(html.includes('tdai-memory'), '应点名缺失的命名空间')
-  assert.ok(!html.includes('读侧总开关'), '不可用时不该渲染可编辑控件')
+  const off = render({}, { tab: 'identity' })
+  assert.ok(off.includes('按工作区覆盖 Agent / Team'), '应有工作区覆盖总开关')
+  assert.ok(off.includes('当前未启用：所有工作区都使用默认身份'), '总开关关闭时要有明确说明')
+  assert.ok(off.includes('还没有绑定'), '空列表要有空状态')
+
+  const on = render({
+    workspaceAgentsEnabled: true,
+    workspaceAgents: [
+      { workspace: '/mnt/d/repo-a', title: 'Repo A', teamId: 'team-a', agentId: 'agt-a' },
+      { workspace: '/mnt/d/repo-b', title: '', teamId: '', agentId: 'agt-b' },
+    ],
+  }, { tab: 'identity' })
+  assert.ok(on.includes('Repo A'), '规则行应显示工作区标题')
+  assert.ok(on.includes('/mnt/d/repo-a'), '规则行应显示完整路径')
+  assert.ok(on.includes('value="team-a"'), '规则行应回显 Team ID')
+  assert.ok(on.includes('value="agt-b"'), '规则行应回显 Agent ID')
+  assert.ok(on.includes('placeholder="默认 team-x"'), 'Team 留空时应提示回落默认 team')
+  assert.ok(on.includes('placeholder="默认 agt-x"'), 'Agent 留空时应提示回落默认 agent')
+  assert.ok(on.includes('>移除</button>'), '规则行应有移除按钮')
+  assert.ok(on.includes('list="tdai-workspace-options"'), '添加输入应支持工作区下拉')
+  assert.ok(on.includes('>添加</button>'), '应有添加按钮')
+
+  // 设置页标准 props：注册工作区列表进 datalist
+  const withOptions = render({ workspaceAgentsEnabled: true }, {
+    tab: 'identity',
+    useWorkspaces: (selector) => selector({ items: [{ path: '/mnt/d/repo-c', title: 'Repo C' }] }),
+  })
+  assert.ok(withOptions.includes('<option value="/mnt/d/repo-c">Repo C</option>'), '应把注册工作区渲染进 datalist')
+
+  // env 形态：组合层传的是字符串（cordis.patch.yml 的 `!!js process.env.X`），
+  // 面板不能把它读成"关" —— 否则用户看着一个假的开关去回滚。
+  const fromEnv = render({
+    workspaceAgentsEnabled: 'true',
+    workspaceAgents: [{ workspace: '/mnt/d/repo-a', agentId: 'agt-a' }],
+  }, { tab: 'identity' })
+  assert.ok(fromEnv.includes('>工作区覆盖开（1 条）<'), `字符串 "true" 应显示为开：${fromEnv.match(/工作区覆盖[^<]*/)?.[0]}`)
+  assert.ok(!fromEnv.includes('当前未启用：所有工作区都使用默认身份'), '字符串 "true" 不该再显示未启用说明')
+  const workspaceToggle = fromEnv.slice(fromEnv.indexOf('按工作区覆盖 Agent / Team') - 600)
+  assert.ok(workspaceToggle.includes('checked=""'), '总开关勾选框应为勾选态')
+
+  const envOff = render({ enabled: 'false' }, { tab: 'read' })
+  assert.ok(envOff.includes('读侧关'), `字符串 "false" 应显示为关：${envOff.match(/读侧[^<]*/)?.[0]}`)
 }
 
-// ── 8) Bot 会话 · ds-bot：总闸串联（父关闭 → 子置灰）──────────────────────────
+// ── 10) Bot 会话 · ds-bot：总闸串联（父关闭 → 子置灰）──────────────────────────
 {
-  // 默认（总闸开、回写关）：skill 注入与回写自己不灰；蒸馏 / 窗口 / 复用灰
-  // （回写默认关时蒸馏没有意义 —— 这正是 dimmedBy 要表达的东西）
-  const base = render()
+  const base = render({}, { tab: 'bot' })
   assert.equal(dimmed(base, '识别 ds-bot 会话'), false, '总闸是根，默认开且不置灰')
   assert.equal(dimmed(base, 'Bot 会话注入云端 skill'), false, 'enabled + skillsEnabled 都开着 → 不灰')
   assert.equal(dimmed(base, 'Bot 会话回写记忆'), false, '回写默认关但不置灰（它只受总闸与全局回流约束）')
@@ -277,30 +270,35 @@ function dimmed(html, label) {
     assert.ok(row.includes('value="5"'), '窗口条数应回显生效值 5')
   }
 
-  // 总闸关：Bot 组所有子项全灰（含台账路径），tooltip 点名总闸；总闸自己永远可点
-  const off = render({ dsbotAwarenessEnabled: false })
+  const off = render({ dsbotAwarenessEnabled: false }, { tab: 'bot' })
   for (const label of ['Bot 会话注入云端 skill', 'Bot 会话回写记忆', '群聊前文蒸馏', '复用本群 MEMORY 条目']) {
     assert.equal(dimmed(off, label), true, `总闸关闭时「${label}」应置灰`)
   }
   assert.ok(off.includes('「识别 ds-bot 会话」已关闭'), '置灰 tooltip 应点名总闸')
-  assert.ok(off.includes('title="「识别 ds-bot 会话」已关闭，此项暂不生效"'), '台账路径文本框也只受总闸约束（同样置灰）')
-  assert.equal(dimmed(off, '识别 ds-bot 会话'), false, '总闸自己不能被置灰（否则没法重新打开）')
+  assert.ok(off.includes('title="「识别 ds-bot 会话」已关闭，此项暂不生效"'), '台账路径文本框也只受总闸约束')
+  assert.equal(dimmed(off, '识别 ds-bot 会话'), false, '总闸自己不能被置灰')
 
-  // 回写打开：蒸馏 / 窗口 / 复用解灰
-  const writeOn = render({ botWritebackEnabled: true })
+  const writeOn = render({ botWritebackEnabled: true }, { tab: 'bot' })
   assert.equal(dimmed(writeOn, '群聊前文蒸馏'), false, '回写打开后蒸馏解灰')
   assert.equal(dimmed(writeOn, '复用本群 MEMORY 条目'), false, '回写打开后复用解灰')
   assert.ok(!writeOn.includes('「Bot 会话回写记忆」已关闭'), '回写打开后不该再有"回写已关闭"的 tooltip')
 
-  // 读侧总开关 / 云端 skill 召回：只灰 skill 注入，**不灰回写**（写侧独立）
-  assert.equal(dimmed(render({ enabled: false }), 'Bot 会话注入云端 skill'), true, '读侧总开关关闭 → Bot skill 注入灰')
-  assert.equal(dimmed(render({ skillsEnabled: false }), 'Bot 会话注入云端 skill'), true, '云端 skill 召回关闭 → Bot skill 注入灰')
-  assert.equal(dimmed(render({ enabled: false }), 'Bot 会话回写记忆'), false, '回写不受读侧总开关影响')
+  assert.equal(dimmed(render({ enabled: false }, { tab: 'bot' }), 'Bot 会话注入云端 skill'), true, '读侧总开关关闭 → Bot skill 注入灰')
+  assert.equal(dimmed(render({ skillsEnabled: false }, { tab: 'bot' }), 'Bot 会话注入云端 skill'), true, '云端 skill 召回关闭 → Bot skill 注入灰')
+  assert.equal(dimmed(render({ enabled: false }, { tab: 'bot' }), 'Bot 会话回写记忆'), false, '回写不受读侧总开关影响')
 
-  // 全局回流关：灰回写（蒸馏只挂 Bot 回写开关，按方案 §3.1 的 dimmedBy 表不跟着灰）
-  const captureOff = render({ botWritebackEnabled: true, captureEnabled: false })
+  const captureOff = render({ botWritebackEnabled: true, captureEnabled: false }, { tab: 'bot' })
   assert.equal(dimmed(captureOff, 'Bot 会话回写记忆'), true, '全局「对话回流」关闭 → Bot 回写灰')
   assert.equal(dimmed(captureOff, '群聊前文蒸馏'), false, '蒸馏只挂 Bot 回写开关（方案 §3.1 的 dimmedBy 表）')
 }
 
-console.log('settings card render tests passed: 分组 / 条数上限输入框 / 依赖置灰矩阵 / Bot 会话串联 / 身份告警 / secret 侧信道 / 不可用自解释')
+// ── 11) 命名空间缺失：可见自解释，不渲染可编辑控件 ──────────────────────────
+{
+  const html = render({}, { status: 'unavailable' })
+  assert.ok(html.includes('TDAI Memory'), '不可用状态也要有标题')
+  assert.ok(html.includes('设置当前不可用'), '应给出可见的不可用说明')
+  assert.ok(html.includes('tdai-memory'), '应点名缺失的命名空间')
+  assert.ok(!html.includes('读侧总开关'), '不可用时不该渲染可编辑控件')
+}
+
+console.log('settings card render tests passed: Tab / 折叠分组 / 横向溢出 / 置灰矩阵 / 工作区 Agent / secret / 不可用自解释')

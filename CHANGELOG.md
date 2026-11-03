@@ -24,6 +24,115 @@
 
 ## [Unreleased]
 
+### 修复：审查发现的 4 处静默缺陷（资产缓存 / 面板判重 / 保存锁 / 裸会话身份）
+
+合入前审查（2026-11-04）复现并修掉的一批"不报错但行为不对"的问题：
+
+1. **晚到的资产加载失败会踢掉已成功的新资产**（`lib/assets.mjs`）。`ensure()` 的失败
+   回调无条件 `cache.delete(sessionId)`。同一个会话可能并发存在两次加载（预热用旧身份在飞、
+   assemble 换成工作区身份后成功；或 `/tdai-sync` / 知识工具 refresh 顶掉旧的），旧请求
+   晚到失败时会把**成功的那份**删掉，还给会话盖一个 15s 冷却 → `session_context` /
+   L2L3 / 知识注入全部静默变空，日志只有一句 `asset load failed`。
+   改法：只有"自己还是当前缓存条目"（`this.cache.get(id) === entry`）时才作废并记失败；
+   日志里的"冷却"提示也跟着只在真进冷却时打印。
+2. **面板判重与运行期归一不是同一套口径**（`client.card.tsx` ↔ `config.mjs`）。
+   运行期按 `path.resolve` + 去尾分隔符 + win32 小写归一，且同路径**后者覆盖前者**；
+   面板只比原始 trim 字符串，于是 `/repo/a/` 与 `/repo/a` 都能保存 —— 面板显示两条规则、
+   运行期只有后来那条生效，第一行配置静默失效。
+   改法：新增 `workspacePathKey()`（浏览器安全的同口径归一），`addWorkspaceRow` 与
+   `sanitizeWorkspaceAgents` 都用它判重，错误信息点名"哪两个路径是同一个目录"。
+   顺带补上**绝对路径校验**：相对路径会被运行期按插件进程 cwd 解析，规则永远不命中。
+3. **保存期间切 Tab 会摘掉保存锁、并吞掉新编辑**（`client.card.tsx`）。旧写法
+   `saving = note === '保存中…'`，而切 Tab 会 `setNote('')` → 输入框与保存按钮重新可编辑；
+   保存成功后又整体 `setTouched(new Set())`，于是保存窗口内的编辑既不提交、也不再算未保存。
+   改法：`saving` 用独立 state；成功后只清**本次真正提交**的键；`mutate` 返回 `false`
+   （宿主拒绝写入）时不再当成功；调用放进微任务，避免同步抛错把面板锁死。
+4. **裸会话拿不到身份**（`index.mjs`）。`lib/tools.mjs` 的 `sessionIdOf()` 一直支持
+   `id ?? sessionId` 两种形状，但新的 `identityFor()` 只认 `session.id` —— 只有
+   `sessionId` 的会话（老宿主 / 内部调用）会报"未取到当前会话身份"。同口径修掉，
+   `sessionWithHeader()` 也一并支持，store 补到 cwd 后仍能命中工作区规则。
+
+面板显示口径同时收紧：开关一律走 `boolOn()`（schema 是
+`z.union([z.boolean(), z.string()])`，env 传的是字符串），修掉 `workspaceAgentsEnabled:
+"true"` 被显示成"关"、`enabled: "false"` 被显示成"开"的问题；`useWorkspaces` 改为无条件调用
+（条件调用会在 props 有无变化时改变 hook 数量，整页抛错）。
+
+测试：`assets-budget` 增「晚到失败不踢新资产」；`load` 增裸会话 / store 补 cwd 的身份解析；
+`settings-card` 增判重键与运行期归一逐条对齐、等价路径拦截、绝对路径校验、`boolOn`，
+并把 client.js 新鲜度从"grep 文案"升级为与重新构建的产物**逐字节**比对
+（逻辑改动不涉文案时旧口径漏得掉）；`settings-card-render` 增 env 字符串开关的显示断言。
+
+### 新增：按工作区覆盖 Team / Agent（多工作区多 agent）
+
+同一个 DSH 进程打开多个工作区时，原来只能共用一组 `team / agent`。新增工作区身份覆盖：
+
+- `workspaceAgentsEnabled`（默认**关**，升级后行为不变）+ `workspaceAgents` 规则表：
+  `工作目录（session.header.cwd）→ { teamId?, agentId? }`。
+- 命中规则 → 用规则里的 team/agent 覆盖默认身份（空项回落默认）；未命中 / 总开关关 /
+  规则两栏都空 → 默认身份。默认身份缺字段但规则补全了 → 该会话读侧仍可用。
+- 判定只在 `config.mjs` 的 `identityForWorkspace()` 一处；会话级有效配置通过
+  `runtime.configFor(session)` / `identityFor(session)` / `readEnabledFor(session)` 下发。
+- `SessionAssets` 的缓存 key 带 `teamId|agentId`：同一会话切换有效身份时旧画像作废重载，
+  不会把 A 的 L3/L2 当成 B 的资产。
+- `/tdai-status` 增加身份来源 `workspace`、当前 cwd、命中的规则、规则总数。
+- 面板新增「身份与工作区」Tab 的「工作区 Agent」：总开关、规则卡（Team / Agent 留空回落）、
+  已登记工作区下拉（`useWorkspaces` 标准 props；缺失时手填绝对路径）、重复/空行拦截。
+- env：`TDAI_MEMORY_WORKSPACE_AGENTS_ENABLED`、`TDAI_MEMORY_WORKSPACE_AGENTS`
+  （JSON 字符串）。设计与回滚见
+  [docs/proposals/workspace-agent-identity.zh-CN.md](docs/proposals/workspace-agent-identity.zh-CN.md)。
+
+### 改版：设置卡片改为 4 个 Tab + 可折叠分组，修横向滚动条
+
+- 顶层拆成「读侧 / 写侧 / Bot 与子 agent / 身份与工作区」四个 Tab；
+- 每个 Tab 内用原生 `<details>` 折叠分组，群聊蒸馏等高级参数默认收起；
+- 开关 / 数字项改为「标签一行、hint 下一行」，长说明 `overflow-wrap:anywhere`；
+  输入框 `width:100%; min-width:0; box-sizing:border-box`，根容器与 flex/grid 容器补
+  `min-width:0` —— 修掉旧版 `white-space:nowrap` 导致的设置面板横向滚动条；
+- 顶部增加状态行：读侧 / 写侧 / 工作区覆盖状态 + 默认身份缺项点名；
+- 读侧身份告警改为说明「工作区覆盖补全字段时该工作区仍可用」。
+
+### 测试
+
+- 新增 `test/workspace-agents.test.mjs`：路径归一、规则归一（数组 / JSON / 空串 / 坏条目 /
+  同路径后者覆盖）、总开关关闭、全量与部分覆盖、未命中回落、补全身份、user/service/task 不被覆盖。
+- `test/assets-budget.test.mjs` 增加「同一会话切换有效身份必须重载资产」。
+- `test/settings-card.test.mjs` / `test/settings-card-render.test.mjs` 按新 Tab / 工作区 UI 重写，
+  并断言横向溢出修复（`min-width:0` / `overflow-wrap:anywhere` / 长 hint 不再 `nowrap`）。
+
+---
+
+### 修复：L0 不再写入工具调用与工具结果
+
+#### 为什么
+
+L0 是 L1/L2/L3 后台抽取的唯一输入。旧实现沿用上游 `toMemoryMessages()` 的做法，
+把每次工具调用折叠成 `[tool_call] name(args)`、结果折叠成 `[tool_result:name] …`
+一并写进 L0。实测代价（本机 2026-10-24）：
+
+- 当日 331 条 L0 里 assistant 占 313 条（94.6%），user 只有 18 条；
+- assistant 正文合计 210,570 字符，其中同一条 `bash` 命令重复出现 19 次、另一条 17 次；
+- L1 据此抽出的 135 条记忆清一色是 `work_fact` / `work_method` / `work_task` /
+  `work_artifact`，一条 `persona` / `instruction` / `episodic` 都没有。
+
+工具调用是执行过程，不是「人说了什么」，对长期画像没有信息量，还会持续稀释真人发言的占比。
+它同时是 L2 场景块膨胀的主要原料——`技术开发-记忆插件项目` 已被撑到 233,046 字节
+（占 L2 总量 35.4%），个人生活类九块合计被挤到 35% 以下。
+
+#### 改了什么
+
+- `lib/normalize.mjs` 的 `toL0Records()`：跳过 `role === 'tool_call'` 与 `'tool_result'` 的条目。
+  纯工具调用的 record 产不出内容，由末尾的 `filter` 整条丢弃，不留空壳；同一 `recordKey`
+  里 text 与工具混排时只保留 text，顺序不变。
+- 删掉随之失效的 `TOOL_TEXT_MAX` 常量与 `collapse()` 折叠函数。
+- skill 端点不受影响：`toSkillMessages()` 仍保留 5-role 与 `tool_call_id` 配对锚点
+  （core 侧归档要求工具成对）。
+
+#### 验证
+
+`test/capture-normalize.test.mjs` 新增三组断言：工具不得折进 L0、纯工具 record 整条消失、
+同 recordKey 混排只留 text；原「工具折叠成标记」断言改为反向断言（不得出现 `[tool_call]`、
+不得夹带工具参数）。`npm test` 全绿。
+
 ## [0.8.0] - 2026-10-23
 
 ### 修复：读侧工具失败不再伪装成「（无结果）」（候选 1，P0）

@@ -253,7 +253,7 @@ schema 从 2774 → 6446 字节（新增 2 个知识工具 + 记忆工具描述�
 | 端点 | role | 工具怎么表示 |
 | --- | --- | --- |
 | `/v3/skill/conversation/add` | user / assistant / `tool_call` / `tool_result` / system | 独立消息 + `tool_call_id` 配对锚点 |
-| `/v3/conversation/add`（L0） | 只有 user / assistant / system | 折叠成 `[tool_call] name(args)` / `[tool_result:name] …` |
+| `/v3/conversation/add`（L0） | 只有 user / assistant / system | **整条丢弃** —— 工具调用与结果不进 L0 |
 
 - **内部思考（`reasoning`）与图片一律丢弃**，对齐
   `MemoryProxy/src/skill/normalize-conversation.ts`。reasoning 与可见回复在 DSH 里
@@ -314,7 +314,7 @@ DSH 自己的尾部段（约 500–800 tokens，因为位置前移）。如果�
 
 - **fail-open**：Gateway 任何故障只记日志，不阻断 DSH
 - **会话级资产缓存**：agent 建立时（`agent/created`）预热 + pre-step 懒加载兜底；section 同步读缓存，首轮即可注入
-- **静态身份**（单人场景），不做多用户与 auth/verify
+- **默认身份 + 工作区覆盖**（单人场景），不做多用户与 auth/verify
 
 ## 安装
 
@@ -343,7 +343,8 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
 
 ### 方式一：Web 设置面板（推荐，快捷切换）
 
-「设置 → TDAI Memory」页（设置导航里的顶层一项），可即时切换：
+「设置 → TDAI Memory」页（设置导航里的顶层一项），按 **读侧 / 写侧 / Bot 与子 agent /
+身份与工作区** 四个 Tab 组织，可即时切换：
 
 - **读侧**：读侧总开关、L1 自动召回（含**单轮召回条数上限**）、**云端 skill 召回**
   （含**条数上限**与**分数下限**两个数字框 —— 实际注入条数 = 过分数下限后的前 N 条；
@@ -352,10 +353,14 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
   挂在会话上下文下面，可再选"保留原 persona 行"、长期记忆、知识库）；
   上层关掉时下层在卡片上置灰并说明原因
 - **写侧**：对话回流（独立于读侧）、待办写入 task（独立，默认关；另需 User Key）
-- **子 agent**：子会话是否**全量继承**读侧（身份 + 记忆 + skill 召回）、是否回流（默认都关；
-  知识库与 14 个工具在子会话里本就可用）
-- **身份与地址**：MemoryCore 地址、实例 ID、Team / Agent / User / Task ID、User Key、
-  知识服务地址改写
+- **Bot 与子 agent**：ds-bot 总闸 / skill 注入 / 回写、群聊蒸馏（高级参数默认收起）、
+  子会话是否**全量继承**读侧（默认关；知识库与 14 个工具在子会话里本就可用）
+- **身份与工作区**：默认 MemoryCore 地址、实例 ID、Team / Agent / User / Task ID、
+  User Key、知识服务地址改写；以及 **工作区 Agent** —— 按会话工作目录覆盖 Team / Agent
+  （总开关默认关；规则为空或未命中时回落默认身份）
+
+长说明统一放在标签**下一行**并允许换行，输入框占满容器；设置面板只出现纵向滚动条，
+不再有旧版 `white-space:nowrap` 造成的横向滚动条。
 
 开关的依赖关系（卡片上按同一层级分组、置灰显示"暂不生效"）：
 
@@ -378,6 +383,13 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
                              （它是 volatile 字段，改面板不会重新 apply 插件），
                              开关判据在调用时——所以关着时调用会得到明确的"未启用"。
 
+工作区身份覆盖（默认关）
+  workspaceAgentsEnabled —— 是否按会话 cwd 匹配规则；关掉 = 回到"一个进程一个身份"
+  workspaceAgents        —— 规则表：cwd → { teamId?, agentId? }；空项回落默认，
+                            未命中 / 总开关关 → 默认身份。判定只在 config.mjs 的
+                            identityForWorkspace() 一处。路径必须是绝对路径；
+                            面板按归一后的路径判重（`/repo/a/` 与 `/repo/a` 是同一条）
+
 子 agent 会话（按会话判定，不受上面开关影响；能力面见 lib/subagent.mjs）
   subagentInjectionEnabled —— 子会话是否全量继承读侧（身份 + 记忆）  默认关
                               （知识库与工具在子会话里始终可用）
@@ -388,9 +400,12 @@ dsh plugin --profile web add ./dsh-tdai-memory-plugin
 
 1. **`injectionEnabled` 只管 system prompt 里的那几个注入段**，关掉它**不影响** L1 召回；
 2. **回流不依赖读侧**：读侧全关时仍照常把对话写回 MemoryCore（capture-only）；
-3. **身份不全是读侧失效的头号原因**（`readEnabled = enabled && 身份齐全`）：卡片会在读侧那组下面点名缺哪些字段。
+3. **身份不全是读侧失效的头号原因**（`readEnabled = enabled && 有效身份齐全`）：卡片会在顶部点名缺哪些字段。
+   默认身份缺字段时，若某个工作区规则把它补全了，那个工作区的会话仍可用读侧；
+   未命中规则的会话照旧停用（写侧不受影响）。
 
-开关即时生效；身份字段变更后**新会话**生效（已有会话的注入缓存不变）。留空文本框 = 回落到 env；
+开关即时生效；身份字段与工作区规则变更后，**新会话**立即按新值解析，已有会话的资产缓存
+会按 team/agent 变化自动失效重载。留空文本框 = 回落到 env；
 「单轮召回条数上限」留空则回落到 env / 默认 5，填 1–20 之外的数字会按区间收敛并在保存结果里说明。
 
 ### 方式二：env
@@ -438,6 +453,11 @@ export TDAI_MEMORY_BOT_CONTEXT_MAX_TOKENS=5000            # 蒸馏输出上限�
 export TDAI_MEMORY_BOT_CONTEXT_TIMEOUT_MS=15000           # 蒸馏超时（2000–60000；思考型模型 8 秒不够）
 export TDAI_MEMORY_DSBOT_LEDGER_PATH=                    # 台账路径；空 = <DSH_HOME>/storages/tdai-memory-plugin/dsbot-state.json
 
+# ── 工作区身份覆盖（默认关；也可只在 Web 面板配置）──
+export TDAI_MEMORY_WORKSPACE_AGENTS_ENABLED=false
+# 规则表用 JSON 字符串；workspace 必须是绝对路径（服务端会做轻量规范化）
+export TDAI_MEMORY_WORKSPACE_AGENTS='[{"workspace":"/mnt/d/repo/a","teamId":"team-a","agentId":"agt-a"}]'
+
 # ── 调参 ──
 export TDAI_MEMORY_ENDPOINT=http://127.0.0.1:8420
 export TDAI_MEMORY_RECALL_LIMIT=5           # L1 合并 top-K（1–20，面板里也可改）
@@ -453,8 +473,8 @@ export TDAI_MEMORY_ASSET_LOAD_BUDGET_MS=5000  # 整包资产（meta+L3/L2+knowle
 export TDAI_MEMORY_ASSET_RETRY_COOLDOWN_MS=15000  # 加载失败后的冷却期：期内不重试（0=每次重试）
 ```
 
-配置优先级：**Web 设置 > env > 内置默认值**。身份不完整时读侧自动停用并告警，写侧不受影响；
-`TDAI_MEMORY_API_KEY` 只从 env 读取，不写入设置面板。
+配置优先级：**Web 设置 > env > 内置默认值**。身份不完整时读侧按**每个会话的有效身份**判定
+（未命中工作区覆盖的会话停用），写侧不受影响；`TDAI_MEMORY_API_KEY` 只从 env 读取，不写入设置面板。
 
 **哪些键刻意不上面板**：`apiKeyEnv` / `l2Limit` / `timeoutMs` / `recallTimeoutMs` /
 `assetLoadBudgetMs` / `assetRetryCooldownMs` 六个键**故意**不放设置面板（= `lib/settings.mjs` 的
@@ -477,20 +497,24 @@ export TDAI_MEMORY_ASSET_RETRY_COOLDOWN_MS=15000  # 加载失败后的冷却期�
 ## 与 MemoryProxy 的差异（有意为之）
 
 - **无代理层**：不转发 LLM 流量，不做限流/计费/存储抽象——那些是 proxy 基础设施，不属于插件职责
-- **无 auth/verify**：数据面接受显式身份，meta 面用 `x-tdai-user-key`，静态身份下 verify 不必要
+- **无 auth/verify**：数据面接受显式身份，meta 面用 `x-tdai-user-key`，单人场景下 verify 不必要
 - **无 ACL 过滤**：借入资产来自本人 agent 绑定，单用户场景不做 acl/check（proxy 的 fail-closed 设计面向多用户）
 - **工具原生注册**：替代 skill-bridge/memory-bridge 的 curl 方案，serviceToken 不进 prompt
-- **无 session-init 表单**：静态身份下跳过 team/agent/task 选择流程
+- **无 session-init 表单**：默认身份 + 工作区覆盖，跳过逐会话的 team/agent/task 选择流程
 
 ## 身份的语义（重要）
 
-**一个 dsh 进程只对应一个 TDAI 身份。** 身份来自 `TDAI_MEMORY_*` 环境变量或 Web 设置面板
-（面板优先），在插件加载时确定一次；`session_id` 每次调用时从当前会话取。
+**默认身份是进程级的；工作区覆盖可以让不同工作目录的会话使用不同的 Team / Agent。**
+默认身份来自 `TDAI_MEMORY_*` 环境变量或 Web 设置面板（面板优先）；每个会话再按自己的
+`header.cwd` 命中 `workspaceAgents` 规则，命中时覆盖 team / agent（空项回落默认）。
+`session_id` 每次调用时从当前会话取。
 
 这是有意为之：proxy 的"每个会话选 Team/Agent/Task"表单，是它作为**多用户网关**才需要的能力；
-本插件是 DSH 进程内的单用户组件，静态身份是更自然的形态。需要多身份时，换进程或改配置。
+本插件是 DSH 进程内的单用户组件，默认身份 + 显式工作区覆盖比每个会话弹表单更轻。
+需要更多身份时，加一条工作区规则即可；关掉总开关就回到"一个进程一个身份"。
 
-用 `/tdai-status` 可以确认当前生效的身份、它的来源（env / settings）、以及缺哪些字段。
+用 `/tdai-status` 可以确认当前生效的身份、它的来源（env / settings / workspace）、
+当前会话的 cwd、命中的规则，以及缺哪些字段。
 
 ## 开发
 
@@ -520,6 +544,7 @@ npm run check:secrets  # 扫描已跟踪文件里的疑似凭据（也是 npm te
 | [docs/dsh-0.1.7-migration.md](docs/dsh-0.1.7-migration.md) | 中文 | DSH 0.1.7-rc.1 兼容性审计：每项契约的核对方式与现场证据、迁移记录与真机验证结果 |
 | [docs/prompt-design.zh-CN.md](docs/prompt-design.zh-CN.md) | 中文 | 提示词注入的优化思路、缓存视角下的风险（含"装别的插件会改提示词 → 前缀缓存失效"）与尚未解决的潜在问题 |
 | [docs/prompt-injection-redesign.md](docs/prompt-injection-redesign.md) | 中文 | 改造施工图：每一条决策、每一处对 DSH / 插件 / proxy 源码的引用 |
+| [docs/proposals/workspace-agent-identity.zh-CN.md](docs/proposals/workspace-agent-identity.zh-CN.md) | 中文 | 多工作区多 Agent：身份解析语义、面板交互方案、横向溢出修复、运行时链路与回滚 |
 
 ## License
 

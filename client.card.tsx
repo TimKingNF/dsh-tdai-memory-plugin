@@ -1,86 +1,62 @@
 /**
  * TDAI Memory 设置卡片。
  *
- * 完全对齐 Modlens 的设置卡 chrome：原生插件卡（border + 分层背景 + 12px 圆角）、
- * 可折叠头部（标题+副标题+自定义 SVG 箭头）、字段为「标签在上控件在下」的堆叠行、
- * 底部「放弃修改(ghost) + 保存(primary)」草稿式提交。全部行内样式 + --dsw-* 变量。
+ * 2026-11 改版（多工作区多 agent）：
+ *   - 顶层按「读侧 / 写侧 / Bot 与子 agent / 身份与工作区」分 Tab；
+ *   - 每个 Tab 内的分组可折叠（原生 <details>），高级参数默认收起；
+ *   - 身份页新增「工作区 Agent」：工作目录 → { teamId?, agentId? } 规则表；
+ *   - 所有长说明改为**标签下一行**并允许换行，输入框 min-width:0 / width:100%，
+ *     修掉旧版 `white-space:nowrap` 造成的横向滚动条。
  *
- * 读写（DSH 0.1.7-rc.1）：通过 `ctx.configForms.get(ENTRY_ID)` 拿到本 entry 的设置表单；
- * 旧的 `ctx.settingsScope.bind({namespace})` 已随 0.1.7-rc.1 一起被删除。编辑进草稿
- * （secret 字段脱敏显示、初始置空），用 touched 集合记录用户改过的字段（避免脱敏导致
- * "永远脏"），保存时只批量 mutate 改过的字段。
+ * 读写（DSH 0.1.7-rc.1）：通过 `ctx.configForms.get(ENTRY_ID)` 拿本 entry 的设置表单；
+ * 编辑进草稿（secret 字段脱敏显示、初始置空），用 touched 集合记录用户改过的字段，
+ * 保存时只批量 mutate 改过的字段。`workspaceAgents` 是数组节点，按整表替换提交。
  *
- * 挂载位置：`settings.section` —— 设置面板左侧的**顶层导航页**（「设置 → TDAI Memory」），
- * 与 profile 里其它第三方插件（`dsh-better-sidebar` / `dsh-workspace-drag` / `dshmarket`）一致。
+ * 挂载位置：`settings.section`（设置面板左侧的顶层导航页）。
  *
- * 走过的弯路：先挂的是 `settings.plugins.tab`（「内置插件」分区里的二级 tab，官方 inventory
- * 用那个）——实测用户**在设置导航里根本看不到**，反馈"没有设置项"。旧的 `settings.plugin.item`
- * 已不存在；`plugins.item` 是 Plugin Manager 的 **keyed** 槽（要 `bundle#rowId` 的 key +
- * summary/full 双视图），语义不符。
- *
- * 这里**无条件注册**（不用 `configForms.whileServed` 包）：命名空间缺失时渲染一条可见的
- * 自解释说明——"客户端加载成功但宿主命名空间缺失"是可诊断状态，不该被藏成"什么都没有"。
- *
- * secret 字段（userKey）：`ConfigFormSnapshot.value` 里**没有**它（宿主的 redact 会把它从
- * value 里删掉），所以只能"留空 = 不改动"。是否已设置从 `describe()` 的 `secrets` 侧信道读。
- *
- * ── 开关的依赖关系（文案必须与真实语义一致，改动前先看这张表）─────────────────
+ * ── 开关依赖表（改文案前先看这张表）────────────────────────────────────────
  *
  *   读侧总开关 enabled
- *     ├─ L1 自动召回 recallEnabled（另有条数上限 recallLimit）
- *     ├─ 云端 skill 召回 skillsEnabled（每轮按当前对话检索，另有条数上限 / 分数闸门）
+ *     ├─ L1 自动召回 recallEnabled（recallLimit）
+ *     ├─ 云端 skill 召回 skillsEnabled（skillRecallLimit / skillRecallMinScore）
  *     ├─ System prompt 注入 injectionEnabled
- *     │    ├─ sessionContextEnabled（<session_context> 信封）
- *     │    │    └─ agentPromptEnabled（[Role] / [Rules] 正文 + persona 槽的英文指引句）
- *     │    │         └─ agentPromptKeepBase（persona 槽要不要保留 DSH 原 persona 行）
+ *     │    ├─ sessionContextEnabled
+ *     │    │    └─ agentPromptEnabled
+ *     │    │         └─ agentPromptKeepBase
  *     │    ├─ profileMemoryEnabled
  *     │    └─ knowledgeEnabled
  *     └─ 只读工具（无独立开关）
  *
- *   写侧总开关 captureEnabled —— **完全独立**，既不受 enabled 约束，
- *   也不受 injectionEnabled 约束（lib/capture.mjs 只判它自己）。
+ *   写侧总开关 captureEnabled —— 完全独立，不受 enabled / injectionEnabled 约束。
+ *   taskWriteEnabled 也是独立写侧开关（默认关，另需 userKey）。
  *
- *   子 agent 会话（DSH 派出去的子会话）——能力面拆分，见 lib/subagent.mjs：
- *     subagentInjectionEnabled  默认**关**：子会话不注入身份（session_context）与记忆
- *                               （画像 / L1 召回 / 状态快照）、不为这些面预热资产；
- *                               但**团队知识库、知识 skill 与 10 个只读工具照常可用**
- *     subagentCaptureEnabled    默认**关**：子 agent 的执行过程不回流 L0
- *   两者都按 session.header.origin === 'subagent' 判定。
+ *   子 agent：subagentInjectionEnabled（读侧，默认关）/ subagentCaptureEnabled（写侧，默认关）。
  *
- *   ds-bot 会话（方案 docs/proposals/ds-bot-tdai-integration/minimal.agents.md §3.1）：
- *     dsbotAwarenessEnabled     总闸：关掉后不索引 ds-bot 的 state.json，Bot 会话按普通会话处理
- *       ├─ botSkillInjectEnabled    读侧：只注入云端 skill；还要 AND 全局 enabled + skillsEnabled
- *       │                           身份与记忆对 Bot 会话**恒关**，故意没有开关
- *       └─ botWritebackEnabled      写侧：按人锚点回写 L0（默认**关**）；还要 AND captureEnabled
- *            ├─ botContextDistillEnabled  群聊前文蒸馏
- *            ├─ botContextMessages        群聊窗口条数（0 = 不蒸）
- *            ├─ botContextMaxTokens       蒸馏输出上限（默认 5,000；思考 token 也从这里扣）
- *            ├─ botContextTimeoutMs       蒸馏超时（默认 15,000；思考型模型 8 秒不够）
- *            └─ botContextReuseMemory     摘要复用本群 MEMORY（默认关，避免归因回环）
- *     dsbotLedgerPath           台账路径（空 = 默认位置；只受总闸约束）
+ *   ds-bot：dsbotAwarenessEnabled 总闸
+ *     ├─ botSkillInjectEnabled（还要 AND 全局 enabled + skillsEnabled）
+ *     └─ botWritebackEnabled（默认关，还要 AND captureEnabled）
+ *          ├─ botContextDistillEnabled
+ *          ├─ botContextMessages / botContextMaxTokens / botContextTimeoutMs
+ *          └─ botContextReuseMemory
  *
- * 几个容易搞错的点：
- *   0. 云端 skill 召回**也不**依赖 injectionEnabled：它与 L1 召回同样走 agent/pre-step、
- *      注入到消息尾部（同一轮里两条块共用一条 plugin 消息），与 system 段无关；
- *   1. L1 召回**不**依赖 injectionEnabled（recall.mjs 只判 readEnabled + recallEnabled）；
- *      injectionEnabled 只管 system prompt 里的那几个段 + persona 槽的指引句。
- *   2. 回流**不**依赖 enabled：读侧全关时回流照常写 L0（capture-only 模式）。
- *   3. 身份不全时读侧整体不生效（readEnabled = enabled && 身份齐全），回流不受影响。
- *      —— 这条最容易"看起来开关都开着但什么都没注入"，所以卡片里显式告警。
- *
- * 卡片的分组、缩进、置灰都只是把上面这张表画出来；真正的判据在上面这些 mjs 里。
+ *   工作区身份覆盖：workspaceAgentsEnabled 总闸 + workspaceAgents 规则表。
+ *     命中 → 用规则里的 teamId / agentId 覆盖默认身份（空项回落默认）；
+ *     未命中 / 总开关关 → 默认身份。判定只在 config.mjs 的 identityForWorkspace()。
  */
 import React from 'react'
 import type { Context } from '@deepseek-ai/cordis'
 
 const NS = 'tdai-memory'
 
-/**
- * 读侧总开关 + 它的两个直接子项（召回 / 注入）。
- *
- * 三个具名常量分别对应"一条直线上"的三个层次；`READ_TOGGLES` 只是给测试用的汇总，
- * 渲染顺序按下图的语义排（召回后面紧跟它的条数上限，见 recallLimitRow）。
- */
+type TabId = 'read' | 'write' | 'bot' | 'identity'
+
+const TABS: Array<{ id: TabId; label: string }> = [
+  { id: 'read', label: '读侧' },
+  { id: 'write', label: '写侧' },
+  { id: 'bot', label: 'Bot 与子 agent' },
+  { id: 'identity', label: '身份与工作区' },
+]
+
 const READ_MASTER = {
   key: 'enabled',
   label: '读侧总开关',
@@ -94,17 +70,14 @@ const RECALL_TOGGLE = {
 const SKILL_RECALL_TOGGLE = {
   key: 'skillsEnabled',
   label: '云端 skill 召回',
-  hint: '每轮按当前对话检索这个 agent 名下的云端 skill，命中才注入（只给名字 + 一句描述，'
-    + '正文按需用 tdai_skill_view 取）；不再常驻目录',
+  hint: '每轮按当前对话检索这个 agent 名下的云端 skill，命中才注入（只给名字 + 一句描述，正文按需用 tdai_skill_view 取）',
 }
 const INJECT_MASTER = {
   key: 'injectionEnabled',
   label: 'System prompt 注入',
   hint: '只管下面那几个注入段；不影响 L1 召回与 skill 召回',
 }
-const READ_TOGGLES = [READ_MASTER, RECALL_TOGGLE, SKILL_RECALL_TOGGLE, INJECT_MASTER]
 
-/** 置灰时的原因（tooltip）；文案与真实依赖关系一一对应，别写成"总开关"这种含糊说法。 */
 const READ_DIM_REASON = '「读侧总开关」已关闭，此项暂不生效'
 const RECALL_DIM_REASON = '「L1 自动召回」已关闭，此项暂不生效'
 const SKILL_RECALL_DIM_REASON = '「云端 skill 召回」已关闭，此项暂不生效'
@@ -112,24 +85,25 @@ const INJECT_DIM_REASON = '「System prompt 注入」总闸已关闭，此项暂
 const AGENT_PROMPT_DIM_REASON = '「Agent 角色 / 规则 prompt」已关闭，此项暂不生效'
 const SESSION_CONTEXT_DIM_REASON = '「会话上下文（Agent / Task）」已关闭，此项暂不生效'
 
-/** 二级从属的置灰原因：键 = 那个父开关的 key。 */
 const DEP_DIM_REASON: Record<string, string> = {
   sessionContextEnabled: SESSION_CONTEXT_DIM_REASON,
   agentPromptEnabled: AGENT_PROMPT_DIM_REASON,
 }
 
 /**
- * `dimmedBy` = 这一项在 UI 上从属于哪些开关（置灰判定用；不影响真实注入判据）——
- * 列表里**任何一个**关掉，本项就置灰。层级与 config.mjs 的开关树一致：
- * sessionContextEnabled → agentPromptEnabled → agentPromptKeepBase。
+ * 注入段：`dimmedBy` = UI 上的从属关系（列表里任一开关关掉 → 置灰）。
+ * 层级与 config.mjs 的开关树一致：sessionContext → agentPrompt → keepBase。
  */
 const INJECT_TOGGLES = [
-  { key: 'sessionContextEnabled', label: '会话上下文（Agent / Task）' },
+  {
+    key: 'sessionContextEnabled',
+    label: '会话上下文（Agent / Task）',
+    hint: '把当前 agent / task 的身份写进 <session_context> 块',
+  },
   {
     key: 'agentPromptEnabled',
     label: 'Agent 角色 / 规则 prompt',
-    hint: '把「角色定位 prompt」+「规则固定 prompt」写进会话上下文的 [Role] / [Rules]，'
-      + '并在 persona 槽放一句英文指引；拿不到文本时两边都保持原样',
+    hint: '把「角色定位 prompt」+「规则固定 prompt」写进 [Role] / [Rules]，并在 persona 槽放一句英文指引',
     dimmedBy: ['sessionContextEnabled'],
   },
   {
@@ -139,22 +113,23 @@ const INJECT_TOGGLES = [
     defaultOff: true,
     dimmedBy: ['sessionContextEnabled', 'agentPromptEnabled'],
   },
-  { key: 'profileMemoryEnabled', label: '长期记忆（L3 画像 + L2 索引）' },
-  { key: 'knowledgeEnabled', label: '知识库（wiki / code-graph）', hint: '默认关', defaultOff: true },
+  {
+    key: 'profileMemoryEnabled',
+    label: '长期记忆（L3 画像 + L2 索引）',
+    hint: '把画像与场景索引注入 system prompt；L1 召回不受它影响',
+  },
+  {
+    key: 'knowledgeEnabled',
+    label: '知识库（wiki / code-graph）',
+    hint: '默认关：开启后注入知识路由，并注册 tdai-team-knowledge skill 与知识工具',
+    defaultOff: true,
+  },
 ]
 
-/**
- * 子 agent（DSH 派出去的子会话）的两个开关，**默认都关**。
- *
- * 默认关的理由：子 agent 的任务通常由父 agent 明确指定（"分析这段 diff"），
- * 父 agent 的身份与画像 / 召回是干扰；它的整段执行过程属于工作噪音，不该进长期记忆。
- * 但**知识库与工具是子 agent 干活要用的能力**，不随这两个开关关闭（见 lib/subagent.mjs
- * 的能力面表）—— 打开第一个开关只是把身份 / 记忆 / 云端 skill 召回也一并给子会话。
- */
 const SUBAGENT_INJECT_TOGGLE = {
   key: 'subagentInjectionEnabled',
   label: '子 agent 全量继承读侧',
-  hint: '默认关：子会话不注入身份与记忆、不做 L1 召回与 skill 召回（团队知识库与 10 个只读工具本就可用）',
+  hint: '默认关：子会话不注入身份与记忆、不做 L1 召回与 skill 召回（团队知识库与只读工具本就可用）',
   defaultOff: true,
 }
 const SUBAGENT_CAPTURE_TOGGLE = {
@@ -163,24 +138,16 @@ const SUBAGENT_CAPTURE_TOGGLE = {
   hint: '默认关：子 agent 的执行过程不写进长期记忆',
   defaultOff: true,
 }
-const SUBAGENT_TOGGLES = [SUBAGENT_INJECT_TOGGLE, SUBAGENT_CAPTURE_TOGGLE]
 
-/**
- * Bot 会话（ds-bot）：总闸 + 读/写子开关 + 群聊蒸馏，语义见 minimal.agents.md §3.1。
- *
- * **身份与记忆对 Bot 会话恒关**（角色权威归 ds-bot；本阶段没有「每 Bot 一个 tdai agent」），
- * 所以这里**故意没有**「注入身份 / 注入记忆」开关 —— 面板上一个能开的东西，早晚会被当成
- * 受支持的用法。真要调试，改 `lib/dsbot.mjs` 的 sessionPolicy，不要做成配置项。
- */
 const DSBOT_MASTER_TOGGLE = {
   key: 'dsbotAwarenessEnabled',
   label: '识别 ds-bot 会话',
-  hint: '总闸：关掉后不索引 ds-bot 的 state.json，Bot 会话按普通会话处理（回到改动前的唯一开关）',
+  hint: '总闸：关掉后不索引 ds-bot 的 state.json，Bot 会话按普通会话处理',
 }
 const BOT_SKILL_INJECT_TOGGLE = {
   key: 'botSkillInjectEnabled',
   label: 'Bot 会话注入云端 skill',
-  hint: '「Bot 会话识别 / 读侧总开关 / 云端 skill 召回」任一关闭时置灰；身份与记忆对 Bot 会话恒不注入（没有开关）',
+  hint: '「Bot 会话识别 / 读侧总开关 / 云端 skill 召回」任一关闭时置灰；身份与记忆对 Bot 会话恒不注入',
   dimmedBy: ['dsbotAwarenessEnabled', 'enabled', 'skillsEnabled'],
 }
 const BOT_WRITEBACK_TOGGLE = {
@@ -190,12 +157,17 @@ const BOT_WRITEBACK_TOGGLE = {
   defaultOff: true,
   dimmedBy: ['dsbotAwarenessEnabled', 'captureEnabled'],
 }
-/** 蒸馏 / 窗口 / 复用都挂在「Bot 会话回写记忆」下：回写关着时蒸馏没有意义。 */
 const BOT_CONTEXT_DISTILL_TOGGLE = {
   key: 'botContextDistillEnabled',
   label: '群聊前文蒸馏',
   hint: '回写关着时蒸馏没有意义；关掉后群聊只写人话',
   dimmedBy: ['dsbotAwarenessEnabled', 'botWritebackEnabled'],
+}
+const WORKSPACE_MASTER_TOGGLE = {
+  key: 'workspaceAgentsEnabled',
+  label: '按工作区覆盖 Agent / Team',
+  hint: '默认关：所有工作区使用上面的默认身份。开启后，命中的工作区可以单独指定 Team / Agent',
+  defaultOff: true,
 }
 const BOT_CONTEXT_REUSE_TOGGLE = {
   key: 'botContextReuseMemory',
@@ -204,10 +176,10 @@ const BOT_CONTEXT_REUSE_TOGGLE = {
   defaultOff: true,
   dimmedBy: ['dsbotAwarenessEnabled', 'botWritebackEnabled'],
 }
+
 const DSBOT_TOGGLES = [DSBOT_MASTER_TOGGLE, BOT_SKILL_INJECT_TOGGLE, BOT_WRITEBACK_TOGGLE]
 const BOT_CONTEXT_TOGGLES = [BOT_CONTEXT_DISTILL_TOGGLE, BOT_CONTEXT_REUSE_TOGGLE]
 
-/** Bot 那组的置灰原因：键 = `dimmedBy` 里那个父开关的 key。 */
 const DSBOT_DIM_REASON = '「识别 ds-bot 会话」已关闭，此项暂不生效'
 const CAPTURE_DIM_REASON = '「对话回流到 MemoryCore」已关闭，此项暂不生效'
 const BOT_CONTEXT_DIM_REASON = '「Bot 会话回写记忆」已关闭，群聊蒸馏没有意义'
@@ -219,7 +191,6 @@ const DSBOT_DIM_REASONS: Record<string, string> = {
   botWritebackEnabled: BOT_CONTEXT_DIM_REASON,
 }
 
-/** 写侧：两个开关，都与读侧完全独立。 */
 const WRITE_TOGGLES = [
   {
     key: 'captureEnabled',
@@ -229,38 +200,23 @@ const WRITE_TOGGLES = [
   {
     key: 'taskWriteEnabled',
     label: '待办写入 task',
-    hint: '默认关：打开后你在对话里明确说「记一下」的待办直接写进 MemoryCore 的 task'
-      + '（另需 User Key），不再落到本地文件；写错可撤销',
+    hint: '默认关：打开后你在对话里明确说「记一下」的待办直接写进 MemoryCore 的 task（另需 User Key），不再落到本地文件',
     defaultOff: true,
   },
 ]
 
-/**
- * 数值字段：面板里以字符串草稿编辑，**保存时**转成 number 再落库。
- *
- * 为什么必须转 number：用户层（面板）要存**真数字**，区间约束（1–20）与"面板改过"的
- * override 语义才干净。宿主 schema 另有 string 分支，但那是给组合层
- * （`cordis.patch.yml` 的 env 只能是 `"5"` 这种字符串）用的，不能据此让用户层也存字符串
- * —— 见 `lib/settings.mjs` 的 `numField` 与 `test/settings-card.test.mjs` 的两侧断言。
- * 越界按 [min, max] 收敛，并把收敛结果回填草稿 + 提示用户。
- */
 const NUMERIC_FIELDS: Record<string, { min: number; max: number; label: string; dflt: number; dimmedBy?: string[] }> = {
   recallLimit: { min: 1, max: 20, label: '单轮召回条数上限', dflt: 5 },
-  // 云端 skill 召回的两个旋钮：**实际注入条数 = 分数过闸门后的前 skillRecallLimit 条**，
-  // 所以"召回少了/多了"通常是这两个一起调（见 lib/recall.mjs 的 pickSkillHits）。
   skillRecallLimit: { min: 1, max: 10, label: 'skill 召回条数上限', dflt: 3 },
   skillRecallMinScore: { min: 0, max: 100, label: 'skill 召回分数下限', dflt: 4 },
-  // Bot 群聊窗口：0 是**有效语义**（= 不蒸），保存时不能被当成空串 unset 掉。
   botContextMessages: {
     min: 0, max: 20, label: '群聊窗口条数', dflt: 5,
     dimmedBy: ['dsbotAwarenessEnabled', 'botWritebackEnabled'],
   },
-  // 蒸馏输出上限：思考 token 也从这里扣，所以默认给到 5,000（正常摘要只花 200–300）。
   botContextMaxTokens: {
     min: 100, max: 32000, label: '蒸馏输出上限', dflt: 5000,
     dimmedBy: ['dsbotAwarenessEnabled', 'botWritebackEnabled'],
   },
-  // 蒸馏超时：会思考的模型在 5,000 预算下可能想十几秒，8 秒不够（现场 timeout 过）。
   botContextTimeoutMs: {
     min: 2000, max: 60000, label: '蒸馏超时', dflt: 15000,
     dimmedBy: ['dsbotAwarenessEnabled', 'botWritebackEnabled'],
@@ -273,26 +229,21 @@ const REQUIRED_IDENTITY = ['serviceId', 'teamId', 'agentId', 'userId']
 const IDENTITY_FIELDS = [
   { key: 'endpoint', label: 'MemoryCore 地址', placeholder: 'http://127.0.0.1:8420' },
   { key: 'serviceId', label: 'Memory 实例 ID（x-tdai-service-id）', placeholder: 'default' },
-  { key: 'teamId', label: 'Team ID' },
-  { key: 'agentId', label: 'Agent ID' },
+  { key: 'teamId', label: '默认 Team ID' },
+  { key: 'agentId', label: '默认 Agent ID' },
   { key: 'userId', label: 'User ID' },
   { key: 'userKey', label: 'User Key（sk-mem-…）', hint: 'meta 面需要；缺省则借入与 session_context 降级', secret: true },
   { key: 'knowledgeEndpoint', label: '知识服务地址改写', placeholder: '如 http://127.0.0.1:8424', hint: '服务端返回容器内地址（host.docker.internal）时填宿主可达的 origin；留空则用服务端返回的地址' },
   { key: 'taskId', label: 'Task ID（可选）' },
 ]
 
-/**
- * 普通文本框字段（路径类）。**不是身份字段**：不参与 `identitySource()` 判定、
- * 不进 `missingIdentity()`、也不受 `blankSecrets()` 影响，所以单独放一组，
- * 渲染时也不走 IDENTITY_FIELDS 那条「secret / 身份告警」的路径。
- */
-const TEXT_FIELDS = [
+/** 非身份文本框：不参与身份告警 / secret 脱敏。 */
+const BOT_TEXT_FIELDS = [
   {
     key: 'botContextModel',
     label: '蒸馏模型（provider/model）',
     placeholder: '空 = 主持 Bot 的模型；如 deepseek-official/deepseek-flash',
-    hint: '群聊前文摘要用哪个模型蒸。主持 Bot 若挂在会思考的模型上，思考 token 会从输出预算里扣，'
-      + '容易把正文挤空（distill-empty）；换一个没有思考档位的小模型更稳也更省',
+    hint: '群聊前文摘要用哪个模型蒸。主持 Bot 若挂在会思考的模型上，思考 token 会从输出预算里扣，容易把正文挤空（distill-empty）；换一个没有思考档位的小模型更稳也更省',
     dimmedBy: ['dsbotAwarenessEnabled', 'botWritebackEnabled'],
   },
   {
@@ -306,27 +257,156 @@ const TEXT_FIELDS = [
 
 /** 卡片字段的单一事实来源，导出给 test/settings-card.test.mjs 做一致性断言。 */
 export const CARD_FIELDS = {
-  toggles: [...READ_TOGGLES, ...INJECT_TOGGLES, ...WRITE_TOGGLES, ...SUBAGENT_TOGGLES, ...DSBOT_TOGGLES, ...BOT_CONTEXT_TOGGLES],
+  toggles: [
+    READ_MASTER,
+    RECALL_TOGGLE,
+    SKILL_RECALL_TOGGLE,
+    INJECT_MASTER,
+    ...INJECT_TOGGLES,
+    ...WRITE_TOGGLES,
+    SUBAGENT_INJECT_TOGGLE,
+    SUBAGENT_CAPTURE_TOGGLE,
+    ...DSBOT_TOGGLES,
+    ...BOT_CONTEXT_TOGGLES,
+    WORKSPACE_MASTER_TOGGLE,
+  ],
   numeric: NUMERIC_FIELDS,
   identity: IDENTITY_FIELDS,
-  text: TEXT_FIELDS,
+  text: BOT_TEXT_FIELDS,
+  workspace: { master: 'workspaceAgentsEnabled', rules: 'workspaceAgents' },
   requiredIdentity: REQUIRED_IDENTITY,
 }
 
-/**
- * 默认关的开关集合：判定"父项是否关闭"时不能只看 `=== false` ——
- * 默认关的项在快照缺字段时是**关**，默认开的项缺字段时是**开**。
- */
 const DEFAULT_OFF_KEYS = new Set(
   CARD_FIELDS.toggles.filter((t) => t.defaultOff === true).map((t) => t.key),
 )
 
-/**
- * 身份里缺哪些字段（读侧失效的判定与日志点名用的是同一组 key）。
- * 纯函数，便于单测。
- */
 export function missingIdentity(value: Record<string, unknown> | undefined): string[] {
   return REQUIRED_IDENTITY.filter((k) => !String(value?.[k] ?? '').trim())
+}
+
+/**
+ * 开关的"有效布尔值"。
+ *
+ * 为什么不能直接 `=== true` / `!== false`：schema 的布尔字段是
+ * `z.union([z.boolean(), z.string()])`（组合层 env 只能是字符串，见 lib/settings.mjs
+ * 的 boolField 注释）。于是 `workspaceAgentsEnabled` 可能是字符串 `"true"`，
+ * `=== true` 会把"已启用"显示成关闭 —— 用户看着面板去回滚，等于看着一个假的开关。
+ * 与 config.mjs 的 `boolOpt()` 同一口径。
+ */
+export function boolOn(value: unknown, defaultOn = true): boolean {
+  if (value === undefined || value === null || value === '') return defaultOn
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  return !/^(0|false|no|off)$/i.test(String(value).trim())
+}
+
+/**
+ * 工作目录的「判重键」（纯字符串运算，浏览器里没有 `node:path`）。
+ *
+ * 为什么必须有它：运行期按 `config.mjs` 的 `normalizeWorkspacePath()`（`path.resolve`
+ * + 去尾分隔符 + win32 小写）匹配，且 `normalizeWorkspaceAgents()` 对同一路径是
+ * **后者覆盖前者**。若面板按原始字符串判重，`/repo/a/` 与 `/repo/a` 都能存下去 ——
+ * 面板显示两条规则，运行期只有后来那条生效，第一行配置静默失效。
+ *
+ * 这里做同一套归一（只是不碰文件系统）：
+ *   - 反斜杠风格（`C:\`、`\\server`、含 `\`）视为 Windows：统一分隔符 + 小写；
+ *   - 去掉 `.` 段、折叠 `..` 段、去掉尾分隔符（根路径除外）。
+ * 绝对路径的判定与归一在同一处，避免两套口径。
+ */
+export function workspacePathKey(raw: unknown): string {
+  const text = String(raw ?? '').trim()
+  if (!text) return ''
+  const windows = /^[a-zA-Z]:[\\/]/.test(text) || text.startsWith('\\\\') || text.includes('\\')
+  const slash = windows ? '\\' : '/'
+  const unified = windows ? text.replace(/\//g, '\\') : text
+  const drive = windows ? /^([a-zA-Z]):/.exec(unified) : null
+  const body = drive ? unified.slice(2) : unified
+  const parts: string[] = []
+  for (const segment of body.split(/[\\/]+/)) {
+    if (!segment || segment === '.') continue
+    if (segment === '..') { parts.pop(); continue }
+    parts.push(segment)
+  }
+  const lead = drive
+    ? `${drive[1].toLowerCase()}:`
+    : windows
+      ? (unified.startsWith('\\\\') ? '\\\\' : '')
+      : (unified.startsWith('/') ? '/' : '')
+  const joined = `${lead}${parts.join(slash)}`
+  return windows ? joined.toLowerCase() : joined
+}
+
+/** 工作区路径必须是绝对路径：相对路径会被运行期按插件进程 cwd 解析，规则永远不命中。 */
+export function isAbsoluteWorkspacePath(raw: unknown): boolean {
+  const text = String(raw ?? '').trim()
+  if (!text) return false
+  return text.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(text) || text.startsWith('\\\\')
+}
+
+/**
+ * 工作区规则行归一化（纯函数，便于单测与保存前校验）。
+ *
+ * - 只保留有路径、且 teamId / agentId 至少填了一个的行；
+ * - 路径必须是绝对路径（相对路径运行期永远匹配不上会话 cwd，属于静默失效）；
+ * - 判重按 `workspacePathKey()`，与运行期的 `normalizeWorkspacePath()` 同口径：
+ *   `/repo/a/` 与 `/repo/a` 算**同一条**，报错拦下保存，而不是静默丢一条；
+ * - 不改存储里的路径写法（规范化仍在 config.mjs 做），只用于判重与校验。
+ */
+export function sanitizeWorkspaceAgents(rows: unknown): {
+  rows: Array<{ workspace: string; title: string; teamId: string; agentId: string }>
+  error: string
+} {
+  const list = Array.isArray(rows) ? rows : []
+  const seen = new Map<string, string>()
+  const out: Array<{ workspace: string; title: string; teamId: string; agentId: string }> = []
+  for (const row of list) {
+    if (!row || typeof row !== 'object') continue
+    const workspace = String((row as Record<string, unknown>).workspace ?? '').trim()
+    const title = String((row as Record<string, unknown>).title ?? '').trim()
+    const teamId = String((row as Record<string, unknown>).teamId ?? '').trim()
+    const agentId = String((row as Record<string, unknown>).agentId ?? '').trim()
+    if (!workspace) continue
+    if (!teamId && !agentId) continue
+    if (!isAbsoluteWorkspacePath(workspace)) {
+      return { rows: out, error: `工作区必须是绝对路径：${workspace}` }
+    }
+    const key = workspacePathKey(workspace)
+    const previous = seen.get(key)
+    if (previous !== undefined) {
+      return {
+        rows: out,
+        error: previous === workspace
+          ? `工作区重复：${workspace}`
+          : `工作区重复：${previous} 与 ${workspace} 是同一个目录`,
+      }
+    }
+    seen.set(key, workspace)
+    out.push({ workspace, title, teamId, agentId })
+  }
+  return { rows: out, error: '' }
+}
+
+/** 把配置里的 workspaceAgents（数组 / JSON 字符串 / 空串）读成可编辑行。 */
+export function asWorkspaceRows(raw: unknown): Array<{ workspace: string; title: string; teamId: string; agentId: string }> {
+  let value = raw
+  if (typeof raw === 'string') {
+    const text = raw.trim()
+    if (!text) return []
+    try { value = JSON.parse(text) } catch { return [] }
+  }
+  if (!Array.isArray(value)) return []
+  return value.flatMap((row) => {
+    if (!row || typeof row !== 'object') return []
+    const workspace = String((row as Record<string, unknown>).workspace ?? '').trim()
+    if (!workspace) return []
+    return [{
+      workspace,
+      title: String((row as Record<string, unknown>).title ?? '').trim(),
+      teamId: String((row as Record<string, unknown>).teamId ?? '').trim(),
+      agentId: String((row as Record<string, unknown>).agentId ?? '').trim(),
+    }]
+  })
 }
 
 /**
@@ -338,8 +418,7 @@ export function missingIdentity(value: Record<string, unknown> | undefined): str
  *     区间约束与 override 语义才干净），越界按 [min, max] 收敛并把收敛结果回填草稿（patch）
  *     + 记一句提示（adjusted）。
  *
- * @returns ops 提交给 scope.mutate；patch 回填草稿；adjusted 面向用户的收敛说明；
- *          error 非空时不提交、直接提示（例如数字框里填了非数字）。
+ * `workspaceAgents` 是数组：走通用分支，整表 `set`（数组在 settings.mutate 里是整体替换）。
  */
 export function buildSaveOps(
   draft: Record<string, unknown>,
@@ -371,8 +450,13 @@ export function buildSaveOps(
       continue
     }
     const v = draft[key]
-    if (typeof v === 'string' && v === '') ops.push({ op: 'unset', path: [key] })
-    else ops.push({ op: 'set', path: [key], value: v })
+    if (typeof v === 'string' && v === '') {
+      ops.push({ op: 'unset', path: [key] })
+      patch[key] = ''
+    } else {
+      ops.push({ op: 'set', path: [key], value: v })
+      patch[key] = v
+    }
   }
 
   return { ops, patch, adjusted, error: '' }
@@ -380,6 +464,7 @@ export function buildSaveOps(
 
 const C = {
   border: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.35))',
+  borderSoft: '1px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.22))',
   guide: '2px solid var(--dsw-alias-border-l2, rgba(127,127,127,0.30))',
   tertiary: 'var(--dsw-alias-label-tertiary, rgba(127,127,127,0.8))',
   secondary: 'var(--dsw-alias-label-secondary, inherit)',
@@ -391,17 +476,9 @@ function blankSecrets(value: Record<string, unknown>): Record<string, unknown> {
   return next
 }
 
-/**
- * 身份不全的告警：这是"开关都开着但什么都没注入"最常见的原因。
- * 放在读侧那组下面、紧挨着开关 —— 用户改开关时第一眼就能看到。
- */
-function identityWarningNote(missing: string[], readOn: boolean): React.ReactNode {
-  if (!readOn || missing.length === 0) return null
-  return (
-    <p style={{ color: C.tertiary, margin: '6px 0 0', fontSize: '12px' }} role="status">
-      ⚠️ 身份未填全（缺 {missing.join(' / ')}）→ 读侧（召回 / 注入 / 工具）实际不会生效；「对话回流」不受影响。
-    </p>
-  )
+function workspaceBasename(workspace: string): string {
+  const parts = workspace.split(/[\\/]/).filter(Boolean)
+  return parts[parts.length - 1] || workspace
 }
 
 /**
@@ -428,14 +505,51 @@ export interface SettingsDescribeFace {
   subscribe(listener: () => void): () => void
 }
 
-function TdaiMemoryCard(props: { form: SettingsForm; describe?: SettingsDescribeFace; entryId?: string }) {
-  const { form, describe } = props
+/** 设置页标准 props 里的 workspace 快照（结构类型；缺失时退回手填路径）。 */
+export interface WorkspacesFace {
+  (selector?: (snapshot: any) => any): any
+}
+
+/**
+ * `useWorkspaces` 缺失时的占位实现：让调用点保持**无条件**，hooks 数量不随 props 变化。
+ * 没有工作区快照时面板退化为手填绝对路径（`workspaceOptions` 为空 → 换 placeholder）。
+ */
+const noWorkspaces: WorkspacesFace = () => undefined
+
+interface CardProps {
+  form: SettingsForm
+  describe?: SettingsDescribeFace
+  entryId?: string
+  /** 测试 / 深链用：指定初始 Tab；应用不传，默认「读侧」。 */
+  initialTab?: TabId
+  /** 设置页标准 props 注入；缺失时工作区选择退化为手填路径。 */
+  useWorkspaces?: WorkspacesFace
+}
+
+function TdaiMemoryCard(props: CardProps) {
+  const { form, describe, useWorkspaces } = props
   const entryId = props.entryId ?? NS
   const [snap, setSnap] = React.useState(() => form.getSnapshot())
   const [draft, setDraft] = React.useState<Record<string, unknown> | null>(null)
   const [touched, setTouched] = React.useState<Set<string>>(() => new Set())
   const [note, setNote] = React.useState('')
+  /**
+   * 保存锁必须是独立状态，不能从 `note` 推断。
+   *
+   * 旧写法 `saving = note === '保存中…'` 会让**任何**清空 note 的操作（切 Tab 就会）
+   * 在请求在飞时把锁摘掉：输入框重新可编辑，保存成功后又整体 `setTouched(new Set())`，
+   * 于是这段时间里的编辑既没提交、也不再算"未保存"，关掉面板就丢了。
+   */
+  const [saving, setSaving] = React.useState(false)
+  const [tab, setTab] = React.useState<TabId>(props.initialTab ?? 'read')
+  const [newWorkspace, setNewWorkspace] = React.useState('')
+  const [workspaceNote, setWorkspaceNote] = React.useState('')
   React.useEffect(() => form.subscribe(() => setSnap(form.getSnapshot())), [form])
+
+  // 设置页把 useWorkspaces 作为标准 props 传进来。它不是必须的：没有它也能手填路径。
+  // **无条件调用**（缺失时换成空实现）：条件调用会在 props 有无变化时改变 hook 数量，
+  // React 会直接抛 "Rendered more hooks than during the previous render"。
+  const workspaceSnap = (useWorkspaces ?? noWorkspaces)((snapshot: any) => snapshot)
 
   // secret 的"是否已设置"侧信道（值本身跨 wire 就被删掉了）
   const [dsnap, setDsnap] = React.useState(() => describe?.getSnapshot())
@@ -448,21 +562,8 @@ function TdaiMemoryCard(props: { form: SettingsForm; describe?: SettingsDescribe
     return entry?.secrets?.some((s) => s.path.length === 1 && s.path[0] === key && s.set) === true
   }
 
-  if (snap.status === 'unavailable') {
-    // 无条件注册成顶层设置页之后，这个分支是有意的"自解释失败"：
-    // 页面在 → 说明客户端半边已加载；这句在 → 说明宿主没暴露本插件的设置命名空间。
-    // 两者都没有 → 客户端半边根本没加载（那是另一类问题，别再猜这一层）。
-    return (
-      <div style={{ border: C.border, borderRadius: '12px', padding: '14px 16px' }} role="status">
-        <div style={{ fontSize: '14px', fontWeight: 600 }}>TDAI Memory</div>
-        <div style={{ color: C.tertiary, fontSize: '13px', marginTop: '6px' }}>
-          设置当前不可用：宿主没有暴露本插件的设置命名空间（<code>{entryId}</code>）。
-          请确认 dsh-tdai-memory-plugin 已在 profile 中启用（entry 状态应为 <code>schema</code>），
-          并检查宿主日志里是否有 <code>[tdai-memory]</code> 的报错。
-        </div>
-      </div>
-    )
-  }
+  // 所有 hooks 必须在任何 early return 之前调用：snap.status 从 loading 变 ready 时
+  // 组件会重渲染，hook 顺序变化会让 React 直接抛错。
   const current = snap.status === 'ready' && snap.value ? snap.value as Record<string, unknown> : {}
   const writable = snap.writable !== false
 
@@ -471,24 +572,42 @@ function TdaiMemoryCard(props: { form: SettingsForm; describe?: SettingsDescribe
     if (snap.status === 'ready' && draft === null) setDraft(blankSecrets(current))
   }, [snap.status, current, draft])
 
+  const workspaceOptions = React.useMemo(() => {
+    const items = workspaceSnap?.items
+    if (!Array.isArray(items)) return [] as Array<{ path: string; title: string }>
+    return items
+      .map((item: any) => ({ path: String(item?.path ?? ''), title: String(item?.title ?? '') }))
+      .filter((item: { path: string }) => item.path)
+  }, [workspaceSnap])
+
+  if (snap.status === 'unavailable') {
+    return (
+      <div style={rootStyle} role="status">
+        <div style={{ fontSize: '14px', fontWeight: 600 }}>TDAI Memory</div>
+        <div style={{ color: C.tertiary, fontSize: '13px', marginTop: '6px', lineHeight: 1.5 }}>
+          设置当前不可用：宿主没有暴露本插件的设置命名空间（<code>{entryId}</code>）。
+          请确认 dsh-tdai-memory-plugin 已在 profile 中启用（entry 状态应为 <code>schema</code>），
+          并检查宿主日志里是否有 <code>[tdai-memory]</code> 的报错。
+        </div>
+      </div>
+    )
+  }
+
   const value: Record<string, unknown> = draft ?? current
   const dirty = touched.size > 0
-  const saving = note === '保存中…'
 
-  // ── 依赖链的实时状态：用来置灰"当前不生效"的项 ────────────────────────────
-  const readOn = value.enabled !== false
-  const recallOn = value.recallEnabled !== false
-  const skillOn = value.skillsEnabled !== false
-  const injectOn = value.injectionEnabled !== false
-  // 身份不全 → 读侧整体不生效（readEnabled = enabled && identityComplete）。
-  // 只在快照就绪后判断，否则首帧 current 为空会误报。
+  // 开关一律按"有效布尔值"判（schema 允许字符串，见 boolOn 注释）。
+  const readOn = boolOn(value.enabled)
+  const recallOn = boolOn(value.recallEnabled)
+  const skillOn = boolOn(value.skillsEnabled)
+  const injectOn = boolOn(value.injectionEnabled)
+  const writeOn = boolOn(value.captureEnabled)
   const missingIdentityKeys = snap.status === 'ready' ? missingIdentity(value) : []
+  const workspaceRows = asWorkspaceRows(value.workspaceAgents)
+  const workspaceOn = boolOn(value.workspaceAgentsEnabled, false)
 
-  /**
-   * Bot 会话那组的串联判定：`dimmedBy` 里**任一**开关关闭 → 本项置灰。
-   * 默认关的项（回写 / 复用 / persona…）在快照缺字段时按"关"算，所以不能只看 `=== false`。
-   */
-  const switchOff = (key: string) => (DEFAULT_OFF_KEYS.has(key) ? value[key] !== true : value[key] === false)
+  const switchOff = (key: string) =>
+    (DEFAULT_OFF_KEYS.has(key) ? !boolOn(value[key], false) : !boolOn(value[key], true))
   const dsbotDim = (t: { dimmedBy?: string[] }) => {
     const offParent = (t.dimmedBy ?? []).find(switchOff)
     return {
@@ -503,40 +622,102 @@ function TdaiMemoryCard(props: { form: SettingsForm; describe?: SettingsDescribe
     setNote('')
   }
 
+  const editWorkspaces = (rows: Array<{ workspace: string; title: string; teamId: string; agentId: string }>) => {
+    edit('workspaceAgents', rows)
+  }
+
+  const updateWorkspaceRow = (index: number, patch: Partial<{ title: string; teamId: string; agentId: string }>) => {
+    editWorkspaces(workspaceRows.map((row, i) => (i === index ? { ...row, ...patch } : row)))
+  }
+
+  const removeWorkspaceRow = (index: number) => {
+    editWorkspaces(workspaceRows.filter((_, i) => i !== index))
+    setWorkspaceNote('')
+  }
+
+  const addWorkspaceRow = () => {
+    const path = newWorkspace.trim()
+    if (!path) {
+      setWorkspaceNote('先填写或选择一个工作区路径')
+      return
+    }
+    if (!isAbsoluteWorkspacePath(path)) {
+      setWorkspaceNote(`工作区必须是绝对路径：${path}`)
+      return
+    }
+    // 判重键与运行期同口径（`/repo/a/` 与 `/repo/a` 是同一条），否则存下去会被后者覆盖
+    const key = workspacePathKey(path)
+    const duplicate = workspaceRows.find((row) => workspacePathKey(row.workspace) === key)
+    if (duplicate) {
+      setWorkspaceNote(duplicate.workspace === path
+        ? '这个工作区已经在列表里了'
+        : `这个目录已经在列表里了（${duplicate.workspace}）`)
+      return
+    }
+    const matched = workspaceOptions.find((item) => workspacePathKey(item.path) === key)
+    editWorkspaces([...workspaceRows, { workspace: path, title: matched?.title ?? '', teamId: '', agentId: '' }])
+    setNewWorkspace('')
+    setWorkspaceNote('')
+  }
+
   const reset = () => {
     setDraft(blankSecrets(current))
     setTouched(new Set())
     setNote('')
+    setWorkspaceNote('')
   }
 
   const save = () => {
     if (!draft || touched.size === 0) return
-    // 归一化（空串=unset、数值=number 且收敛到 schema 区间）在纯函数里做，见 buildSaveOps
-    const { ops, patch, adjusted, error: invalid } = buildSaveOps(draft, touched)
+    let nextDraft = draft
+    if (touched.has('workspaceAgents')) {
+      const sanitized = sanitizeWorkspaceAgents(draft.workspaceAgents)
+      if (sanitized.error) {
+        setNote(sanitized.error)
+        return
+      }
+      nextDraft = { ...draft, workspaceAgents: sanitized.rows }
+      setDraft(nextDraft)
+    }
+    const { ops, patch, adjusted, error: invalid } = buildSaveOps(nextDraft, touched)
     if (invalid) { setNote(invalid); return }
 
+    // 只清「本次真正提交成功的键」：请求在飞时用户仍可能继续编辑（Tab 切换不再摘锁，
+    // 但慢网关上保存锁本身也可能被超时/失败放开），整表清空会把这些编辑吞掉。
+    const submitted = new Set(touched)
+    setSaving(true)
     setNote('保存中…')
-    Promise.resolve(form.mutate(ops))
-      .then(() => {
-        // 回填草稿：让面板显示与真正落库的值一致（数值字段会把 "07" / 50 收敛掉）
+    // 放进微任务里调用：`form.mutate` 若**同步**抛错，直接写 `Promise.resolve(form.mutate(...))`
+    // 会绕过下面的 catch，`saving` 停在 true 把整个面板锁死。
+    Promise.resolve()
+      .then(() => form.mutate(ops))
+      .then((ok) => {
+        // 宿主用 `false` 表示"拒绝写入 / 未写入"（不是抛错）。当成成功会显示"已保存"
+        // 而实际没落盘，用户回面板看到的还是旧值。
+        if (ok === false) {
+          setNote('保存失败：宿主拒绝了本次写入（可能有其他窗口同时修改，请重试）')
+          return
+        }
         setDraft((d) => (d ? { ...d, ...patch } : d))
         setNote(adjusted.length > 0 ? `已保存（${adjusted.join('；')}）` : '已保存')
-        setTouched(new Set())
+        setTouched((previous) => new Set([...previous].filter((key) => !submitted.has(key))))
       })
       .catch((error) => setNote(`保存失败：${error?.message ?? '未知错误'}`))
+      .finally(() => setSaving(false))
   }
 
   const fieldRow = (label: React.ReactNode, control: React.ReactNode, key: string) => (
-    <div key={key} style={{ display: 'flex', flexDirection: 'column', gap: '6px', padding: '12px 0', borderTop: C.border }}>
-      <div style={{ fontSize: '13px', color: C.secondary }}>{label}</div>
+    <div key={key} style={fieldRowStyle}>
+      <div style={labelStyle}>{label}</div>
       {control}
     </div>
   )
 
-  /**
-   * 普通文本框行（路径类，**不是身份字段**）：这条路径不参与身份告警 / secret 脱敏，
-   * 只跟着自己的 `dimmedBy` 置灰（当前只有台账路径一项）。
-   */
+  const inputStyleFor = (dim = false): React.CSSProperties => ({
+    ...inputStyle,
+    opacity: dim ? 0.55 : 1,
+  })
+
   const textFieldRow = (
     f: { key: string; label: string; hint?: string; placeholder?: string; dimmedBy?: string[] },
     dim: boolean,
@@ -544,31 +725,20 @@ function TdaiMemoryCard(props: { form: SettingsForm; describe?: SettingsDescribe
   ) => {
     const shown = typeof value[f.key] === 'string' ? value[f.key] as string : ''
     return (
-      <div
-        key={f.key}
-        title={dim ? dimReason : undefined}
-        style={{ display: 'flex', flexDirection: 'column', gap: '6px', padding: '12px 0', borderTop: C.border, opacity: dim ? 0.55 : 1 }}
-      >
-        <div style={{ fontSize: '13px', color: C.secondary }}>
-          {f.label}
-          {f.hint ? <span style={{ color: C.tertiary, marginLeft: '6px', fontSize: '12px' }}>{f.hint}</span> : null}
-        </div>
+      <div key={f.key} title={dim ? dimReason : undefined} style={{ ...fieldRowStyle, opacity: dim ? 0.55 : 1 }}>
+        <div style={labelStyle}>{f.label}</div>
         <input
           type="text"
           value={shown}
           placeholder={f.placeholder}
           disabled={!writable || saving}
-          style={inputStyle}
+          style={inputStyleFor(dim)}
           onChange={(e) => edit(f.key, e.target.value)}
         />
+        {f.hint ? <div style={hintStyle}>{f.hint}</div> : null}
       </div>
     )
   }
-
-  const inputStyle = {
-    appearance: 'none', width: '100%', padding: '8px 12px', borderRadius: '8px',
-    border: C.border, background: 'transparent', color: 'inherit', font: 'inherit', fontSize: '13px',
-  } as const
 
   const ghostBtn = {
     appearance: 'none', font: 'inherit', fontSize: '13px', lineHeight: 1.5,
@@ -583,184 +753,245 @@ function TdaiMemoryCard(props: { form: SettingsForm; describe?: SettingsDescribe
     color: 'var(--dsw-alias-bg-layer-3, rgba(127,127,127,0.05))', opacity: dirty ? 1 : 0.4,
   } as const
 
-  /** 每组开关的横向流式布局：**逐项 nowrap**，checkbox 与标签永不拆行。 */
-  const flowStyle = { display: 'flex', flexWrap: 'wrap', gap: '2px 18px', alignItems: 'center' } as const
-
-  const groupTitle = (text: string) => (
-    <div style={{ fontSize: '12px', fontWeight: 600, color: C.tertiary, letterSpacing: '.02em', padding: '12px 0 2px' }}>{text}</div>
-  )
-
-  /**
-   * 一个开关项。`dim` = 当前被上层开关关掉了 → 置灰 + tooltip 说明原因，
-   * 但**仍可点击**（允许先配好再开总闸，比强制顺序更省事）。
-   */
-  const toggleItem = (
+  const toggleRow = (
     t: { key: string; label: string; hint?: string; defaultOff?: boolean; dimmedBy?: string[] },
     dim: boolean,
     dimReason: string,
   ) => {
-    // 默认开的项用 `!== false`（快照里缺字段也算开），默认关的项必须显式 `=== true`。
-    const checked = t.defaultOff === true ? value[t.key] === true : value[t.key] !== false
+    // 有效布尔值（env 传的是字符串 "true"/"false"，见 boolOn 注释）：默认关的开关
+    // 缺省 = 关，默认开的开关缺省 = 开。
+    const checked = boolOn(value[t.key], t.defaultOff !== true)
     return (
-      <label
-        key={t.key}
-        title={dim ? dimReason : undefined}
-        style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap', fontSize: 13, padding: '5px 0', cursor: writable ? 'pointer' : 'default', opacity: dim ? 0.55 : 1 }}
-      >
-        <input type="checkbox" checked={checked} disabled={!writable || saving} onChange={(e) => edit(t.key, e.target.checked)} style={{ width: 15, height: 15, accentColor: 'var(--dsw-alias-label-primary, #5b8def)', cursor: 'pointer', flex: 'none' }} />
-        <span>{t.label}</span>
-        {t.hint ? <span style={{ color: C.tertiary, fontSize: '12px', marginLeft: '2px' }}>{t.hint}</span> : null}
+      <label key={t.key} title={dim ? dimReason : undefined} style={{ ...toggleStyle, opacity: dim ? 0.55 : 1 }}>
+        <input
+          type="checkbox"
+          checked={checked}
+          disabled={!writable || saving}
+          onChange={(e) => edit(t.key, e.target.checked)}
+          style={checkboxStyle}
+        />
+        <span style={toggleTextStyle}>
+          <span>{t.label}</span>
+          {t.hint ? <span style={hintStyle}>{t.hint}</span> : null}
+        </span>
       </label>
     )
   }
 
-  /** 数字输入行（草稿存字符串，保存时收敛成 number 且收敛到 schema 区间，见 buildSaveOps）。 */
   const numericRow = (key: string, hint: string, dim: boolean, dimReason: string) => {
     const meta = NUMERIC_FIELDS[key]
     const raw = draft ? draft[key] : current[key]
     const shown = raw === undefined || raw === null ? '' : String(raw)
     return (
-      <span
-        key={key}
-        title={dim ? dimReason : undefined}
-        style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap', fontSize: 13, padding: '5px 0', opacity: dim ? 0.55 : 1 }}
-      >
-        <span style={{ color: C.secondary }}>{meta.label}</span>
-        <input
-          type="number"
-          min={meta.min}
-          max={meta.max}
-          step={1}
-          value={shown}
-          placeholder={String(meta.dflt)}
-          disabled={!writable || saving}
-          onChange={(e) => edit(key, e.target.value)}
-          style={{ appearance: 'textfield', width: 56, padding: '3px 6px', borderRadius: '6px', border: C.border, background: 'transparent', color: 'inherit', font: 'inherit', fontSize: 13, textAlign: 'center' }}
-        />
-        <span style={{ color: C.tertiary, fontSize: 12 }}>{hint}</span>
-      </span>
+      <div key={key} title={dim ? dimReason : undefined} style={{ ...numericStyle, opacity: dim ? 0.55 : 1 }}>
+        <div style={numericLineStyle}>
+          <span style={{ color: C.secondary }}>{meta.label}</span>
+          <input
+            type="number"
+            min={meta.min}
+            max={meta.max}
+            step={1}
+            value={shown}
+            placeholder={String(meta.dflt)}
+            disabled={!writable || saving}
+            onChange={(e) => edit(key, e.target.value)}
+            style={numberInputStyle}
+          />
+        </div>
+        <div style={hintStyle}>{hint}</div>
+      </div>
     )
   }
 
-  /** L1 召回条数上限（挂在「L1 自动召回」下）。 */
-  const recallLimitRow = () => numericRow(
-    'recallLimit',
-    '条（自有 + 借入合并后的上限，1–20；实际还受 4000 字符预算约束）',
-    !readOn || !recallOn,
-    !readOn ? READ_DIM_REASON : RECALL_DIM_REASON,
+  /** 一个可折叠分组。原生 details 不依赖 JS；测试也能拿到隐藏内容。 */
+  const section = (
+    title: string,
+    summary: string,
+    children: React.ReactNode,
+    options: { open?: boolean; key?: string } = {},
+  ) => (
+    <details key={options.key ?? title} open={options.open} className="tdai-section" style={sectionStyle}>
+      <summary style={summaryStyle}>
+        <span className="tdai-chevron" aria-hidden="true">▸</span>
+        <span style={summaryTitleStyle}>{title}</span>
+        <span style={summaryHintStyle}>{summary}</span>
+      </summary>
+      <div style={sectionBodyStyle}>{children}</div>
+    </details>
   )
 
-  return (
-    <div style={{ border: C.border, background: 'var(--dsw-alias-bg-layer-3, rgba(127,127,127,0.05))', borderRadius: '12px' }}>
-      {/* 顶层设置页已由左侧导航承担"标题"职责，这里不再放可折叠头部：
-          少一次点击，进页面即见全部开关（2026-09-25 改）。 */}
-      <div style={{ margin: '0 16px', paddingTop: '4px' }}>
-        {!writable && <p style={{ color: C.tertiary, margin: '12px 0 4px', fontSize: '12px' }} role="status">当前设置为只读。</p>}
+  const identityWarning = () => {
+    if (!readOn || missingIdentityKeys.length === 0) return null
+    return (
+      <p style={warningStyle} role="status">
+        ⚠️ 默认身份未填全（缺 {missingIdentityKeys.join(' / ')}）→ 读侧（召回 / 注入 / 工具）默认不生效；
+        若某个工作区覆盖补全了缺失字段，该工作区仍可用。「对话回流」不受影响。
+      </p>
+    )
+  }
 
-            {/* ── 读侧：把记忆读进上下文（召回 / 注入 / 只读工具）─────────────── */}
-            {groupTitle('读侧 · 把记忆读进上下文')}
-            <div style={flowStyle}>
-              {toggleItem(READ_MASTER, false, '')}
-              {toggleItem(RECALL_TOGGLE, !readOn, READ_DIM_REASON)}
-              {/* 条数上限紧跟「L1 自动召回」，读起来是同一件事 */}
-              {recallLimitRow()}
-              {/* 云端 skill 召回同样是"每轮读进上下文"，但不走 system 段，
-                  所以放在注入总闸**之前**，不被它置灰 */}
-              {toggleItem(SKILL_RECALL_TOGGLE, !readOn, READ_DIM_REASON)}
-              {/* 两个旋钮紧跟它：实际注入条数 = 过分数闸门后的前 N 条 */}
-              {numericRow('skillRecallLimit', '条（每轮最多注入几条命中，1–10）',
-                !readOn || !skillOn, !readOn ? READ_DIM_REASON : SKILL_RECALL_DIM_REASON)}
-              {numericRow('skillRecallMinScore', '分以下不注入（默认 4；0 = 关掉闸门）',
-                !readOn || !skillOn, !readOn ? READ_DIM_REASON : SKILL_RECALL_DIM_REASON)}
-              {toggleItem(INJECT_MASTER, !readOn, READ_DIM_REASON)}
-            </div>
-            {identityWarningNote(missingIdentityKeys, readOn)}
-            {/* 注入段挂在「System prompt 注入」下：缩进 + 竖线表示从属关系 */}
-            <div style={{ ...flowStyle, paddingLeft: 22, marginLeft: 2, marginTop: 2, borderLeft: C.guide }}>
-              {INJECT_TOGGLES.map((t) => {
-                // 多级从属（agentPromptKeepBase ← agentPromptEnabled ← sessionContext）
-                // 也要算置灰原因，否则用户会以为"打开了但没生效"。
-                const offParent = (t.dimmedBy ?? []).find((k: string) => value[k] === false)
-                const dim = !readOn || !injectOn || offParent !== undefined
-                const reason = !readOn ? READ_DIM_REASON
-                  : (!injectOn ? INJECT_DIM_REASON : (DEP_DIM_REASON[offParent as string] ?? INJECT_DIM_REASON))
-                return toggleItem(t, dim, reason)
-              })}
-            </div>
+  const readTab = (
+    <div>
+      {section('召回', 'L1 记忆 + 云端 skill', (
+        <>
+          {toggleRow(READ_MASTER, false, '')}
+          {toggleRow(RECALL_TOGGLE, !readOn, READ_DIM_REASON)}
+          {numericRow('recallLimit', '条（自有 + 借入合并后的上限，1–20；实际还受 4000 字符预算约束）', !readOn || !recallOn, !readOn ? READ_DIM_REASON : RECALL_DIM_REASON)}
+          {toggleRow(SKILL_RECALL_TOGGLE, !readOn, READ_DIM_REASON)}
+          {numericRow('skillRecallLimit', '条（每轮最多注入几条命中，1–10）', !readOn || !skillOn, !readOn ? READ_DIM_REASON : SKILL_RECALL_DIM_REASON)}
+          {numericRow('skillRecallMinScore', '分以下不注入（默认 4；0 = 关掉闸门）', !readOn || !skillOn, !readOn ? READ_DIM_REASON : SKILL_RECALL_DIM_REASON)}
+        </>
+      ), { open: true, key: 'recall' })}
 
-            {/* ── 写侧：把对话回流给 MemoryCore（与读侧完全独立）─────────────── */}
-            {groupTitle('写侧 · 把对话回流给 MemoryCore')}
-            <div style={flowStyle}>
-              {WRITE_TOGGLES.map((t) => toggleItem(t, false, ''))}
-            </div>
-
-            {/* ── 子 agent：能力面拆分（读侧只关身份/记忆，写侧独立）───────────── */}
-            {groupTitle('子 agent · 委派出去的子会话')}
-            <div style={flowStyle}>
-              {toggleItem(SUBAGENT_INJECT_TOGGLE, !readOn, READ_DIM_REASON)}
-              {toggleItem(SUBAGENT_CAPTURE_TOGGLE, false, '')}
-            </div>
-
-            {/* ── Bot 会话（ds-bot）：识别总闸 + 读/写子开关 + 群聊蒸馏 ──────────
-                身份与记忆对 Bot 会话**恒关**，所以这里没有对应开关（方案 §3.1 明确不给）：
-                角色权威归 ds-bot，本阶段也没有「每 Bot 一个 tdai agent」。 */}
-            {groupTitle('Bot 会话 · ds-bot')}
-            <p style={{ color: C.tertiary, margin: '0 0 2px', fontSize: '12px' }}>
-              识别 ds-bot 的 Bot / 房间会话：读侧只注入云端 skill，写侧按人锚点回写；
-              身份与记忆对 Bot 会话恒不注入（没有开关）。
-            </p>
-            <div style={flowStyle}>
-              {DSBOT_TOGGLES.map((t) => {
-                const d = dsbotDim(t)
-                return toggleItem(t, d.dim, d.reason)
-              })}
-            </div>
-            {/* 蒸馏三项挂在「Bot 会话回写记忆」下：回写关着时蒸馏没有意义 */}
-            <div style={{ ...flowStyle, paddingLeft: 22, marginLeft: 2, marginTop: 2, borderLeft: C.guide }}>
-              {(() => {
-                const d = dsbotDim(BOT_CONTEXT_DISTILL_TOGGLE)
-                return toggleItem(BOT_CONTEXT_DISTILL_TOGGLE, d.dim, d.reason)
-              })()}
-              {(() => {
-                const d = dsbotDim(NUMERIC_FIELDS.botContextMessages)
-                return numericRow(
-                  'botContextMessages',
-                  '条（0 = 不蒸；窗口取断点之后、锚点之前的最后 N 条，0–20）',
-                  d.dim, d.reason,
-                )
-              })()}
-              {(() => {
-                const d = dsbotDim(NUMERIC_FIELDS.botContextMaxTokens)
-                return numericRow(
-                  'botContextMaxTokens',
-                  'token（输出上限，100–32000；思考 token 也从这里扣，摘要正文通常只花 200–300）',
-                  d.dim, d.reason,
-                )
-              })()}
-              {(() => {
-                const d = dsbotDim(NUMERIC_FIELDS.botContextTimeoutMs)
-                return numericRow(
-                  'botContextTimeoutMs',
-                  '毫秒（2000–60000；思考型模型建议 ≥15000，超时只写人话）',
-                  d.dim, d.reason,
-                )
-              })()}
-              {(() => {
-                const d = dsbotDim(BOT_CONTEXT_REUSE_TOGGLE)
-                return toggleItem(BOT_CONTEXT_REUSE_TOGGLE, d.dim, d.reason)
-              })()}
-            </div>
-            {TEXT_FIELDS.map((f) => {
-              const d = dsbotDim(f)
-              return textFieldRow(f, d.dim, d.reason)
+      {section('System prompt 注入', '身份 / 画像 / 知识路由', (
+        <>
+          {toggleRow(INJECT_MASTER, !readOn, READ_DIM_REASON)}
+          <div style={indentStyle}>
+            {INJECT_TOGGLES.map((t) => {
+              // 与 dsbotDim 同口径：置灰判据也走 switchOff（env 字符串值同样成立）
+              const offParent = (t.dimmedBy ?? []).find((k: string) => switchOff(k))
+              const dim = !readOn || !injectOn || offParent !== undefined
+              const reason = !readOn ? READ_DIM_REASON
+                : (!injectOn ? INJECT_DIM_REASON : (DEP_DIM_REASON[offParent as string] ?? INJECT_DIM_REASON))
+              return toggleRow(t, dim, reason)
             })}
+          </div>
+          {identityWarning()}
+        </>
+      ), { open: true, key: 'inject' })}
+    </div>
+  )
 
-            {/* ── 身份与地址（readEnabled = 读侧总开关 && 身份齐全）───────────── */}
-            {groupTitle('身份与地址')}
+  const writeTab = (
+    <div>
+      {section('对话回流', '写侧独立开关', (
+        <>
+          {WRITE_TOGGLES.map((t) => toggleRow(t, false, ''))}
+          <p style={plainHintStyle}>写侧与读侧完全独立：读侧全关也照常回流；回流写 L0 并触发 Skill 归档。</p>
+        </>
+      ), { open: true, key: 'write' })}
+
+      {section('子 agent', '委派出去的子会话', (
+        <>
+          {toggleRow(SUBAGENT_CAPTURE_TOGGLE, false, '')}
+          <p style={plainHintStyle}>子 agent 的读侧继承在「Bot 与子 agent」页；这里只管它的执行过程是否回流。</p>
+        </>
+      ), { open: true, key: 'subagent-write' })}
+    </div>
+  )
+
+  const botTab = (
+    <div>
+      {section('Bot 会话 · ds-bot', '识别总闸 + 读写子开关', (
+        <>
+          <p style={plainHintStyle}>
+            识别 ds-bot 的 Bot / 房间会话：读侧只注入云端 skill，写侧按人锚点回写；
+            身份与记忆对 Bot 会话恒不注入（没有开关）。
+          </p>
+          {DSBOT_TOGGLES.map((t) => {
+            const d = dsbotDim(t)
+            return toggleRow(t, d.dim, d.reason)
+          })}
+          <div style={indentStyle}>
+            {(() => {
+              const d = dsbotDim(BOT_CONTEXT_DISTILL_TOGGLE)
+              return toggleRow(BOT_CONTEXT_DISTILL_TOGGLE, d.dim, d.reason)
+            })()}
+            {(() => {
+              const d = dsbotDim(BOT_CONTEXT_REUSE_TOGGLE)
+              return toggleRow(BOT_CONTEXT_REUSE_TOGGLE, d.dim, d.reason)
+            })()}
+          </div>
+        </>
+      ), { open: true, key: 'dsbot' })}
+
+      {section('群聊蒸馏参数', '高级 · 默认收起', (
+        <>
+          {(() => {
+            const d = dsbotDim(NUMERIC_FIELDS.botContextMessages)
+            return numericRow('botContextMessages', '条（0 = 不蒸；窗口取断点之后、锚点之前的最后 N 条，0–20）', d.dim, d.reason)
+          })()}
+          {(() => {
+            const d = dsbotDim(NUMERIC_FIELDS.botContextMaxTokens)
+            return numericRow('botContextMaxTokens', 'token（输出上限，100–32000；思考 token 也从这里扣，摘要正文通常只花 200–300）', d.dim, d.reason)
+          })()}
+          {(() => {
+            const d = dsbotDim(NUMERIC_FIELDS.botContextTimeoutMs)
+            return numericRow('botContextTimeoutMs', '毫秒（2000–60000；思考型模型建议 ≥15000，超时只写人话）', d.dim, d.reason)
+          })()}
+          {BOT_TEXT_FIELDS.map((f) => {
+            const d = dsbotDim(f)
+            return textFieldRow(f, d.dim, d.reason)
+          })}
+        </>
+      ), { open: false, key: 'distill' })}
+
+      {section('子 agent', '读侧能力面', (
+        <>
+          {toggleRow(SUBAGENT_INJECT_TOGGLE, !readOn, READ_DIM_REASON)}
+          <p style={plainHintStyle}>
+            默认关：子会话只保留团队知识库与只读工具，不注入身份 / 记忆 / 云端 skill 召回。
+          </p>
+        </>
+      ), { open: true, key: 'subagent-read' })}
+    </div>
+  )
+
+  const workspaceRow = (row: { workspace: string; title: string; teamId: string; agentId: string }, index: number) => (
+    <div key={`${row.workspace}-${index}`} style={workspaceCardStyle}>
+      <div style={workspaceHeaderStyle}>
+        <div style={{ minWidth: 0, flex: 1 }}>
+          <div style={workspaceTitleStyle}>{row.title || workspaceBasename(row.workspace)}</div>
+          <div style={workspacePathStyle}>{row.workspace}</div>
+        </div>
+        <button
+          type="button"
+          disabled={!writable || saving}
+          onClick={() => removeWorkspaceRow(index)}
+          style={miniGhostBtn}
+        >
+          移除
+        </button>
+      </div>
+      <div style={workspaceInputsStyle}>
+        <label style={workspaceFieldStyle}>
+          <span style={workspaceFieldLabelStyle}>Team ID</span>
+          <input
+            type="text"
+            value={row.teamId}
+            placeholder={typeof value.teamId === 'string' && value.teamId ? `默认 ${value.teamId}` : '默认（未配置）'}
+            disabled={!writable || saving}
+            style={inputStyle}
+            onChange={(e) => updateWorkspaceRow(index, { teamId: e.target.value })}
+          />
+        </label>
+        <label style={workspaceFieldStyle}>
+          <span style={workspaceFieldLabelStyle}>Agent ID</span>
+          <input
+            type="text"
+            value={row.agentId}
+            placeholder={typeof value.agentId === 'string' && value.agentId ? `默认 ${value.agentId}` : '默认（未配置）'}
+            disabled={!writable || saving}
+            style={inputStyle}
+            onChange={(e) => updateWorkspaceRow(index, { agentId: e.target.value })}
+          />
+        </label>
+      </div>
+    </div>
+  )
+
+  const identityTab = (
+    <div>
+      {section('默认身份', '未命中工作区时使用', (
+        <>
+          <div style={identityGridStyle}>
             {IDENTITY_FIELDS.map((f) => {
               const shown = f.secret ? (draft?.[f.key] ?? '') : (typeof value[f.key] === 'string' ? value[f.key] : '')
               return fieldRow(
-                <span>{f.label}{f.hint ? <span style={{ color: C.tertiary, marginLeft: '6px' }}>{f.hint}</span> : null}</span>,
+                <span>
+                  {f.label}
+                  {f.hint ? <span style={inlineHintStyle}>{f.hint}</span> : null}
+                </span>,
                 <input
                   type={f.secret ? 'password' : 'text'}
                   value={shown}
@@ -773,13 +1004,463 @@ function TdaiMemoryCard(props: { form: SettingsForm; describe?: SettingsDescribe
               )
             })}
           </div>
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '8px', padding: '0 16px 12px' }}>
-            {note && <span style={{ color: C.tertiary, fontSize: '12px', marginRight: 'auto', alignSelf: 'center' }} role="status">{note}</span>}
-            <button type="button" disabled={!dirty || saving} onClick={reset} style={ghostBtn}>放弃修改</button>
-            <button type="button" disabled={!dirty || saving} onClick={save} style={primaryBtn}>保存</button>
+          <p style={plainHintStyle}>
+            读侧需要 instance / team / agent / user 四项齐全；缺项时读侧不生效，写侧不受影响。
+          </p>
+        </>
+      ), { open: true, key: 'identity' })}
+
+      {section('工作区 Agent', '按会话工作目录覆盖 Team / Agent', (
+        <>
+          {toggleRow(WORKSPACE_MASTER_TOGGLE, false, '')}
+          <p style={plainHintStyle}>
+            开启后，命中下表工作区的会话使用对应 Agent / Team；未命中、规则为空或总开关关闭时，
+            回落到上面的「默认身份」。匹配依据是会话创建时的工作目录（cwd）。
+          </p>
+
+          {!workspaceOn ? (
+            <p style={plainHintStyle}>当前未启用：所有工作区都使用默认身份。</p>
+          ) : null}
+
+          <div style={{ opacity: workspaceOn ? 1 : 0.6 }}>
+            {workspaceRows.length === 0 ? (
+              <p style={emptyStyle}>还没有绑定。添加一个工作区后，只有该目录下的会话使用这里的 Agent。</p>
+            ) : workspaceRows.map(workspaceRow)}
           </div>
+
+          <div style={addRowStyle}>
+            <input
+              type="text"
+              list="tdai-workspace-options"
+              value={newWorkspace}
+              placeholder={workspaceOptions.length > 0 ? '选择或输入工作区路径' : '输入工作区绝对路径'}
+              disabled={!writable || saving}
+              style={{ ...inputStyle, flex: 1, minWidth: 0 }}
+              onChange={(e) => { setNewWorkspace(e.target.value); setWorkspaceNote('') }}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addWorkspaceRow() } }}
+            />
+            <datalist id="tdai-workspace-options">
+              {workspaceOptions.map((item) => (
+                <option key={item.path} value={item.path}>{item.title || workspaceBasename(item.path)}</option>
+              ))}
+            </datalist>
+            <button type="button" disabled={!writable || saving} onClick={addWorkspaceRow} style={smallBtn}>
+              添加
+            </button>
+          </div>
+          {workspaceNote ? <p style={warningStyle} role="status">{workspaceNote}</p> : null}
+          {workspaceOn && workspaceRows.length > 0 ? (
+            <p style={plainHintStyle}>
+              共 {workspaceRows.length} 条规则。Team / Agent 留空表示沿用默认；两栏都空的行保存时会被丢弃。
+              User Key 仍是全局一份，跨 team 使用时请确认它在该 team 有效。
+            </p>
+          ) : null}
+        </>
+      ), { open: true, key: 'workspace' })}
     </div>
   )
+
+  const content = tab === 'read' ? readTab
+    : tab === 'write' ? writeTab
+      : tab === 'bot' ? botTab
+        : identityTab
+
+  return (
+    <div style={rootStyle}>
+      <style>{`
+        .tdai-section > summary { list-style: none; }
+        .tdai-section > summary::-webkit-details-marker { display: none; }
+        .tdai-chevron {
+          display: inline-block; flex: none; width: 10px; margin-top: 1px;
+          color: var(--dsw-alias-label-tertiary, rgba(127,127,127,0.8));
+          font-size: 12px; line-height: 1.4;
+          transition: transform .15s ease; transform: rotate(0deg);
+        }
+        .tdai-section[open] > summary .tdai-chevron { transform: rotate(90deg); }
+      `}</style>
+      <div style={statusLineStyle}>
+        <span>读侧{readOn ? '开' : '关'}</span>
+        <span style={dotStyle}>·</span>
+        <span>写侧{writeOn ? '开' : '关'}</span>
+        <span style={dotStyle}>·</span>
+        <span>工作区覆盖{workspaceOn ? `开（${workspaceRows.length} 条）` : '关'}</span>
+        {missingIdentityKeys.length > 0 ? (
+          <>
+            <span style={dotStyle}>·</span>
+            <span style={{ color: 'var(--dsw-alias-label-warning, #b7791f)' }}>默认身份缺 {missingIdentityKeys.join('/')}</span>
+          </>
+        ) : null}
+      </div>
+
+      <div style={tabBarStyle} role="tablist" aria-label="TDAI Memory 设置分组">
+        {TABS.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            role="tab"
+            aria-selected={tab === t.id}
+            onClick={() => { setTab(t.id); setNote('') }}
+            style={tab === t.id ? activeTabStyle : tabStyle}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      <div style={contentStyle}>
+        {!writable && <p style={plainHintStyle} role="status">当前设置为只读。</p>}
+        {content}
+      </div>
+
+      <div style={footerStyle}>
+        {note && <span style={footerNoteStyle} role="status">{note}</span>}
+        <button type="button" disabled={!dirty || saving} onClick={reset} style={ghostBtn}>放弃修改</button>
+        <button type="button" disabled={!dirty || saving} onClick={save} style={primaryBtn}>保存</button>
+      </div>
+    </div>
+  )
+}
+
+const rootStyle: React.CSSProperties = {
+  border: C.border,
+  background: 'var(--dsw-alias-bg-layer-3, rgba(127,127,127,0.05))',
+  borderRadius: '12px',
+  width: '100%',
+  maxWidth: '100%',
+  minWidth: 0,
+  boxSizing: 'border-box',
+}
+
+const statusLineStyle: React.CSSProperties = {
+  display: 'flex',
+  flexWrap: 'wrap',
+  gap: '6px',
+  alignItems: 'center',
+  padding: '10px 16px 0',
+  fontSize: '12px',
+  color: C.tertiary,
+  lineHeight: 1.4,
+  minWidth: 0,
+}
+
+const dotStyle: React.CSSProperties = { opacity: 0.5 }
+
+const tabBarStyle: React.CSSProperties = {
+  display: 'flex',
+  flexWrap: 'wrap',
+  gap: '2px',
+  padding: '8px 16px 0',
+  borderBottom: C.borderSoft,
+  minWidth: 0,
+}
+
+const tabStyle: React.CSSProperties = {
+  appearance: 'none',
+  font: 'inherit',
+  fontSize: '13px',
+  lineHeight: 1.4,
+  padding: '7px 10px',
+  border: 'none',
+  borderBottom: '2px solid transparent',
+  background: 'none',
+  color: C.tertiary,
+  cursor: 'pointer',
+  whiteSpace: 'nowrap',
+  marginBottom: '-1px',
+}
+
+const activeTabStyle: React.CSSProperties = {
+  ...tabStyle,
+  color: 'var(--dsw-alias-label-primary, inherit)',
+  borderBottom: '2px solid var(--dsw-alias-label-primary, currentColor)',
+}
+
+const contentStyle: React.CSSProperties = {
+  padding: '4px 16px 8px',
+  minWidth: 0,
+}
+
+const footerStyle: React.CSSProperties = {
+  display: 'flex',
+  justifyContent: 'flex-end',
+  gap: '8px',
+  padding: '10px 16px 12px',
+  borderTop: C.borderSoft,
+  minWidth: 0,
+}
+
+const footerNoteStyle: React.CSSProperties = {
+  color: C.tertiary,
+  fontSize: '12px',
+  marginRight: 'auto',
+  alignSelf: 'center',
+  minWidth: 0,
+  overflowWrap: 'anywhere',
+}
+
+const fieldRowStyle: React.CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '5px',
+  padding: '8px 0',
+  minWidth: 0,
+}
+
+const labelStyle: React.CSSProperties = {
+  fontSize: '13px',
+  color: C.secondary,
+  lineHeight: 1.45,
+  minWidth: 0,
+  overflowWrap: 'anywhere',
+}
+
+const inlineHintStyle: React.CSSProperties = {
+  color: C.tertiary,
+  marginLeft: '6px',
+  fontSize: '12px',
+  overflowWrap: 'anywhere',
+}
+
+const hintStyle: React.CSSProperties = {
+  display: 'block',
+  color: C.tertiary,
+  fontSize: '12px',
+  lineHeight: 1.45,
+  marginTop: '2px',
+  minWidth: 0,
+  overflowWrap: 'anywhere',
+}
+
+const inputStyle: React.CSSProperties = {
+  appearance: 'none',
+  width: '100%',
+  minWidth: 0,
+  maxWidth: '100%',
+  boxSizing: 'border-box',
+  padding: '7px 10px',
+  borderRadius: '8px',
+  border: C.border,
+  background: 'transparent',
+  color: 'inherit',
+  font: 'inherit',
+  fontSize: '13px',
+}
+
+const toggleStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'flex-start',
+  gap: '8px',
+  padding: '7px 0',
+  minWidth: 0,
+  cursor: 'pointer',
+}
+
+const checkboxStyle: React.CSSProperties = {
+  width: 15,
+  height: 15,
+  marginTop: 2,
+  accentColor: 'var(--dsw-alias-label-primary, #5b8def)',
+  cursor: 'pointer',
+  flex: 'none',
+}
+
+const toggleTextStyle: React.CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  minWidth: 0,
+  fontSize: '13px',
+  lineHeight: 1.45,
+}
+
+const numericStyle: React.CSSProperties = {
+  padding: '7px 0',
+  minWidth: 0,
+}
+
+const numericLineStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: '8px',
+  flexWrap: 'wrap',
+  minWidth: 0,
+  fontSize: '13px',
+}
+
+const numberInputStyle: React.CSSProperties = {
+  appearance: 'textfield',
+  width: 64,
+  minWidth: 0,
+  padding: '3px 6px',
+  borderRadius: '6px',
+  border: C.border,
+  background: 'transparent',
+  color: 'inherit',
+  font: 'inherit',
+  fontSize: '13px',
+  textAlign: 'center',
+}
+
+const sectionStyle: React.CSSProperties = {
+  borderTop: C.borderSoft,
+  padding: '2px 0',
+  minWidth: 0,
+}
+
+const summaryStyle: React.CSSProperties = {
+  display: 'flex',
+  flexWrap: 'wrap',
+  alignItems: 'baseline',
+  gap: '8px',
+  padding: '9px 0',
+  cursor: 'pointer',
+  minWidth: 0,
+  listStyle: 'none',
+}
+
+const summaryTitleStyle: React.CSSProperties = {
+  fontSize: '13px',
+  fontWeight: 600,
+  color: C.secondary,
+}
+
+const summaryHintStyle: React.CSSProperties = {
+  fontSize: '12px',
+  color: C.tertiary,
+  overflowWrap: 'anywhere',
+}
+
+const sectionBodyStyle: React.CSSProperties = {
+  padding: '0 0 8px',
+  minWidth: 0,
+}
+
+const indentStyle: React.CSSProperties = {
+  paddingLeft: 22,
+  marginLeft: 2,
+  borderLeft: C.guide,
+  minWidth: 0,
+}
+
+const plainHintStyle: React.CSSProperties = {
+  color: C.tertiary,
+  margin: '4px 0 8px',
+  fontSize: '12px',
+  lineHeight: 1.5,
+  overflowWrap: 'anywhere',
+  minWidth: 0,
+}
+
+const warningStyle: React.CSSProperties = {
+  color: 'var(--dsw-alias-label-warning, #b7791f)',
+  margin: '6px 0 4px',
+  fontSize: '12px',
+  lineHeight: 1.5,
+  overflowWrap: 'anywhere',
+  minWidth: 0,
+}
+
+const identityGridStyle: React.CSSProperties = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+  columnGap: '14px',
+  minWidth: 0,
+}
+
+const workspaceCardStyle: React.CSSProperties = {
+  border: C.borderSoft,
+  borderRadius: '8px',
+  padding: '8px 10px',
+  margin: '8px 0',
+  minWidth: 0,
+  boxSizing: 'border-box',
+}
+
+const workspaceHeaderStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'flex-start',
+  gap: '8px',
+  minWidth: 0,
+}
+
+const workspaceTitleStyle: React.CSSProperties = {
+  fontSize: '13px',
+  fontWeight: 500,
+  lineHeight: 1.4,
+  overflowWrap: 'anywhere',
+}
+
+const workspacePathStyle: React.CSSProperties = {
+  fontSize: '11px',
+  color: C.tertiary,
+  lineHeight: 1.4,
+  marginTop: '2px',
+  overflowWrap: 'anywhere',
+}
+
+const workspaceInputsStyle: React.CSSProperties = {
+  display: 'grid',
+  gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+  gap: '8px',
+  marginTop: '8px',
+  minWidth: 0,
+}
+
+const workspaceFieldStyle: React.CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: '4px',
+  minWidth: 0,
+}
+
+const workspaceFieldLabelStyle: React.CSSProperties = {
+  fontSize: '12px',
+  color: C.tertiary,
+}
+
+const addRowStyle: React.CSSProperties = {
+  display: 'flex',
+  gap: '8px',
+  alignItems: 'center',
+  marginTop: '10px',
+  minWidth: 0,
+}
+
+const emptyStyle: React.CSSProperties = {
+  color: C.tertiary,
+  fontSize: '12px',
+  lineHeight: 1.5,
+  margin: '6px 0',
+  padding: '8px 10px',
+  border: C.borderSoft,
+  borderRadius: '8px',
+  overflowWrap: 'anywhere',
+}
+
+const smallBtn: React.CSSProperties = {
+  appearance: 'none',
+  font: 'inherit',
+  fontSize: '13px',
+  lineHeight: 1.4,
+  cursor: 'pointer',
+  border: C.border,
+  borderRadius: '8px',
+  padding: '6px 12px',
+  background: 'none',
+  color: C.secondary,
+  flex: 'none',
+}
+
+const miniGhostBtn: React.CSSProperties = {
+  appearance: 'none',
+  font: 'inherit',
+  fontSize: '12px',
+  lineHeight: 1.4,
+  cursor: 'pointer',
+  border: 'none',
+  background: 'none',
+  color: C.tertiary,
+  padding: '2px 4px',
+  flex: 'none',
 }
 
 export const name = 'dsh-tdai-memory-plugin-client'
@@ -788,25 +1469,12 @@ export const inject = ['configForms', 'slots']
 /**
  * 设置命名空间 = profile patch 的 entry id，必须与 lib/settings.mjs 的
  * `SETTINGS_NAMESPACE` 和 cordis.patch.yml 的 `id` 三处一致。
- *
- * 依据（0.1.7-rc.1 实测）：settings 命名空间就是 **profile patch 的 entry id**
- * （官方 `dsh-client-ui-settings-*` 的 `_NS` 分别等于 `agent-loop` /
- * `web-search-deepseek` / `subagent-model-selection-settings`），不是带 `include:` 前缀的
- * loader 路径。
  */
 export const SETTINGS_ENTRY_ID = NS
 
 export function apply(ctx: Context) {
-  // 读侧只读面：用来在卡片里显示 secret 字段"是否已设置"
   const describe = ctx.configForms.describe()
   const form = ctx.configForms.get(NS)
-  // 挂到 **settings.section**（设置面板左侧的顶层导航页），与 profile 里其它第三方插件
-  // （dsh-better-sidebar / dsh-workspace-drag / dshmarket）一致。
-  //
-  // 为什么不挂 settings.plugins.tab：那是「内置插件」分区里的二级 tab，藏得深、且那是给
-  // DSH 内置插件清单用的；挂在那里用户会以为"没有设置项"（实测踩过）。
-  // 为什么不用 whileServed 包一层：无条件注册让"客户端加载了但命名空间缺失"变成**可见**的
-  // 自解释条目，而不是静默消失（故障可诊断性 > 少一次空条目）。
   ctx.slots.inject('settings.section', () =>
     ctx.slots.register({
       name: 'settings.section',
