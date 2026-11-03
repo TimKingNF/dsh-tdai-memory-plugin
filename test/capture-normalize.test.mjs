@@ -7,8 +7,10 @@
  *
  * 依据（TencentDB-Agent-Memory 仓库）：
  *   - `MemoryProxy/src/skill/normalize-conversation.ts`：reasoning/thinking/image 丢弃
- *   - `agents/asset-import.ts` `toMemoryMessages()`：L0 只收 user/assistant/system，
- *     工具折叠成 `[tool_call] name(args)` / `[tool_result:name] …`
+ *   - 上游 `agents/asset-import.ts` `toMemoryMessages()` 会把工具折成
+ *     `[tool_call] name(args)` 写进 L0；本插件自 0.8.x 起不照做——实测工具调用会
+ *     占满 L0（单日 assistant 记录 94.6%、同一条 bash 重复 19 次），把 L1 抽取
+ *     全带成 work_fact，L2 技术块因此一路膨胀。L0 只留真人发言与可见回复。
  *
  * 运行：node test/capture-normalize.test.mjs
  */
@@ -83,9 +85,9 @@ const toolResultEvent = (toolCallId, text, { turn = 1, step = 1 } = {}) => ({
 
   const record = h.written[1].content
   assert.ok(record.includes('我先查一下。'), '可见回复要保留')
-  assert.ok(record.includes('[tool_call] bash({"command":"git status"})'), `工具调用要折成标记：${record}`)
-  assert.ok(record.includes('[tool_result:bash] On branch main nothing to commit'),
-    `工具结果要折成标记、压空白、带工具名：${record}`)
+  assert.ok(!record.includes('[tool_call]'), `工具调用不得进 L0：${record}`)
+  assert.ok(!record.includes('[tool_result'), `工具结果不得进 L0：${record}`)
+  assert.ok(!record.includes('git status'), `工具参数不得随正文夹带进 L0：${record}`)
 
   // Skill 端点：5-role + 配对锚点
   assert.deepEqual(h.archived.map((m) => m.role), ['user', 'assistant', 'tool_call', 'tool_result'])
@@ -145,7 +147,7 @@ const toolResultEvent = (toolCallId, text, { turn = 1, step = 1 } = {}) => ({
     `成功轮不应出现丢弃日志，实际：${JSON.stringify(h.logs)}`)
 }
 
-// ── 6) 纯函数投影：recordKey 分组 + 空记录过滤 ─────────────────────────────
+// ── 6) 纯函数投影：recordKey 分组 + 空记录过滤 + 工具不进 L0 ────────────────
 {
   const l0 = toL0Records([
     { role: 'user', content: '问题', recordKey: 'u:1' },
@@ -155,11 +157,30 @@ const toolResultEvent = (toolCallId, text, { turn = 1, step = 1 } = {}) => ({
   ])
   assert.deepEqual(l0, [
     { role: 'user', content: '问题' },
-    { role: 'assistant', content: '回答\n[tool_call] calc({"a":1})' },
+    { role: 'assistant', content: '回答' },
+  ], '工具调用不得折叠进 L0：执行过程不是「人说了什么」')
+
+  // 纯工具 record（没有任何 text）必须整条消失，不得留空壳
+  const toolOnly = toL0Records([
+    { role: 'tool_call', content: '{"command":"ls -la"}', toolName: 'bash', recordKey: 'a:9:1' },
+    { role: 'tool_result', content: 'file1\nfile2', toolName: 'bash', recordKey: 'a:9:1' },
+    { role: 'tool_call', content: '{"path":"x.md"}', toolName: 'read', recordKey: 'a:9:2' },
   ])
+  assert.deepEqual(toolOnly, [], '只有工具调用的 record 不得写进 L0')
+
+  // 同一 recordKey 里 text 与工具混排时，只留 text
+  const mixed = toL0Records([
+    { role: 'assistant', content: '我先查一下', recordKey: 'a:5:1' },
+    { role: 'tool_call', content: '{"command":"cat f"}', toolName: 'bash', recordKey: 'a:5:1' },
+    { role: 'tool_result', content: '内容', toolName: 'bash', recordKey: 'a:5:1' },
+    { role: 'assistant', content: '查完了', recordKey: 'a:5:1' },
+  ])
+  assert.deepEqual(mixed, [{ role: 'assistant', content: '我先查一下\n查完了' }],
+    '工具必须被剔除，同 recordKey 的 text 仍按顺序拼接')
 
   const skill = toSkillMessages([{ role: 'tool_call', content: '{}', toolCallId: 'c1' }])
-  assert.deepEqual(skill, [{ role: 'tool_call', content: '{}', tool_call_id: 'c1' }])
+  assert.deepEqual(skill, [{ role: 'tool_call', content: '{}', tool_call_id: 'c1' }],
+    'skill 端点必须保留 5-role 与 tool_call_id 锚点')
 }
 
-console.log('capture normalize tests passed: reasoning 丢弃 / L0 折叠 / skill 5-role / 失败轮不回流')
+console.log('capture normalize tests passed: reasoning 丢弃 / L0 不落工具 / skill 5-role / 失败轮不回流')
